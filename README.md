@@ -9,6 +9,7 @@
    └──────────────────────────────────────────────────────────┘
 ```
 
+[![CI](https://github.com/Dicklesworthstone/rust_proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/rust_proxy/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
 ![Platform](https://img.shields.io/badge/platform-linux-blue)
 ![Routing](https://img.shields.io/badge/iptables-ipset-red)

@@ -97,24 +97,36 @@ async fn handle_connection(
 
     let mut header_buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 512];
-    loop {
+    let header_end = loop {
         let n = upstream_socket.read(&mut tmp).await?;
         if n == 0 {
             return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
         }
         header_buf.extend_from_slice(&tmp[..n]);
-        if header_buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
         }
         if header_buf.len() > 16 * 1024 {
             return Err(anyhow!("Proxy CONNECT response too large"));
         }
+    };
+
+    let header_bytes = &header_buf[..header_end];
+    let trailer = &header_buf[header_end..];
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let status_line = header_text.lines().next().unwrap_or_default();
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|token| token.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("Proxy CONNECT invalid status line: {status_line}"))?;
+    if !(200..300).contains(&status_code) {
+        return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
     }
 
-    let header_text = String::from_utf8_lossy(&header_buf);
-    let status_line = header_text.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") && !status_line.contains(" 2") {
-        return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
+    if !trailer.is_empty() {
+        client.write_all(trailer).await?;
+        client.flush().await?;
     }
 
     let (bytes_to_up, bytes_to_client) =
