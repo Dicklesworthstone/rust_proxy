@@ -152,6 +152,27 @@ pub struct Settings {
     pub include_aws_ip_ranges: bool,
     pub include_cloudflare_ip_ranges: bool,
     pub include_google_ip_ranges: bool,
+    /// Max retry attempts for upstream proxy connections (0 = no retries)
+    #[serde(default = "default_connect_max_retries")]
+    pub connect_max_retries: u32,
+    /// Initial backoff delay in milliseconds for retries
+    #[serde(default = "default_connect_initial_backoff_ms")]
+    pub connect_initial_backoff_ms: u64,
+    /// Maximum backoff delay in milliseconds for retries
+    #[serde(default = "default_connect_max_backoff_ms")]
+    pub connect_max_backoff_ms: u64,
+}
+
+fn default_connect_max_retries() -> u32 {
+    3
+}
+
+fn default_connect_initial_backoff_ms() -> u64 {
+    100
+}
+
+fn default_connect_max_backoff_ms() -> u64 {
+    5000
 }
 
 impl Default for Settings {
@@ -166,6 +187,9 @@ impl Default for Settings {
             include_aws_ip_ranges: true,
             include_cloudflare_ip_ranges: true,
             include_google_ip_ranges: true,
+            connect_max_retries: default_connect_max_retries(),
+            connect_initial_backoff_ms: default_connect_initial_backoff_ms(),
+            connect_max_backoff_ms: default_connect_max_backoff_ms(),
         }
     }
 }

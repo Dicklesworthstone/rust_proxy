@@ -4,11 +4,30 @@ use base64::Engine as _;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::ProxyConfig;
 use crate::state::StateStore;
+
+/// Configuration for connection retry with exponential backoff
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    pub max_retries: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 5000,
+        }
+    }
+}
 
 const SO_ORIGINAL_DST: libc::c_int = 80;
 
@@ -39,6 +58,7 @@ pub async fn run_proxy(
     listen_port: u16,
     upstream: UpstreamProxy,
     state: Arc<StateStore>,
+    retry_config: RetryConfig,
 ) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
     let listener = TcpListener::bind(addr)
@@ -51,7 +71,9 @@ pub async fn run_proxy(
         let upstream_clone = upstream.clone();
         let state_clone = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, upstream_clone, state_clone).await {
+            if let Err(err) =
+                handle_connection(client, upstream_clone, state_clone, retry_config).await
+            {
                 tracing::warn!("connection error: {err}");
             }
         });
@@ -62,6 +84,7 @@ async fn handle_connection(
     mut client: TcpStream,
     upstream: UpstreamProxy,
     state: Arc<StateStore>,
+    retry_config: RetryConfig,
 ) -> Result<()> {
     let original = get_original_dst(&client)?;
     let target = match original {
@@ -71,14 +94,8 @@ async fn handle_connection(
     let target_host = target.ip().to_string();
     let target_port = target.port();
 
-    let mut upstream_socket = TcpStream::connect((upstream.host.as_str(), upstream.port))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to upstream {}:{}",
-                upstream.host, upstream.port
-            )
-        })?;
+    let mut upstream_socket =
+        connect_with_retry(&upstream.host, upstream.port, &retry_config).await?;
 
     let auth_header = if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
         let token = Base64.encode(format!("{}:{}", user, pass));
@@ -136,6 +153,53 @@ async fn handle_connection(
         .await;
 
     Ok(())
+}
+
+/// Connect to upstream with exponential backoff retry
+async fn connect_with_retry(host: &str, port: u16, config: &RetryConfig) -> Result<TcpStream> {
+    let mut last_error = None;
+    let mut backoff_ms = config.initial_backoff_ms;
+
+    for attempt in 0..=config.max_retries {
+        match TcpStream::connect((host, port)).await {
+            Ok(stream) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        "Connected to upstream {}:{} after {} retries",
+                        host,
+                        port,
+                        attempt
+                    );
+                }
+                return Ok(stream);
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < config.max_retries {
+                    tracing::warn!(
+                        "Failed to connect to upstream {}:{} (attempt {}/{}), retrying in {}ms: {}",
+                        host,
+                        port,
+                        attempt + 1,
+                        config.max_retries + 1,
+                        backoff_ms,
+                        last_error.as_ref().unwrap()
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    // Exponential backoff: double the delay, capped at max_backoff_ms
+                    backoff_ms = (backoff_ms * 2).min(config.max_backoff_ms);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Failed to connect to upstream {}:{} after {} attempts: {}",
+        host,
+        port,
+        config.max_retries + 1,
+        last_error.unwrap()
+    ))
 }
 
 fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {

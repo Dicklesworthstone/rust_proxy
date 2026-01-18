@@ -19,7 +19,7 @@ mod state;
 mod util;
 
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
-use proxy::UpstreamProxy;
+use proxy::{RetryConfig, UpstreamProxy};
 use state::{State, StateStore};
 
 #[derive(Parser)]
@@ -520,10 +520,16 @@ async fn run_daemon() -> Result<()> {
         }
     });
 
+    let retry_config = RetryConfig {
+        max_retries: config.settings.connect_max_retries,
+        initial_backoff_ms: config.settings.connect_initial_backoff_ms,
+        max_backoff_ms: config.settings.connect_max_backoff_ms,
+    };
     let proxy_task = tokio::spawn(proxy::run_proxy(
         config.settings.listen_port,
         upstream,
         state.clone(),
+        retry_config,
     ));
 
     tokio::select! {

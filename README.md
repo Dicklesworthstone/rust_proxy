@@ -305,6 +305,10 @@ chain_name = "RUST_PROXY"
 include_aws_ip_ranges = true
 include_cloudflare_ip_ranges = true
 include_google_ip_ranges = true
+# Connection retry settings (exponential backoff)
+connect_max_retries = 3
+connect_initial_backoff_ms = 100
+connect_max_backoff_ms = 5000
 ```
 
 ## Running as a systemd Service
