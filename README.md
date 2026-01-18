@@ -234,6 +234,28 @@ Check system dependencies.
 rust_proxy diagnose
 ```
 
+### `rust_proxy completions`
+Generate shell completions for bash, zsh, fish, PowerShell, or elvish.
+
+```bash
+# Bash (add to ~/.bashrc)
+rust_proxy completions bash >> ~/.bashrc
+source ~/.bashrc
+
+# Zsh (add to ~/.zshrc or use fpath)
+rust_proxy completions zsh > ~/.zfunc/_rust_proxy
+# Then add to ~/.zshrc: fpath=(~/.zfunc $fpath)
+
+# Fish
+rust_proxy completions fish > ~/.config/fish/completions/rust_proxy.fish
+
+# PowerShell (add to profile)
+rust_proxy completions powershell >> $PROFILE
+
+# Elvish
+rust_proxy completions elvish >> ~/.elvish/rc.elv
+```
+
 ## Configuration
 
 Config file location:

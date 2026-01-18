@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -70,6 +71,12 @@ enum Commands {
     Status(OutputArgs),
     /// Check system dependencies
     Diagnose,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Args)]
@@ -174,6 +181,7 @@ async fn main() -> Result<()> {
         Commands::Daemon => run_daemon().await?,
         Commands::Status(args) => status_cmd(args.json)?,
         Commands::Diagnose => diagnose_cmd()?,
+        Commands::Completions { shell } => completions_cmd(shell),
     }
 
     Ok(())
@@ -408,6 +416,11 @@ fn diagnose_cmd() -> Result<()> {
     println!("iptables: {}", if iptables_ok { "ok" } else { "missing" });
     println!("ipset:    {}", if ipset_ok { "ok" } else { "missing" });
     Ok(())
+}
+
+fn completions_cmd(shell: Shell) {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "rust_proxy", &mut std::io::stdout());
 }
 
 async fn run_daemon() -> Result<()> {
