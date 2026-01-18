@@ -234,3 +234,165 @@ impl StateStore {
         });
     }
 }
+
+/// Runtime state that can change during daemon operation.
+/// Separate from Config (user intent) and StateStore (persistent stats).
+/// This manages dynamic proxy switching for failover/failback.
+#[derive(Debug)]
+struct RuntimeStateInner {
+    /// Currently effective proxy (may differ from config during failover)
+    effective_proxy: Option<String>,
+    /// Original active proxy from config (for failback)
+    original_proxy: Option<String>,
+    /// When current failover state began (None if no active failover)
+    failover_at: Option<DateTime<Utc>>,
+    /// When last failover/failback occurred (for min interval check)
+    last_switch_at: Option<DateTime<Utc>>,
+    /// Recovery detection timestamp (for failback delay)
+    recovery_detected_at: Option<DateTime<Utc>>,
+}
+
+/// Thread-safe runtime state for dynamic proxy management
+#[derive(Clone)]
+pub struct RuntimeState {
+    inner: Arc<RwLock<RuntimeStateInner>>,
+}
+
+impl RuntimeState {
+    /// Create from the active proxy ID on daemon startup
+    pub fn new(active_proxy: Option<String>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RuntimeStateInner {
+                effective_proxy: active_proxy.clone(),
+                original_proxy: active_proxy,
+                failover_at: None,
+                last_switch_at: None,
+                recovery_detected_at: None,
+            })),
+        }
+    }
+
+    /// Get currently effective proxy ID (may be failover target)
+    pub async fn get_effective_proxy(&self) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner.effective_proxy.clone()
+    }
+
+    /// Get the original proxy ID from config (for failback reference)
+    pub async fn get_original_proxy(&self) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner.original_proxy.clone()
+    }
+
+    /// Check if we're currently in a failover state
+    pub async fn is_failed_over(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.failover_at.is_some()
+    }
+
+    /// Get failover timestamp if in failover state
+    #[allow(dead_code)] // Will be used by status command
+    pub async fn get_failover_at(&self) -> Option<DateTime<Utc>> {
+        let inner = self.inner.read().await;
+        inner.failover_at
+    }
+
+    /// Perform failover to a new proxy
+    pub async fn failover_to(&self, new_proxy: &str) {
+        let now = Utc::now();
+        let mut inner = self.inner.write().await;
+        inner.effective_proxy = Some(new_proxy.to_string());
+        inner.failover_at = Some(now);
+        inner.last_switch_at = Some(now);
+        inner.recovery_detected_at = None;
+
+        tracing::info!(
+            from = ?inner.original_proxy,
+            to = new_proxy,
+            "Failover performed"
+        );
+    }
+
+    /// Perform failback to original proxy
+    pub async fn failback(&self) {
+        let now = Utc::now();
+        let mut inner = self.inner.write().await;
+        let original = inner.original_proxy.clone();
+        inner.effective_proxy = original.clone();
+        inner.failover_at = None;
+        inner.last_switch_at = Some(now);
+        inner.recovery_detected_at = None;
+
+        tracing::info!(
+            to = ?original,
+            "Failback performed"
+        );
+    }
+
+    /// Record that original proxy has recovered (start failback timer)
+    pub async fn record_recovery_detected(&self) {
+        let mut inner = self.inner.write().await;
+        if inner.recovery_detected_at.is_none() {
+            inner.recovery_detected_at = Some(Utc::now());
+            tracing::debug!(
+                proxy = ?inner.original_proxy,
+                "Original proxy recovery detected, starting failback timer"
+            );
+        }
+    }
+
+    /// Clear recovery detection (original failed again)
+    pub async fn clear_recovery_detected(&self) {
+        let mut inner = self.inner.write().await;
+        if inner.recovery_detected_at.is_some() {
+            inner.recovery_detected_at = None;
+            tracing::debug!(
+                proxy = ?inner.original_proxy,
+                "Original proxy recovery cleared (failed again)"
+            );
+        }
+    }
+
+    /// Check if enough time has passed for failback
+    pub async fn failback_delay_passed(&self, delay_secs: u64) -> bool {
+        let inner = self.inner.read().await;
+        inner
+            .recovery_detected_at
+            .map(|t| Utc::now().signed_duration_since(t).num_seconds() >= delay_secs as i64)
+            .unwrap_or(false)
+    }
+
+    /// Check if enough time has passed since last switch (flapping prevention)
+    #[allow(dead_code)] // Will be used for flapping prevention
+    pub async fn can_switch(&self, min_interval_secs: u64) -> bool {
+        let inner = self.inner.read().await;
+        inner
+            .last_switch_at
+            .map(|t| Utc::now().signed_duration_since(t).num_seconds() >= min_interval_secs as i64)
+            .unwrap_or(true)
+    }
+
+    /// Get a snapshot of runtime state for status display
+    #[allow(dead_code)] // Will be used by status command
+    pub async fn get_status_snapshot(&self) -> RuntimeStateSnapshot {
+        let inner = self.inner.read().await;
+        RuntimeStateSnapshot {
+            effective_proxy: inner.effective_proxy.clone(),
+            original_proxy: inner.original_proxy.clone(),
+            is_failed_over: inner.failover_at.is_some(),
+            failover_at: inner.failover_at,
+            last_switch_at: inner.last_switch_at,
+        }
+    }
+}
+
+/// Snapshot of runtime state for display purposes
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Will be used by status command
+pub struct RuntimeStateSnapshot {
+    pub effective_proxy: Option<String>,
+    pub original_proxy: Option<String>,
+    pub is_failed_over: bool,
+    pub failover_at: Option<DateTime<Utc>>,
+    pub last_switch_at: Option<DateTime<Utc>>,
+}

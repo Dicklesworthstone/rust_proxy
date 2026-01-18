@@ -1,5 +1,5 @@
 use crate::config::{AppConfig, ProxyConfig};
-use crate::state::StateStore;
+use crate::state::{HealthStatus, RuntimeState, StateStore};
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,10 +102,116 @@ async fn check_proxy_connect(proxy_addr: &str) -> Result<()> {
     }
 }
 
+/// Event indicating a failover occurred
+#[derive(Debug, Clone)]
+pub struct FailoverEvent {
+    pub from_proxy: String,
+    pub to_proxy: String,
+    pub reason: String,
+}
+
+/// Check if failover should occur and return the event if so
+pub async fn check_and_perform_failover(
+    config: &AppConfig,
+    state: &StateStore,
+    runtime: &RuntimeState,
+) -> Option<FailoverEvent> {
+    // Only proceed if auto_failover is enabled
+    if !config.settings.auto_failover {
+        return None;
+    }
+
+    // Get the currently effective proxy
+    let effective = runtime.get_effective_proxy().await?;
+
+    // Check if the effective proxy is unhealthy
+    let health = state.get_health_status(&effective).await;
+    if health != HealthStatus::Unhealthy {
+        return None; // Current proxy is still okay
+    }
+
+    // Find the best healthy alternative
+    let alternative = find_best_healthy_proxy(config, state, &effective).await?;
+
+    // Create the failover event
+    Some(FailoverEvent {
+        from_proxy: effective,
+        to_proxy: alternative,
+        reason: "health check failure".to_string(),
+    })
+}
+
+/// Find the highest-priority healthy proxy (excluding the current one)
+pub async fn find_best_healthy_proxy(
+    config: &AppConfig,
+    state: &StateStore,
+    exclude: &str,
+) -> Option<String> {
+    // Get all proxies sorted by priority (lower = higher priority)
+    let mut candidates: Vec<_> = config.proxies.iter().filter(|p| p.id != exclude).collect();
+
+    // Sort by priority (None treated as lowest priority, i.e., 100)
+    candidates.sort_by_key(|p| p.priority.unwrap_or(100));
+
+    // Find the first healthy proxy
+    for proxy in candidates {
+        let health = state.get_health_status(&proxy.id).await;
+        if health == HealthStatus::Healthy {
+            return Some(proxy.id.clone());
+        }
+    }
+
+    None // No healthy alternatives
+}
+
+/// Check if failback should occur (original proxy recovered)
+pub async fn check_and_perform_failback(
+    config: &AppConfig,
+    state: &StateStore,
+    runtime: &RuntimeState,
+) -> bool {
+    // Only proceed if auto_failback is enabled and we're in a failover state
+    if !config.settings.auto_failback {
+        return false;
+    }
+
+    if !runtime.is_failed_over().await {
+        return false;
+    }
+
+    // Get the original proxy
+    let original = match runtime.get_original_proxy().await {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Check if the original proxy is healthy again
+    let health = state.get_health_status(&original).await;
+
+    if health == HealthStatus::Healthy {
+        // Original is healthy - record recovery detection
+        runtime.record_recovery_detected().await;
+
+        // Check if failback delay has passed
+        if runtime
+            .failback_delay_passed(config.settings.failback_delay_secs)
+            .await
+        {
+            return true;
+        }
+    } else {
+        // Original is still unhealthy - clear recovery detection
+        runtime.clear_recovery_detected().await;
+    }
+
+    false
+}
+
 /// Health check loop that runs as a background task in the daemon
 pub async fn health_check_loop(
     config: AppConfig,
     state: Arc<StateStore>,
+    runtime: RuntimeState,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let interval = Duration::from_secs(config.settings.health_check_interval_secs);
@@ -115,6 +221,8 @@ pub async fn health_check_loop(
     tracing::info!(
         interval_secs = config.settings.health_check_interval_secs,
         proxies = config.proxies.len(),
+        auto_failover = config.settings.auto_failover,
+        auto_failback = config.settings.auto_failback,
         "Health check loop started"
     );
 
@@ -131,6 +239,31 @@ pub async fn health_check_loop(
             }
             _ = ticker.tick() => {
                 run_health_checks(&config, &state).await;
+
+                // Check for failover if enabled
+                if config.settings.auto_failover {
+                    if let Some(event) = check_and_perform_failover(&config, &state, &runtime).await {
+                        tracing::warn!(
+                            from = %event.from_proxy,
+                            to = %event.to_proxy,
+                            reason = %event.reason,
+                            "Failover triggered"
+                        );
+                        runtime.failover_to(&event.to_proxy).await;
+                    }
+                }
+
+                // Check for failback if enabled and we're in failover state
+                if config.settings.auto_failback
+                    && check_and_perform_failback(&config, &state, &runtime).await
+                {
+                    let original = runtime.get_original_proxy().await;
+                    tracing::info!(
+                        to = ?original,
+                        "Failback triggered - returning to original proxy"
+                    );
+                    runtime.failback().await;
+                }
             }
         }
     }

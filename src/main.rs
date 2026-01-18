@@ -22,7 +22,7 @@ mod validation;
 
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
 use proxy::{RetryConfig, UpstreamProxy};
-use state::{State, StateStore};
+use state::{HealthStatus, RuntimeState, State, StateStore};
 
 #[derive(Parser)]
 #[command(
@@ -362,24 +362,142 @@ fn status_cmd(json: bool) -> Result<()> {
     let rules_active = iptables::chain_present(&config.settings.chain_name);
 
     if json {
+        // Build health info for JSON output
+        let proxy_health: Vec<_> = config
+            .proxies
+            .iter()
+            .map(|p| {
+                let stats = state.proxies.get(&p.id);
+                serde_json::json!({
+                    "id": p.id,
+                    "status": stats.map(|s| s.health_status.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    "priority": p.priority,
+                    "latency_ms": stats.and_then(|s| s.ping_avg_ms),
+                    "last_check": stats.and_then(|s| s.last_health_check),
+                    "consecutive_failures": stats.map(|s| s.consecutive_failures).unwrap_or(0),
+                    "last_healthy": stats.and_then(|s| s.last_healthy),
+                    "last_failure_reason": stats.and_then(|s| s.last_failure_reason.clone()),
+                })
+            })
+            .collect();
+
+        let active_health = config.active_proxy.as_ref().and_then(|id| {
+            state.proxies.get(id).map(|stats| {
+                serde_json::json!({
+                    "status": stats.health_status.to_string(),
+                    "last_check": stats.last_health_check,
+                    "latency_ms": stats.ping_avg_ms,
+                    "consecutive_failures": stats.consecutive_failures,
+                })
+            })
+        });
+
         let payload = serde_json::json!({
             "active_proxy": config.active_proxy,
+            "active_proxy_health": active_health,
             "rules_active": rules_active,
-            "targets": config.targets,
+            "health_check_enabled": config.settings.health_check_enabled,
+            "auto_failover": config.settings.auto_failover,
+            "auto_failback": config.settings.auto_failback,
+            "targets": config.targets.len(),
+            "proxy_health": proxy_health,
             "stats": state,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
+    // Human-readable output
     let active = config
         .active_proxy
         .clone()
         .unwrap_or_else(|| "-".to_string());
     println!("Active proxy: {}", active);
+
+    // Show active proxy health if available
+    if let Some(ref active_id) = config.active_proxy {
+        if let Some(stats) = state.proxies.get(active_id) {
+            let health_str = format_health_status(stats.health_status);
+            let last_check = format_time_ago(stats.last_health_check);
+            let latency = stats
+                .ping_avg_ms
+                .map(|ms| format!("{:.0}ms", ms))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "Health: {} (last check: {}, latency: {})",
+                health_str, last_check, latency
+            );
+        }
+    }
+
     println!("Rules active: {}", if rules_active { "yes" } else { "no" });
     println!("Targets: {}", config.targets.len());
+
+    // Show health summary if health checks are enabled and there are proxies
+    if config.settings.health_check_enabled && !config.proxies.is_empty() {
+        println!();
+        println!("Proxy Health Summary:");
+        println!(
+            "  {:<12} {:<12} {:<10} {:<10} {:<12} Failures",
+            "ID", "Status", "Priority", "Latency", "Last Check"
+        );
+        for proxy in &config.proxies {
+            let stats = state.proxies.get(&proxy.id);
+            let status = stats
+                .map(|s| format_health_status(s.health_status))
+                .unwrap_or_else(|| "? Unknown".dimmed().to_string());
+            let priority = proxy
+                .priority
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let latency = stats
+                .and_then(|s| s.ping_avg_ms)
+                .map(|ms| format!("{:.0}ms", ms))
+                .unwrap_or_else(|| "-".to_string());
+            let last_check = stats
+                .and_then(|s| s.last_health_check)
+                .map(|t| format_time_ago(Some(t)))
+                .unwrap_or_else(|| "never".to_string());
+            let failures = stats.map(|s| s.consecutive_failures).unwrap_or(0);
+
+            println!(
+                "  {:<12} {:<12} {:<10} {:<10} {:<12} {}",
+                proxy.id, status, priority, latency, last_check, failures
+            );
+        }
+    } else if !config.settings.health_check_enabled {
+        println!();
+        println!("Health checks: {}", "disabled".dimmed());
+    }
+
     Ok(())
+}
+
+/// Format health status with color
+fn format_health_status(status: HealthStatus) -> String {
+    match status {
+        HealthStatus::Healthy => "✓ Healthy".green().to_string(),
+        HealthStatus::Degraded => "⚠ Degraded".yellow().to_string(),
+        HealthStatus::Unhealthy => "✗ Unhealthy".red().to_string(),
+        HealthStatus::Unknown => "? Unknown".dimmed().to_string(),
+    }
+}
+
+/// Format a timestamp as relative time (e.g., "5s ago")
+fn format_time_ago(dt: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    dt.map(|t| {
+        let ago = chrono::Utc::now().signed_duration_since(t);
+        if ago.num_seconds() < 60 {
+            format!("{}s ago", ago.num_seconds())
+        } else if ago.num_minutes() < 60 {
+            format!("{}m ago", ago.num_minutes())
+        } else if ago.num_hours() < 24 {
+            format!("{}h ago", ago.num_hours())
+        } else {
+            format!("{}d ago", ago.num_days())
+        }
+    })
+    .unwrap_or_else(|| "never".to_string())
 }
 
 async fn activate_cmd(id: Option<String>, select: bool, run: bool) -> Result<()> {
@@ -1124,6 +1242,9 @@ async fn run_daemon() -> Result<()> {
     state.record_activated(&active_id, chrono::Utc::now()).await;
     state.clone().start_flush_loop(Duration::from_secs(5));
 
+    // Create runtime state for dynamic proxy management
+    let runtime_state = RuntimeState::new(config.active_proxy.clone());
+
     iptables::ensure_ipset(&config.settings.ipset_name)?;
 
     let initial_targets = build_target_entries(&config).await?;
@@ -1190,10 +1311,12 @@ async fn run_daemon() -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let health_config = config.clone();
         let health_state = state.clone();
+        let health_runtime = runtime_state.clone();
         Some((
             tokio::spawn(health::health_check_loop(
                 health_config,
                 health_state,
+                health_runtime,
                 shutdown_rx,
             )),
             shutdown_tx,
