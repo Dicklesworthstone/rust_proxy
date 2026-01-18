@@ -106,7 +106,7 @@ impl StateStore {
         state.save(&self.path)
     }
 
-    pub async fn start_flush_loop(self: Arc<Self>, interval: Duration) {
+    pub fn start_flush_loop(self: Arc<Self>, interval: Duration) {
         let store = self.clone();
         tokio::spawn(async move {
             let mut next = Instant::now() + interval;

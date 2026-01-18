@@ -454,7 +454,7 @@ async fn run_daemon() -> Result<()> {
 
     let state = Arc::new(StateStore::load().await?);
     state.record_activated(&active_id, chrono::Utc::now()).await;
-    state.clone().start_flush_loop(Duration::from_secs(5)).await;
+    state.clone().start_flush_loop(Duration::from_secs(5));
 
     iptables::ensure_ipset(&config.settings.ipset_name)?;
 
@@ -489,12 +489,9 @@ async fn run_daemon() -> Result<()> {
                 Ok(entries) => {
                     if let Err(err) = iptables::sync_ipset(&ipset_name, &entries) {
                         tracing::warn!("ipset sync failed: {err}");
-                    } else {
-                        let count = entries.len();
-                        if seen.len() != count {
-                            tracing::info!("ipset refreshed: {} targets", count);
-                            seen = entries.clone();
-                        }
+                    } else if seen != entries {
+                        tracing::info!("ipset refreshed: {} targets", entries.len());
+                        seen = entries;
                     }
                 }
                 Err(err) => tracing::warn!("target refresh failed: {err}"),
@@ -537,8 +534,10 @@ async fn run_daemon() -> Result<()> {
             tracing::info!("Shutdown signal received");
         }
         res = proxy_task => {
-            if let Err(err) = res {
-                tracing::error!("Proxy task failed: {err}");
+            match res {
+                Ok(Ok(())) => tracing::info!("Proxy task completed"),
+                Ok(Err(err)) => tracing::error!("Proxy error: {err}"),
+                Err(err) => tracing::error!("Proxy task panicked: {err}"),
             }
         }
     }
