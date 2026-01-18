@@ -17,6 +17,7 @@ mod iptables;
 mod proxy;
 mod state;
 mod util;
+mod validation;
 
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
 use proxy::{RetryConfig, UpstreamProxy};
@@ -71,6 +72,18 @@ enum Commands {
     Status(OutputArgs),
     /// Check system dependencies
     Diagnose,
+    /// Validate configuration without side effects
+    Check {
+        /// Treat warnings as errors (exit code 2)
+        #[arg(long)]
+        strict: bool,
+        /// Output validation results as JSON
+        #[arg(long)]
+        json: bool,
+        /// Only output errors (no success messages)
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -181,6 +194,11 @@ async fn main() -> Result<()> {
         Commands::Daemon => run_daemon().await?,
         Commands::Status(args) => status_cmd(args.json)?,
         Commands::Diagnose => diagnose_cmd()?,
+        Commands::Check {
+            strict,
+            json,
+            quiet,
+        } => check_cmd(strict, json, quiet)?,
         Commands::Completions { shell } => completions_cmd(shell),
     }
 
@@ -415,6 +433,167 @@ fn diagnose_cmd() -> Result<()> {
 
     println!("iptables: {}", if iptables_ok { "ok" } else { "missing" });
     println!("ipset:    {}", if ipset_ok { "ok" } else { "missing" });
+    Ok(())
+}
+
+fn check_cmd(strict: bool, json: bool, quiet: bool) -> Result<()> {
+    use validation::{validate_config, ValidationSeverity};
+
+    let config_path = config::config_path()?;
+
+    // Try to load config
+    let config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(err) => {
+            if json {
+                let output = serde_json::json!({
+                    "valid": false,
+                    "config_path": config_path.display().to_string(),
+                    "errors": [{
+                        "category": "file",
+                        "message": format!("Failed to load configuration: {}", err),
+                    }],
+                    "warnings": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                eprintln!("{} Failed to load configuration: {}", "✗".red(), err);
+            }
+            std::process::exit(3);
+        }
+    };
+
+    let report = validate_config(&config, &config_path);
+
+    if json {
+        let errors: Vec<serde_json::Value> = report
+            .results
+            .iter()
+            .filter(|r| r.severity == ValidationSeverity::Error)
+            .map(|r| {
+                let mut obj = serde_json::json!({
+                    "category": r.category,
+                    "message": r.message,
+                });
+                if let Some(ref id) = r.id {
+                    obj["id"] = serde_json::Value::String(id.clone());
+                }
+                if let Some(ref suggestion) = r.suggestion {
+                    obj["suggestion"] = serde_json::Value::String(suggestion.clone());
+                }
+                obj
+            })
+            .collect();
+
+        let warnings: Vec<serde_json::Value> = report
+            .results
+            .iter()
+            .filter(|r| r.severity == ValidationSeverity::Warning)
+            .map(|r| {
+                let mut obj = serde_json::json!({
+                    "category": r.category,
+                    "message": r.message,
+                });
+                if let Some(ref id) = r.id {
+                    obj["id"] = serde_json::Value::String(id.clone());
+                }
+                if let Some(ref suggestion) = r.suggestion {
+                    obj["suggestion"] = serde_json::Value::String(suggestion.clone());
+                }
+                obj
+            })
+            .collect();
+
+        let output = serde_json::json!({
+            "valid": !report.has_errors(),
+            "config_path": config_path.display().to_string(),
+            "errors": errors,
+            "warnings": warnings,
+            "summary": {
+                "error_count": report.error_count(),
+                "warning_count": report.warning_count(),
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if !quiet || report.has_errors() || (strict && report.has_warnings()) {
+        println!("Configuration: {}", config_path.display());
+        println!();
+
+        // Group results by category
+        let mut by_category: std::collections::HashMap<&str, Vec<_>> =
+            std::collections::HashMap::new();
+        for result in &report.results {
+            by_category.entry(result.category).or_default().push(result);
+        }
+
+        // Display by category
+        for category in ["file", "proxy", "target", "settings", "active"] {
+            if let Some(results) = by_category.get(category) {
+                let category_name = match category {
+                    "file" => "File Access",
+                    "proxy" => "Proxies",
+                    "target" => "Targets",
+                    "settings" => "Settings",
+                    "active" => "Active Proxy",
+                    _ => category,
+                };
+
+                let has_errors = results
+                    .iter()
+                    .any(|r| r.severity == ValidationSeverity::Error);
+                let has_warnings = results
+                    .iter()
+                    .any(|r| r.severity == ValidationSeverity::Warning);
+
+                if has_errors || has_warnings {
+                    println!("{}:", category_name);
+                    for result in results {
+                        let prefix = match result.severity {
+                            ValidationSeverity::Error => "✗".red().to_string(),
+                            ValidationSeverity::Warning => "⚠".yellow().to_string(),
+                            ValidationSeverity::Info => "ℹ".blue().to_string(),
+                        };
+                        let id_str = result
+                            .id
+                            .as_deref()
+                            .map(|id| format!(" [{}]", id))
+                            .unwrap_or_default();
+                        println!("  {}{} {}", prefix, id_str, result.message);
+                        if let Some(ref suggestion) = result.suggestion {
+                            println!("    → {}", suggestion);
+                        }
+                    }
+                    println!();
+                }
+            }
+        }
+
+        // Summary
+        if report.has_errors() {
+            println!(
+                "Configuration {}: {} error(s), {} warning(s)",
+                "invalid".red(),
+                report.error_count(),
+                report.warning_count()
+            );
+        } else if report.has_warnings() {
+            println!(
+                "Configuration {}: {} warning(s)",
+                "valid".green(),
+                report.warning_count()
+            );
+        } else {
+            println!("Configuration {}.", "valid".green());
+        }
+    }
+
+    // Exit codes
+    if report.has_errors() {
+        std::process::exit(1);
+    } else if strict && report.has_warnings() {
+        std::process::exit(2);
+    }
+
     Ok(())
 }
 
