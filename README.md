@@ -1,13 +1,10 @@
 # rust_proxy
 
 <div align="center">
+  <img src="rust_proxy.webp" alt="rust_proxy - Machine-wide targeted transparent proxy">
+</div>
 
-```
-   ┌──────────────────────────────────────────────────────────┐
-   │   Targeted domains → ipset/iptables → local proxy →     │
-   │              upstream HTTP proxy (CONNECT)              │
-   └──────────────────────────────────────────────────────────┘
-```
+<div align="center">
 
 [![CI](https://github.com/Dicklesworthstone/rust_proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/rust_proxy/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
