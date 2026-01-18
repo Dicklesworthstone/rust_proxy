@@ -763,3 +763,168 @@ pub fn state_dir() -> Result<PathBuf> {
     let dir = proj.state_dir().context("Failed to resolve state dir")?;
     Ok(dir.to_path_buf())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_infer_provider_anthropic() {
+        assert_eq!(
+            infer_provider("api.anthropic.com"),
+            Some(Provider::Anthropic)
+        );
+        assert_eq!(infer_provider("claude.ai"), Some(Provider::Anthropic));
+        assert_eq!(infer_provider("www.claude.com"), Some(Provider::Anthropic));
+    }
+
+    #[test]
+    fn test_infer_provider_openai() {
+        assert_eq!(infer_provider("api.openai.com"), Some(Provider::Openai));
+        assert_eq!(infer_provider("chatgpt.com"), Some(Provider::Openai));
+        assert_eq!(infer_provider("oaistatic.com"), Some(Provider::Openai));
+        assert_eq!(infer_provider("sora.com"), Some(Provider::Openai));
+    }
+
+    #[test]
+    fn test_infer_provider_amazon() {
+        assert_eq!(infer_provider("aws.amazon.com"), Some(Provider::Amazon));
+        assert_eq!(infer_provider("iam.amazonaws.com"), Some(Provider::Amazon));
+        assert_eq!(infer_provider("cloudfront.net"), Some(Provider::Amazon));
+    }
+
+    #[test]
+    fn test_infer_provider_cloudflare() {
+        assert_eq!(infer_provider("cloudflare.com"), Some(Provider::Cloudflare));
+        assert_eq!(
+            infer_provider("dash.cloudflare.com"),
+            Some(Provider::Cloudflare)
+        );
+        assert_eq!(
+            infer_provider("cloudflareinsights.com"),
+            Some(Provider::Cloudflare)
+        );
+    }
+
+    #[test]
+    fn test_infer_provider_vercel() {
+        assert_eq!(infer_provider("vercel.com"), Some(Provider::Vercel));
+        assert_eq!(infer_provider("myapp.vercel.app"), Some(Provider::Vercel));
+    }
+
+    #[test]
+    fn test_infer_provider_supabase() {
+        assert_eq!(infer_provider("supabase.com"), Some(Provider::Supabase));
+        assert_eq!(
+            infer_provider("myproject.supabase.co"),
+            Some(Provider::Supabase)
+        );
+    }
+
+    #[test]
+    fn test_infer_provider_google() {
+        assert_eq!(infer_provider("google.com"), Some(Provider::Google));
+        assert_eq!(
+            infer_provider("maps.googleapis.com"),
+            Some(Provider::Google)
+        );
+        assert_eq!(infer_provider("fonts.gstatic.com"), Some(Provider::Google));
+    }
+
+    #[test]
+    fn test_infer_provider_unknown() {
+        assert_eq!(infer_provider("example.com"), None);
+        assert_eq!(infer_provider("random.org"), None);
+    }
+
+    #[test]
+    fn test_infer_provider_case_insensitive() {
+        assert_eq!(
+            infer_provider("API.ANTHROPIC.COM"),
+            Some(Provider::Anthropic)
+        );
+        assert_eq!(infer_provider("Claude.AI"), Some(Provider::Anthropic));
+    }
+
+    #[test]
+    fn test_provider_as_str() {
+        assert_eq!(Provider::Anthropic.as_str(), "anthropic");
+        assert_eq!(Provider::Openai.as_str(), "openai");
+        assert_eq!(Provider::Google.as_str(), "google");
+        assert_eq!(Provider::Amazon.as_str(), "amazon");
+        assert_eq!(Provider::Cloudflare.as_str(), "cloudflare");
+        assert_eq!(Provider::Vercel.as_str(), "vercel");
+        assert_eq!(Provider::Supabase.as_str(), "supabase");
+    }
+
+    #[test]
+    fn test_target_spec_simple_domain() {
+        let target = TargetSpec::Simple("example.com".to_string());
+        assert_eq!(target.domain(), "example.com");
+    }
+
+    #[test]
+    fn test_target_spec_detailed_domain() {
+        let target = TargetSpec::Detailed {
+            domain: "api.anthropic.com".to_string(),
+            provider: Provider::Anthropic,
+        };
+        assert_eq!(target.domain(), "api.anthropic.com");
+        assert_eq!(target.provider(), Provider::Anthropic);
+    }
+
+    #[test]
+    fn test_target_spec_simple_infers_provider() {
+        let target = TargetSpec::Simple("api.openai.com".to_string());
+        assert_eq!(target.provider(), Provider::Openai);
+    }
+
+    #[test]
+    fn test_target_spec_simple_defaults_to_google() {
+        let target = TargetSpec::Simple("unknown.example.org".to_string());
+        assert_eq!(target.provider(), Provider::Google);
+    }
+
+    #[test]
+    fn test_proxy_auth_resolve_direct() {
+        let auth = ProxyAuth {
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            username_env: None,
+            password_env: None,
+        };
+        let (user, pass) = auth.resolve();
+        assert_eq!(user, Some("user".to_string()));
+        assert_eq!(pass, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_proxy_auth_resolve_empty() {
+        let auth = ProxyAuth::default();
+        let (user, pass) = auth.resolve();
+        assert_eq!(user, None);
+        assert_eq!(pass, None);
+    }
+
+    #[test]
+    fn test_settings_default() {
+        let settings = Settings::default();
+        assert_eq!(settings.listen_port, 12345);
+        assert_eq!(settings.dns_refresh_secs, 300);
+        assert_eq!(settings.ping_interval_secs, 60);
+        assert_eq!(settings.ping_timeout_ms, 1500);
+        assert_eq!(settings.ipset_name, "rust_proxy_targets");
+        assert_eq!(settings.chain_name, "RUST_PROXY");
+        assert!(settings.include_aws_ip_ranges);
+        assert!(settings.include_cloudflare_ip_ranges);
+        assert!(settings.include_google_ip_ranges);
+    }
+
+    #[test]
+    fn test_app_config_default_has_targets() {
+        let config = AppConfig::default();
+        assert!(!config.targets.is_empty());
+        assert!(config.proxies.is_empty());
+        assert!(config.active_proxy.is_none());
+    }
+}

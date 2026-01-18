@@ -98,3 +98,116 @@ pub fn format_since_label(when: Option<DateTime<Utc>>) -> String {
         "-".to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_proxy_url_with_scheme() {
+        let result = parse_proxy_url("http://proxy.example.com:8080").unwrap();
+        assert_eq!(result.host, "proxy.example.com");
+        assert_eq!(result.port, 8080);
+    }
+
+    #[test]
+    fn test_parse_proxy_url_without_scheme() {
+        let result = parse_proxy_url("proxy.example.com:3128").unwrap();
+        assert_eq!(result.host, "proxy.example.com");
+        assert_eq!(result.port, 3128);
+    }
+
+    #[test]
+    fn test_parse_proxy_url_default_http_port() {
+        let result = parse_proxy_url("http://proxy.example.com").unwrap();
+        assert_eq!(result.host, "proxy.example.com");
+        assert_eq!(result.port, 80);
+    }
+
+    #[test]
+    fn test_parse_proxy_url_https_default_port() {
+        let result = parse_proxy_url("https://proxy.example.com").unwrap();
+        assert_eq!(result.host, "proxy.example.com");
+        assert_eq!(result.port, 443);
+    }
+
+    #[test]
+    fn test_parse_proxy_url_invalid() {
+        let result = parse_proxy_url("not a valid url ::::");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_bytes_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn test_format_bytes_kb() {
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(10240), "10.0 KB");
+    }
+
+    #[test]
+    fn test_format_bytes_mb() {
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 5), "5.0 MB");
+    }
+
+    #[test]
+    fn test_format_bytes_gb() {
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 2), "2.00 GB");
+    }
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 0m 0s");
+        assert_eq!(format_duration(Duration::from_secs(7200)), "2h 0m 0s");
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m 1s");
+    }
+
+    #[test]
+    fn test_format_duration_days() {
+        assert_eq!(format_duration(Duration::from_secs(86400)), "1d 0h 0m 0s");
+        assert_eq!(format_duration(Duration::from_secs(90061)), "1d 1h 1m 1s");
+    }
+
+    #[test]
+    fn test_format_timeout_valid() {
+        let result = format_timeout(1000).unwrap();
+        assert_eq!(result, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn test_format_timeout_zero() {
+        let result = format_timeout(0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_duration_since_none() {
+        assert_eq!(format_duration_since(None), "-");
+    }
+
+    #[test]
+    fn test_format_since_label_none() {
+        assert_eq!(format_since_label(None), "-");
+    }
+}
