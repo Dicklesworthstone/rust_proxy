@@ -12,6 +12,7 @@ use tokio::time::Instant;
 
 mod config;
 mod dns;
+mod health;
 mod ip_ranges;
 mod iptables;
 mod proxy;
@@ -1184,6 +1185,23 @@ async fn run_daemon() -> Result<()> {
         }
     });
 
+    // Health check task (only if enabled)
+    let health_task = if config.settings.health_check_enabled {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let health_config = config.clone();
+        let health_state = state.clone();
+        Some((
+            tokio::spawn(health::health_check_loop(
+                health_config,
+                health_state,
+                shutdown_rx,
+            )),
+            shutdown_tx,
+        ))
+    } else {
+        None
+    };
+
     let retry_config = RetryConfig {
         max_retries: config.settings.connect_max_retries,
         initial_backoff_ms: config.settings.connect_initial_backoff_ms,
@@ -1211,6 +1229,10 @@ async fn run_daemon() -> Result<()> {
 
     refresh_task.abort();
     ping_task.abort();
+    if let Some((task, shutdown_tx)) = health_task {
+        let _ = shutdown_tx.send(true);
+        task.abort();
+    }
     iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
     state.flush().await?;
 
