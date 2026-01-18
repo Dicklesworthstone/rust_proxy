@@ -84,6 +84,9 @@ enum Commands {
         /// Only output errors (no success messages)
         #[arg(long)]
         quiet: bool,
+        /// Test actual network connectivity to proxies
+        #[arg(long)]
+        test_connectivity: bool,
     },
     /// Test how a URL would be routed (proxied or direct)
     Test {
@@ -213,7 +216,8 @@ async fn main() -> Result<()> {
             strict,
             json,
             quiet,
-        } => check_cmd(strict, json, quiet)?,
+            test_connectivity,
+        } => check_cmd(strict, json, quiet, test_connectivity).await?,
         Commands::Test {
             url,
             json,
@@ -581,7 +585,53 @@ fn diagnose_cmd() -> Result<()> {
     Ok(())
 }
 
-fn check_cmd(strict: bool, json: bool, quiet: bool) -> Result<()> {
+/// Result of testing connectivity to a proxy
+#[derive(Debug, Clone, serde::Serialize)]
+struct ConnectivityResult {
+    proxy_id: String,
+    status: String, // "success", "dns_failure", "connect_failure", "timeout", "auth_required"
+    latency_ms: Option<u64>,
+    error: Option<String>,
+}
+
+/// Test connectivity to a single proxy
+async fn test_proxy_connectivity(
+    proxy: &config::ProxyConfig,
+    timeout_ms: u64,
+) -> ConnectivityResult {
+    use health::check_proxy_health;
+
+    let result = check_proxy_health(proxy, timeout_ms).await;
+
+    ConnectivityResult {
+        proxy_id: proxy.id.clone(),
+        status: if result.success {
+            "success".to_string()
+        } else if result
+            .failure_reason
+            .as_ref()
+            .is_some_and(|r| r.contains("timeout"))
+        {
+            "timeout".to_string()
+        } else if result
+            .failure_reason
+            .as_ref()
+            .is_some_and(|r| r.contains("407"))
+        {
+            "auth_required".to_string()
+        } else {
+            "connect_failure".to_string()
+        },
+        latency_ms: if result.success {
+            Some(result.latency_ms as u64)
+        } else {
+            None
+        },
+        error: result.failure_reason,
+    }
+}
+
+async fn check_cmd(strict: bool, json: bool, quiet: bool, test_connectivity: bool) -> Result<()> {
     use validation::{validate_config, ValidationSeverity};
 
     let config_path = config::config_path()?;
@@ -609,6 +659,20 @@ fn check_cmd(strict: bool, json: bool, quiet: bool) -> Result<()> {
     };
 
     let report = validate_config(&config, &config_path);
+
+    // Run connectivity tests if requested (in parallel)
+    let connectivity_results: Vec<ConnectivityResult> =
+        if test_connectivity && !config.proxies.is_empty() {
+            let timeout_ms = config.settings.health_check_timeout_ms;
+            let futures: Vec<_> = config
+                .proxies
+                .iter()
+                .map(|proxy| test_proxy_connectivity(proxy, timeout_ms))
+                .collect();
+            futures::future::join_all(futures).await
+        } else {
+            Vec::new()
+        };
 
     if json {
         let errors: Vec<serde_json::Value> = report
@@ -649,7 +713,7 @@ fn check_cmd(strict: bool, json: bool, quiet: bool) -> Result<()> {
             })
             .collect();
 
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "valid": !report.has_errors(),
             "config_path": config_path.display().to_string(),
             "errors": errors,
@@ -659,6 +723,12 @@ fn check_cmd(strict: bool, json: bool, quiet: bool) -> Result<()> {
                 "warning_count": report.warning_count(),
             }
         });
+
+        // Add connectivity results if tested
+        if test_connectivity {
+            output["connectivity"] = serde_json::json!(connectivity_results);
+        }
+
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if !quiet || report.has_errors() || (strict && report.has_warnings()) {
         println!("Configuration: {}", config_path.display());
@@ -711,6 +781,33 @@ fn check_cmd(strict: bool, json: bool, quiet: bool) -> Result<()> {
                     println!();
                 }
             }
+        }
+
+        // Display connectivity results if tested
+        if test_connectivity && !connectivity_results.is_empty() {
+            println!("Connectivity Tests:");
+            for result in &connectivity_results {
+                let (prefix, status_text) = match result.status.as_str() {
+                    "success" => (
+                        "✓".green().to_string(),
+                        format!("reachable ({}ms)", result.latency_ms.unwrap_or(0)),
+                    ),
+                    "auth_required" => (
+                        "⚠".yellow().to_string(),
+                        "reachable (auth required)".to_string(),
+                    ),
+                    "timeout" => ("✗".red().to_string(), "timeout".to_string()),
+                    _ => (
+                        "✗".red().to_string(),
+                        result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "connection failed".to_string()),
+                    ),
+                };
+                println!("  {} [{}] {}", prefix, result.proxy_id, status_text);
+            }
+            println!();
         }
 
         // Summary
