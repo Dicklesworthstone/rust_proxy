@@ -1,0 +1,7 @@
+{
+  "status": "completed",
+  "current": null,
+  "completed": ["directories", "inquire", "reqwest", "tabled", "toml"],
+  "failed": [],
+  "pending": []
+}
