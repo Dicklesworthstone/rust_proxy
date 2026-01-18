@@ -11,6 +11,67 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::ProxyConfig;
 use crate::state::StateStore;
 
+/// Check if an accept() error is transient and should be retried.
+///
+/// Transient errors are temporary conditions that may resolve on their own.
+/// We should log them, back off briefly, and continue accepting connections.
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    // Check by ErrorKind first (portable)
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionReset     // Client reset during accept
+            | ErrorKind::ConnectionAborted // Client aborted during accept
+            | ErrorKind::Interrupted       // Signal interrupted syscall
+            | ErrorKind::WouldBlock // Would block (shouldn't happen, but safe)
+    ) {
+        return true;
+    }
+
+    // Check by raw OS error code (Linux-specific)
+    // These don't have stable ErrorKind mappings
+    matches!(
+        e.raw_os_error(),
+        Some(23)    // ENFILE: system file table full
+            | Some(24)  // EMFILE: process file descriptor limit
+            | Some(103) // ECONNABORTED: connection aborted
+            | Some(105) // ENOBUFS: no buffer space
+            | Some(12) // ENOMEM: out of memory (temporary)
+    )
+}
+
+/// Manages exponential backoff for accept loop errors
+struct AcceptBackoff {
+    current_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+    consecutive_errors: u32,
+}
+
+impl AcceptBackoff {
+    fn new() -> Self {
+        Self {
+            current_ms: 10,
+            min_ms: 10,
+            max_ms: 5000,
+            consecutive_errors: 0,
+        }
+    }
+
+    fn record_error(&mut self) -> Duration {
+        self.consecutive_errors += 1;
+        let backoff = Duration::from_millis(self.current_ms);
+        self.current_ms = (self.current_ms * 2).min(self.max_ms);
+        backoff
+    }
+
+    fn record_success(&mut self) {
+        self.current_ms = self.min_ms;
+        self.consecutive_errors = 0;
+    }
+}
+
 /// Configuration for connection retry with exponential backoff
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
@@ -66,8 +127,32 @@ pub async fn run_proxy(
         .with_context(|| format!("Failed to bind to {addr}"))?;
     tracing::info!("transparent proxy listening on {addr}");
 
+    let mut backoff = AcceptBackoff::new();
+
     loop {
-        let (client, _) = listener.accept().await?;
+        let (client, _) = match listener.accept().await {
+            Ok(conn) => {
+                backoff.record_success();
+                conn
+            }
+            Err(e) if is_transient_accept_error(&e) => {
+                let delay = backoff.record_error();
+                tracing::warn!(
+                    error = %e,
+                    error_code = ?e.raw_os_error(),
+                    consecutive_errors = backoff.consecutive_errors,
+                    backoff_ms = delay.as_millis(),
+                    "Accept error (transient, will retry)"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Accept error (fatal, exiting)");
+                return Err(e.into());
+            }
+        };
+
         let upstream_clone = upstream.clone();
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -221,5 +306,126 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
         let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
         let port = u16::from_be(addr.sin_port);
         Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn test_transient_error_by_error_kind() {
+        // Transient errors should return true
+        assert!(is_transient_accept_error(&Error::new(
+            ErrorKind::ConnectionReset,
+            "test"
+        )));
+        assert!(is_transient_accept_error(&Error::new(
+            ErrorKind::ConnectionAborted,
+            "test"
+        )));
+        assert!(is_transient_accept_error(&Error::new(
+            ErrorKind::Interrupted,
+            "test"
+        )));
+        assert!(is_transient_accept_error(&Error::new(
+            ErrorKind::WouldBlock,
+            "test"
+        )));
+    }
+
+    #[test]
+    fn test_transient_error_by_os_code() {
+        // Linux-specific transient errors (by OS code)
+        assert!(is_transient_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_transient_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+        assert!(is_transient_accept_error(&Error::from_raw_os_error(103))); // ECONNABORTED
+        assert!(is_transient_accept_error(&Error::from_raw_os_error(105))); // ENOBUFS
+        assert!(is_transient_accept_error(&Error::from_raw_os_error(12))); // ENOMEM
+    }
+
+    #[test]
+    fn test_fatal_errors_not_transient() {
+        // Fatal errors should return false
+        assert!(!is_transient_accept_error(&Error::new(
+            ErrorKind::AddrInUse,
+            "test"
+        )));
+        assert!(!is_transient_accept_error(&Error::new(
+            ErrorKind::PermissionDenied,
+            "test"
+        )));
+        assert!(!is_transient_accept_error(&Error::new(
+            ErrorKind::NotFound,
+            "test"
+        )));
+        assert!(!is_transient_accept_error(&Error::from_raw_os_error(98))); // EADDRINUSE
+        assert!(!is_transient_accept_error(&Error::from_raw_os_error(13))); // EACCES
+    }
+
+    #[test]
+    fn test_backoff_exponential_growth() {
+        let mut backoff = AcceptBackoff::new();
+
+        // First error returns 10ms
+        assert_eq!(backoff.record_error().as_millis(), 10);
+        assert_eq!(backoff.consecutive_errors, 1);
+
+        // Doubles each time
+        assert_eq!(backoff.record_error().as_millis(), 20);
+        assert_eq!(backoff.record_error().as_millis(), 40);
+        assert_eq!(backoff.record_error().as_millis(), 80);
+        assert_eq!(backoff.record_error().as_millis(), 160);
+    }
+
+    #[test]
+    fn test_backoff_max_cap() {
+        let mut backoff = AcceptBackoff::new();
+
+        // Run many iterations to ensure we hit the cap
+        for _ in 0..20 {
+            backoff.record_error();
+        }
+
+        // Should be capped at 5000ms
+        assert!(backoff.current_ms <= 5000);
+
+        // Next error should still be capped
+        let delay = backoff.record_error();
+        assert_eq!(delay.as_millis(), 5000);
+    }
+
+    #[test]
+    fn test_backoff_reset_on_success() {
+        let mut backoff = AcceptBackoff::new();
+
+        // Accumulate some errors
+        backoff.record_error();
+        backoff.record_error();
+        backoff.record_error();
+        assert!(backoff.current_ms > 10);
+        assert_eq!(backoff.consecutive_errors, 3);
+
+        // Success should reset
+        backoff.record_success();
+        assert_eq!(backoff.current_ms, 10);
+        assert_eq!(backoff.consecutive_errors, 0);
+    }
+
+    #[test]
+    fn test_backoff_exact_sequence() {
+        let mut backoff = AcceptBackoff::new();
+
+        let expected_sequence = [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5000, 5000];
+
+        for (i, expected_ms) in expected_sequence.iter().enumerate() {
+            let delay = backoff.record_error();
+            assert_eq!(
+                delay.as_millis(),
+                *expected_ms as u128,
+                "Mismatch at iteration {i}"
+            );
+        }
     }
 }
