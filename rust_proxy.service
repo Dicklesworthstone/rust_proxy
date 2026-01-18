@@ -1,0 +1,63 @@
+# rust_proxy systemd service file
+# Install to: /etc/systemd/system/rust_proxy.service
+#
+# After installation:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable rust_proxy
+#   sudo systemctl start rust_proxy
+
+[Unit]
+Description=rust_proxy - Targeted transparent proxy daemon
+Documentation=https://github.com/Dicklesworthstone/rust_proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rust_proxy daemon
+
+# Restart on failure with exponential backoff
+Restart=on-failure
+RestartSec=5
+RestartMaxDelaySec=60
+
+# Security hardening (limited due to iptables requirement)
+# Daemon requires root for iptables/ipset manipulation
+User=root
+Group=root
+
+# Prevent writes to /usr, /boot, /etc (except specific paths)
+ProtectSystem=strict
+
+# Allow access to config and state directories
+# Config: ~/.config/rust_proxy/config.toml -> /root/.config/rust_proxy/
+# State:  ~/.local/state/rust_proxy/state.json -> /root/.local/state/rust_proxy/
+ReadWritePaths=/root/.config/rust_proxy
+ReadWritePaths=/root/.local/state/rust_proxy
+
+# Allow network namespace and iptables access
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+# Standard security restrictions
+NoNewPrivileges=no
+PrivateTmp=true
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Logging via journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rust_proxy
+
+# Environment file for proxy credentials (optional)
+# Create /etc/rust_proxy.env with: PROXY_USER=xxx PROXY_PASS=yyy
+EnvironmentFile=-/etc/rust_proxy.env
+
+# Kill signal and timeout
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

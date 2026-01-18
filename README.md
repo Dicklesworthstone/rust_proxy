@@ -285,6 +285,53 @@ include_cloudflare_ip_ranges = true
 include_google_ip_ranges = true
 ```
 
+## Running as a systemd Service
+
+For production deployments, run rust_proxy as a systemd service for automatic startup and restart on failure.
+
+### Installation
+
+```bash
+# Copy the service file
+sudo cp rust_proxy.service /etc/systemd/system/
+
+# (Optional) Set up proxy credentials
+sudo cp rust_proxy.env.example /etc/rust_proxy.env
+sudo chmod 600 /etc/rust_proxy.env
+sudo nano /etc/rust_proxy.env  # Edit with your credentials
+
+# Reload systemd and enable the service
+sudo systemctl daemon-reload
+sudo systemctl enable rust_proxy
+
+# Start the service
+sudo systemctl start rust_proxy
+```
+
+### Managing the Service
+
+```bash
+# Check status
+sudo systemctl status rust_proxy
+
+# View logs
+sudo journalctl -u rust_proxy -f
+
+# Restart after config changes
+sudo systemctl restart rust_proxy
+
+# Stop the service
+sudo systemctl stop rust_proxy
+```
+
+### Configuration Notes
+
+- The systemd service runs as root (required for iptables/ipset)
+- Config is read from `/root/.config/rust_proxy/config.toml`
+- State is stored in `/root/.local/state/rust_proxy/state.json`
+- Proxy credentials can be set in `/etc/rust_proxy.env`
+- The service restarts automatically on failure with exponential backoff
+
 ## Architecture
 
 ```
