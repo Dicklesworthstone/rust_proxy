@@ -38,6 +38,12 @@ pub struct ProxyConfig {
     pub url: String,
     #[serde(default)]
     pub auth: ProxyAuth,
+    /// Priority for failover selection (lower = higher priority)
+    #[serde(default)]
+    pub priority: Option<u32>,
+    /// Optional custom health check URL
+    #[serde(default)]
+    pub health_check_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +167,27 @@ pub struct Settings {
     /// Maximum backoff delay in milliseconds for retries
     #[serde(default = "default_connect_max_backoff_ms")]
     pub connect_max_backoff_ms: u64,
+    /// Enable automatic health checks for proxies
+    #[serde(default = "default_health_check_enabled")]
+    pub health_check_enabled: bool,
+    /// Interval between health checks in seconds
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+    /// Timeout for health check connections in milliseconds
+    #[serde(default = "default_health_check_timeout_ms")]
+    pub health_check_timeout_ms: u64,
+    /// Number of consecutive failures before marking proxy unhealthy
+    #[serde(default = "default_consecutive_failures_threshold")]
+    pub consecutive_failures_threshold: u32,
+    /// Automatically switch to healthy proxy when active becomes unhealthy
+    #[serde(default = "default_auto_failover")]
+    pub auto_failover: bool,
+    /// Automatically return to original proxy when it recovers
+    #[serde(default = "default_auto_failback")]
+    pub auto_failback: bool,
+    /// Delay in seconds before failing back after recovery
+    #[serde(default = "default_failback_delay_secs")]
+    pub failback_delay_secs: u64,
 }
 
 fn default_connect_max_retries() -> u32 {
@@ -173,6 +200,34 @@ fn default_connect_initial_backoff_ms() -> u64 {
 
 fn default_connect_max_backoff_ms() -> u64 {
     5000
+}
+
+fn default_health_check_enabled() -> bool {
+    true
+}
+
+fn default_health_check_interval_secs() -> u64 {
+    30
+}
+
+fn default_health_check_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_consecutive_failures_threshold() -> u32 {
+    3
+}
+
+fn default_auto_failover() -> bool {
+    true
+}
+
+fn default_auto_failback() -> bool {
+    true
+}
+
+fn default_failback_delay_secs() -> u64 {
+    60
 }
 
 impl Default for Settings {
@@ -190,6 +245,13 @@ impl Default for Settings {
             connect_max_retries: default_connect_max_retries(),
             connect_initial_backoff_ms: default_connect_initial_backoff_ms(),
             connect_max_backoff_ms: default_connect_max_backoff_ms(),
+            health_check_enabled: default_health_check_enabled(),
+            health_check_interval_secs: default_health_check_interval_secs(),
+            health_check_timeout_ms: default_health_check_timeout_ms(),
+            consecutive_failures_threshold: default_consecutive_failures_threshold(),
+            auto_failover: default_auto_failover(),
+            auto_failback: default_auto_failback(),
+            failback_delay_secs: default_failback_delay_secs(),
         }
     }
 }
@@ -942,6 +1004,30 @@ mod tests {
         assert!(settings.include_aws_ip_ranges);
         assert!(settings.include_cloudflare_ip_ranges);
         assert!(settings.include_google_ip_ranges);
+        // Health check settings
+        assert!(settings.health_check_enabled);
+        assert_eq!(settings.health_check_interval_secs, 30);
+        assert_eq!(settings.health_check_timeout_ms, 5000);
+        assert_eq!(settings.consecutive_failures_threshold, 3);
+        assert!(settings.auto_failover);
+        assert!(settings.auto_failback);
+        assert_eq!(settings.failback_delay_secs, 60);
+    }
+
+    #[test]
+    fn test_proxy_config_priority() {
+        let proxy = ProxyConfig {
+            id: "test".to_string(),
+            url: "http://proxy:8080".to_string(),
+            auth: ProxyAuth::default(),
+            priority: Some(1),
+            health_check_url: Some("http://example.com".to_string()),
+        };
+        assert_eq!(proxy.priority, Some(1));
+        assert_eq!(
+            proxy.health_check_url,
+            Some("http://example.com".to_string())
+        );
     }
 
     #[test]

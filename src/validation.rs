@@ -634,11 +634,15 @@ mod tests {
                 id: "test".to_string(),
                 url: "http://proxy1:8080".to_string(),
                 auth: ProxyAuth::default(),
+                priority: None,
+                health_check_url: None,
             },
             ProxyConfig {
                 id: "test".to_string(),
                 url: "http://proxy2:8080".to_string(),
                 auth: ProxyAuth::default(),
+                priority: None,
+                health_check_url: None,
             },
         ];
         let results = validate_proxies(&proxies);
@@ -696,6 +700,8 @@ mod tests {
             id: "existing".to_string(),
             url: "http://proxy:8080".to_string(),
             auth: ProxyAuth::default(),
+            priority: None,
+            health_check_url: None,
         }];
         let results = validate_active_proxy(Some("nonexistent"), &proxies);
         assert!(results.iter().any(|r| r.message.contains("not found")));

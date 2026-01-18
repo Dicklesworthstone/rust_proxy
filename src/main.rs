@@ -257,7 +257,13 @@ fn proxy_cmd(cmd: ProxyCmd) -> Result<()> {
                 username_env,
                 password_env,
             };
-            config.proxies.push(ProxyConfig { id, url, auth });
+            config.proxies.push(ProxyConfig {
+                id,
+                url,
+                auth,
+                priority: None,
+                health_check_url: None,
+            });
             config.save()?;
             println!("Proxy added.");
         }
