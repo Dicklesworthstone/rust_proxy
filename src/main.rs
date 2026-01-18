@@ -84,6 +84,20 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
+    /// Test how a URL would be routed (proxied or direct)
+    Test {
+        /// URL or domain to test (e.g., https://api.openai.com/v1/chat, api.openai.com)
+        url: String,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+        /// Show detailed routing decision process
+        #[arg(short, long)]
+        verbose: bool,
+        /// Skip DNS resolution (only check config)
+        #[arg(long)]
+        no_dns: bool,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -199,6 +213,12 @@ async fn main() -> Result<()> {
             json,
             quiet,
         } => check_cmd(strict, json, quiet)?,
+        Commands::Test {
+            url,
+            json,
+            verbose,
+            no_dns,
+        } => test_cmd(&url, json, verbose, no_dns).await?,
         Commands::Completions { shell } => completions_cmd(shell),
     }
 
@@ -595,6 +615,468 @@ fn check_cmd(strict: bool, json: bool, quiet: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Routing decision result for a URL/domain
+#[derive(Debug)]
+struct RoutingDecision {
+    input: String,
+    domain: String,
+    resolved_ips: Vec<String>,
+    dns_error: Option<String>,
+    would_proxy: bool,
+    domain_in_targets: bool,
+    target_provider: Option<String>,
+    provider_range_matches: Vec<ProviderMatch>,
+    daemon_running: bool,
+    active_proxy: Option<(String, String)>, // (id, url)
+}
+
+#[derive(Debug)]
+struct ProviderMatch {
+    ip: String,
+    provider: String,
+    cidr: String,
+}
+
+/// Parse a URL or domain input and extract the domain
+fn extract_domain(input: &str) -> String {
+    let input = input.trim();
+
+    // If it looks like a URL, parse it
+    if input.starts_with("http://") || input.starts_with("https://") {
+        if let Ok(url) = url::Url::parse(input) {
+            if let Some(host) = url.host_str() {
+                return host.to_string();
+            }
+        }
+    }
+
+    // Try adding https:// and parsing
+    if let Ok(url) = url::Url::parse(&format!("https://{}", input)) {
+        if let Some(host) = url.host_str() {
+            return host.to_string();
+        }
+    }
+
+    // Fall back to treating as domain (strip path if present)
+    input.split('/').next().unwrap_or(input).to_string()
+}
+
+/// Check if an IP address is within a CIDR range
+fn ip_in_cidr(ip_str: &str, cidr: &str) -> bool {
+    use std::net::Ipv4Addr;
+
+    let ip: Ipv4Addr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+
+    let network: Ipv4Addr = match parts[0].parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+
+    let prefix_len: u32 = match parts[1].parse() {
+        Ok(p) if p <= 32 => p,
+        _ => return false,
+    };
+
+    if prefix_len == 0 {
+        return true;
+    }
+
+    let mask = !0u32 << (32 - prefix_len);
+    let ip_bits = u32::from(ip);
+    let net_bits = u32::from(network);
+
+    (ip_bits & mask) == (net_bits & mask)
+}
+
+/// Find which provider range (if any) contains an IP
+async fn find_provider_match(
+    ip: &str,
+    include_aws: bool,
+    include_cloudflare: bool,
+    include_google: bool,
+) -> Option<ProviderMatch> {
+    // Check Cloudflare first (most common for API providers)
+    if include_cloudflare {
+        if let Ok(ranges) = ip_ranges::fetch_cloudflare_ipv4().await {
+            for cidr in &ranges {
+                if ip_in_cidr(ip, cidr) {
+                    return Some(ProviderMatch {
+                        ip: ip.to_string(),
+                        provider: "cloudflare".to_string(),
+                        cidr: cidr.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Check Google
+    if include_google {
+        if let Ok(ranges) = ip_ranges::fetch_google_ipv4().await {
+            for cidr in &ranges {
+                if ip_in_cidr(ip, cidr) {
+                    return Some(ProviderMatch {
+                        ip: ip.to_string(),
+                        provider: "google".to_string(),
+                        cidr: cidr.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Check AWS
+    if include_aws {
+        if let Ok(ranges) = ip_ranges::fetch_aws_ipv4().await {
+            for cidr in &ranges {
+                if ip_in_cidr(ip, cidr) {
+                    return Some(ProviderMatch {
+                        ip: ip.to_string(),
+                        provider: "aws".to_string(),
+                        cidr: cidr.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if daemon is running by attempting to connect to the listen port
+fn is_daemon_running(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+async fn test_cmd(url: &str, json: bool, verbose: bool, no_dns: bool) -> Result<()> {
+    let config = AppConfig::load()?;
+
+    let domain = extract_domain(url);
+
+    if verbose {
+        println!("[1/5] Parsing URL...");
+        println!("      Input: {}", url);
+        println!("      Extracted domain: {}", domain);
+        println!();
+    }
+
+    // Check if domain is in targets
+    let (domain_in_targets, target_provider) = {
+        let mut found = false;
+        let mut provider: Option<String> = None;
+        for target in &config.targets {
+            if target.domain().eq_ignore_ascii_case(&domain) {
+                found = true;
+                provider = Some(target.provider().as_str().to_string());
+                break;
+            }
+        }
+        (found, provider)
+    };
+
+    if verbose {
+        println!("[2/5] Checking targets list...");
+        println!(
+            "      Searching {} configured targets",
+            config.targets.len()
+        );
+        if domain_in_targets {
+            println!(
+                "      {} Found: {} (provider: {})",
+                "✓".green(),
+                domain,
+                target_provider.as_deref().unwrap_or("unknown")
+            );
+        } else {
+            println!("      {} Not found: {}", "✗".red(), domain);
+        }
+        println!();
+    }
+
+    // Resolve DNS
+    let (resolved_ips, dns_error) = if no_dns {
+        if verbose {
+            println!("[3/5] Resolving DNS...");
+            println!("      Skipped (--no-dns flag)");
+            println!();
+        }
+        (Vec::new(), None)
+    } else {
+        if verbose {
+            println!("[3/5] Resolving DNS...");
+            println!("      Query: {} A", domain);
+        }
+        let start = std::time::Instant::now();
+        match dns::resolve_ipv4(std::slice::from_ref(&domain)).await {
+            Ok(ips) => {
+                let ips: Vec<String> = ips.into_iter().collect();
+                if verbose {
+                    println!(
+                        "      Response: {} ({:.0}ms)",
+                        if ips.is_empty() {
+                            "no results".to_string()
+                        } else {
+                            ips.join(", ")
+                        },
+                        start.elapsed().as_millis()
+                    );
+                    println!();
+                }
+                (ips, None)
+            }
+            Err(err) => {
+                if verbose {
+                    println!("      {} Error: {}", "✗".red(), err);
+                    println!();
+                }
+                (Vec::new(), Some(err.to_string()))
+            }
+        }
+    };
+
+    // Check daemon status
+    let daemon_running = is_daemon_running(config.settings.listen_port);
+
+    if verbose {
+        println!("[4/5] Checking daemon status...");
+        if daemon_running {
+            println!("      {} Daemon is running", "✓".green());
+        } else {
+            println!("      Daemon is not running");
+            println!("      (ipset rules not active until daemon runs)");
+        }
+        println!();
+    }
+
+    // Check provider IP ranges
+    let mut provider_range_matches = Vec::new();
+    if !no_dns && !resolved_ips.is_empty() {
+        if verbose {
+            println!("[5/5] Checking provider IP ranges...");
+        }
+        for ip in &resolved_ips {
+            if let Some(m) = find_provider_match(
+                ip,
+                config.settings.include_aws_ip_ranges,
+                config.settings.include_cloudflare_ip_ranges,
+                config.settings.include_google_ip_ranges,
+            )
+            .await
+            {
+                if verbose {
+                    println!(
+                        "      IP {}: {} matches {} range {}",
+                        ip,
+                        "✓".green(),
+                        m.provider,
+                        m.cidr
+                    );
+                }
+                provider_range_matches.push(m);
+            } else if verbose {
+                println!("      IP {}: {} no provider range match", ip, "✗".red());
+            }
+        }
+        if verbose {
+            println!();
+        }
+    } else if verbose && !no_dns {
+        println!("[5/5] Checking provider IP ranges...");
+        println!("      Skipped (no resolved IPs)");
+        println!();
+    } else if verbose {
+        println!("[5/5] Checking provider IP ranges...");
+        println!("      Skipped (--no-dns flag)");
+        println!();
+    }
+
+    // Get active proxy info
+    let active_proxy = config.active_proxy.as_ref().and_then(|id| {
+        config
+            .proxies
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| (p.id.clone(), p.url.clone()))
+    });
+
+    // Determine final routing decision
+    let would_proxy = domain_in_targets || !provider_range_matches.is_empty();
+
+    let decision = RoutingDecision {
+        input: url.to_string(),
+        domain: domain.clone(),
+        resolved_ips: resolved_ips.clone(),
+        dns_error,
+        would_proxy,
+        domain_in_targets,
+        target_provider,
+        provider_range_matches,
+        daemon_running,
+        active_proxy,
+    };
+
+    // Output
+    if json {
+        output_test_json(&decision)?;
+    } else {
+        output_test_standard(&decision, verbose);
+    }
+
+    Ok(())
+}
+
+fn output_test_json(decision: &RoutingDecision) -> Result<()> {
+    let output = serde_json::json!({
+        "input": decision.input,
+        "domain": decision.domain,
+        "resolved_ips": decision.resolved_ips,
+        "dns_error": decision.dns_error,
+        "would_proxy": decision.would_proxy,
+        "active_proxy": decision.active_proxy.as_ref().map(|(id, url)| {
+            serde_json::json!({
+                "id": id,
+                "url": url
+            })
+        }),
+        "routing_decision": {
+            "domain_in_targets": decision.domain_in_targets,
+            "target_provider": decision.target_provider,
+            "provider_range_matches": decision.provider_range_matches.iter().map(|m| {
+                serde_json::json!({
+                    "ip": m.ip,
+                    "provider": m.provider,
+                    "cidr": m.cidr
+                })
+            }).collect::<Vec<_>>()
+        },
+        "daemon_running": decision.daemon_running,
+        "suggestions": build_suggestions(decision)
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn output_test_standard(decision: &RoutingDecision, verbose: bool) {
+    if verbose {
+        println!("─────────────────────────────────────────────────");
+    }
+
+    println!("URL: {}", decision.input);
+    println!("Domain: {}", decision.domain);
+
+    if !decision.resolved_ips.is_empty() {
+        println!("Resolved IPs: {}", decision.resolved_ips.join(", "));
+    } else if let Some(ref err) = decision.dns_error {
+        println!("DNS Error: {}", err.red());
+    }
+    println!();
+
+    // Main result
+    match (&decision.active_proxy, decision.would_proxy) {
+        (None, true) => {
+            println!("{} NO ACTIVE PROXY CONFIGURED", "⚠".yellow());
+            println!();
+            println!("The domain matches routing rules, but no proxy is activated.");
+            println!(
+                "Run '{}' to choose a proxy.",
+                "rust_proxy activate --select".cyan()
+            );
+        }
+        (Some((id, _url)), true) => {
+            if decision.daemon_running {
+                println!("{} WOULD BE PROXIED via '{}'", "✓".green(), id.green());
+            } else {
+                println!(
+                    "{} WOULD BE PROXIED via '{}' (when daemon is running)",
+                    "✓".green(),
+                    id.green()
+                );
+            }
+        }
+        (_, false) => {
+            println!("{} WOULD NOT BE PROXIED (direct connection)", "✗".red());
+        }
+    }
+
+    println!();
+    println!("Routing Decision:");
+
+    // Domain in targets
+    if decision.domain_in_targets {
+        println!(
+            "  {} Domain '{}' is in targets list",
+            "✓".green(),
+            decision.domain
+        );
+        if let Some(ref provider) = decision.target_provider {
+            println!("    └─ Provider hint: {}", provider);
+        }
+    } else {
+        println!(
+            "  {} Domain '{}' is not in targets list",
+            "✗".red(),
+            decision.domain
+        );
+    }
+
+    // Provider range matches
+    if !decision.provider_range_matches.is_empty() {
+        for m in &decision.provider_range_matches {
+            println!("  {} IP {} matches {} range", "✓".green(), m.ip, m.provider);
+            println!("    └─ Matched range: {}", m.cidr);
+        }
+    } else if !decision.resolved_ips.is_empty() {
+        println!("  {} IPs do not match any provider range", "✗".red());
+    }
+
+    // Suggestions
+    let suggestions = build_suggestions(decision);
+    if !suggestions.is_empty() {
+        println!();
+        println!("Suggestions:");
+        for suggestion in suggestions {
+            println!("  • {}", suggestion);
+        }
+    }
+
+    // Notes
+    if !decision.daemon_running && decision.would_proxy {
+        println!();
+        println!(
+            "Note: Daemon is not running. Run '{}' to activate routing.",
+            "sudo rust_proxy daemon".cyan()
+        );
+    }
+}
+
+fn build_suggestions(decision: &RoutingDecision) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    if !decision.would_proxy {
+        suggestions.push(format!(
+            "Add domain to targets: {}",
+            format!("rust_proxy targets add {}", decision.domain).cyan()
+        ));
+    }
+
+    if decision.active_proxy.is_none() && (decision.domain_in_targets || decision.would_proxy) {
+        suggestions.push(format!(
+            "Activate a proxy: {}",
+            "rust_proxy activate --select".cyan()
+        ));
+    }
+
+    suggestions
 }
 
 fn completions_cmd(shell: Shell) {
