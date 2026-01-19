@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, ProxyConfig, Settings, TargetSpec};
+use crate::config::{AppConfig, DegradationPolicy, ProxyConfig, Settings, TargetSpec};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -541,6 +541,32 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
         );
     }
 
+    // Degradation policy validation
+    if settings.degradation_policy == DegradationPolicy::Direct && !settings.allow_direct_fallback {
+        results.push(
+            ValidationResult::error(
+                "settings",
+                "degradation_policy 'direct' requires allow_direct_fallback = true",
+            )
+            .with_id("degradation_policy")
+            .with_suggestion(
+                "Set allow_direct_fallback = true in settings to enable direct connections",
+            ),
+        );
+    }
+
+    // Warn about degradation_delay_secs == 0
+    if settings.degradation_delay_secs == 0 {
+        results.push(
+            ValidationResult::warning(
+                "settings",
+                "degradation_delay_secs = 0 means no debounce before degradation",
+            )
+            .with_id("degradation_delay_secs")
+            .with_suggestion("Consider setting to at least 5 seconds to avoid flapping"),
+        );
+    }
+
     results
 }
 
@@ -729,5 +755,54 @@ mod tests {
         assert_eq!(report.warning_count(), 1);
         assert!(report.has_errors());
         assert!(report.has_warnings());
+    }
+
+    #[test]
+    fn test_validate_degradation_policy_direct_requires_fallback() {
+        let settings = Settings {
+            degradation_policy: DegradationPolicy::Direct,
+            allow_direct_fallback: false,
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(results.iter().any(|r| {
+            r.severity == ValidationSeverity::Error && r.message.contains("allow_direct_fallback")
+        }));
+    }
+
+    #[test]
+    fn test_validate_degradation_policy_direct_with_fallback_enabled() {
+        let settings = Settings {
+            degradation_policy: DegradationPolicy::Direct,
+            allow_direct_fallback: true,
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(!results.iter().any(|r| {
+            r.severity == ValidationSeverity::Error && r.message.contains("allow_direct_fallback")
+        }));
+    }
+
+    #[test]
+    fn test_validate_degradation_delay_zero_warning() {
+        let settings = Settings {
+            degradation_delay_secs: 0,
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(results.iter().any(|r| {
+            r.severity == ValidationSeverity::Warning
+                && r.message.contains("degradation_delay_secs")
+        }));
+    }
+
+    #[test]
+    fn test_validate_degradation_policy_fail_closed_default() {
+        let settings = Settings::default();
+        let results = validate_settings(&settings);
+        // Default fail_closed should not generate degradation-related errors
+        assert!(!results.iter().any(|r| {
+            r.severity == ValidationSeverity::Error && r.message.contains("degradation_policy")
+        }));
     }
 }

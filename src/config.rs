@@ -72,6 +72,21 @@ impl Provider {
     }
 }
 
+/// Policy when all proxies become unhealthy
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationPolicy {
+    /// Reject all connections when no healthy proxy (most secure)
+    #[default]
+    FailClosed,
+    /// Try each proxy in order until one works
+    TryAll,
+    /// Use the most recently healthy proxy
+    UseLast,
+    /// Connect directly without proxy (must enable allow_direct_fallback)
+    Direct,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TargetSpec {
@@ -188,6 +203,15 @@ pub struct Settings {
     /// Delay in seconds before failing back after recovery
     #[serde(default = "default_failback_delay_secs")]
     pub failback_delay_secs: u64,
+    /// Policy when all proxies are unhealthy
+    #[serde(default)]
+    pub degradation_policy: DegradationPolicy,
+    /// Seconds to wait before applying degradation (debounce)
+    #[serde(default = "default_degradation_delay_secs")]
+    pub degradation_delay_secs: u64,
+    /// Allow direct connections as fallback (required for Direct policy)
+    #[serde(default)]
+    pub allow_direct_fallback: bool,
 }
 
 fn default_connect_max_retries() -> u32 {
@@ -230,6 +254,10 @@ fn default_failback_delay_secs() -> u64 {
     60
 }
 
+fn default_degradation_delay_secs() -> u64 {
+    5
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -252,6 +280,9 @@ impl Default for Settings {
             auto_failover: default_auto_failover(),
             auto_failback: default_auto_failback(),
             failback_delay_secs: default_failback_delay_secs(),
+            degradation_policy: DegradationPolicy::default(),
+            degradation_delay_secs: default_degradation_delay_secs(),
+            allow_direct_fallback: false,
         }
     }
 }
@@ -1012,6 +1043,32 @@ mod tests {
         assert!(settings.auto_failover);
         assert!(settings.auto_failback);
         assert_eq!(settings.failback_delay_secs, 60);
+        // Degradation settings
+        assert_eq!(settings.degradation_policy, DegradationPolicy::FailClosed);
+        assert_eq!(settings.degradation_delay_secs, 5);
+        assert!(!settings.allow_direct_fallback);
+    }
+
+    #[test]
+    fn test_degradation_policy_default() {
+        assert_eq!(DegradationPolicy::default(), DegradationPolicy::FailClosed);
+    }
+
+    #[test]
+    fn test_degradation_policy_serde() {
+        // Test that all variants serialize/deserialize correctly
+        let policies = [
+            (DegradationPolicy::FailClosed, "\"fail_closed\""),
+            (DegradationPolicy::TryAll, "\"try_all\""),
+            (DegradationPolicy::UseLast, "\"use_last\""),
+            (DegradationPolicy::Direct, "\"direct\""),
+        ];
+        for (policy, expected_json) in policies {
+            let json = serde_json::to_string(&policy).unwrap();
+            assert_eq!(json, expected_json);
+            let parsed: DegradationPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, policy);
+        }
     }
 
     #[test]
