@@ -1,7 +1,118 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use owo_colors::OwoColorize;
 use std::time::Duration;
 use url::Url;
+
+/// Helper for dry-run mode that provides consistent messaging across commands.
+///
+/// When dry-run is enabled, actions are printed with "Would: <action>" prefix
+/// and the actual operation is skipped.
+///
+/// # Example
+/// ```ignore
+/// let dry_run = DryRun::new(args.dry_run);
+/// if dry_run.would_do("remove proxy 'test'") {
+///     return Ok(());
+/// }
+/// // Actually remove the proxy...
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Infrastructure for future dry-run implementations
+pub struct DryRun {
+    enabled: bool,
+}
+
+#[allow(dead_code)] // Infrastructure for future dry-run implementations
+impl DryRun {
+    /// Create a new DryRun helper
+    pub const fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    /// Returns true if dry-run mode is enabled
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Print what would happen and return true if dry-run is enabled (caller should skip action).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let dry_run = DryRun::new(true);
+    /// if dry_run.would_do("delete config file") {
+    ///     return Ok(()); // Skip the actual deletion
+    /// }
+    /// // Actually delete the file...
+    /// ```
+    pub fn would_do(&self, action: &str) -> bool {
+        if self.enabled {
+            println!("{} {}", "Would:".yellow().bold(), action);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Print what would happen using a format string and return true if dry-run is enabled.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let dry_run = DryRun::new(true);
+    /// if dry_run.would_do_fmt(format_args!("remove proxy '{}'", proxy_id)) {
+    ///     return Ok(());
+    /// }
+    /// ```
+    pub fn would_do_fmt(&self, action: std::fmt::Arguments<'_>) -> bool {
+        if self.enabled {
+            println!("{} {}", "Would:".yellow().bold(), action);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Execute an action only if not in dry-run mode.
+    /// If in dry-run mode, prints what would happen and returns Ok(default).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let dry_run = DryRun::new(true);
+    /// let result = dry_run.execute_or_skip(
+    ///     "save configuration",
+    ///     || config.save(),
+    ///     || Ok(())
+    /// )?;
+    /// ```
+    pub fn execute_or_skip<T, E, F, D>(
+        &self,
+        action: &str,
+        op: F,
+        default: D,
+    ) -> std::result::Result<T, E>
+    where
+        F: FnOnce() -> std::result::Result<T, E>,
+        D: FnOnce() -> std::result::Result<T, E>,
+    {
+        if self.would_do(action) {
+            default()
+        } else {
+            op()
+        }
+    }
+}
+
+impl Default for DryRun {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl From<bool> for DryRun {
+    fn from(enabled: bool) -> Self {
+        Self::new(enabled)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyEndpoint {
@@ -209,5 +320,91 @@ mod tests {
     #[test]
     fn test_format_since_label_none() {
         assert_eq!(format_since_label(None), "-");
+    }
+
+    #[test]
+    fn test_dry_run_new() {
+        let dry_run = DryRun::new(true);
+        assert!(dry_run.is_enabled());
+
+        let dry_run = DryRun::new(false);
+        assert!(!dry_run.is_enabled());
+    }
+
+    #[test]
+    fn test_dry_run_default() {
+        let dry_run = DryRun::default();
+        assert!(!dry_run.is_enabled());
+    }
+
+    #[test]
+    fn test_dry_run_from_bool() {
+        let dry_run: DryRun = true.into();
+        assert!(dry_run.is_enabled());
+
+        let dry_run: DryRun = false.into();
+        assert!(!dry_run.is_enabled());
+    }
+
+    #[test]
+    fn test_dry_run_would_do_enabled() {
+        let dry_run = DryRun::new(true);
+        // When enabled, would_do returns true (skip action)
+        assert!(dry_run.would_do("test action"));
+    }
+
+    #[test]
+    fn test_dry_run_would_do_disabled() {
+        let dry_run = DryRun::new(false);
+        // When disabled, would_do returns false (execute action)
+        assert!(!dry_run.would_do("test action"));
+    }
+
+    #[test]
+    fn test_dry_run_would_do_fmt_enabled() {
+        let dry_run = DryRun::new(true);
+        let proxy_id = "test-proxy";
+        // When enabled, would_do_fmt returns true (skip action)
+        assert!(dry_run.would_do_fmt(format_args!("remove proxy '{}'", proxy_id)));
+    }
+
+    #[test]
+    fn test_dry_run_would_do_fmt_disabled() {
+        let dry_run = DryRun::new(false);
+        let proxy_id = "test-proxy";
+        // When disabled, would_do_fmt returns false (execute action)
+        assert!(!dry_run.would_do_fmt(format_args!("remove proxy '{}'", proxy_id)));
+    }
+
+    #[test]
+    fn test_dry_run_execute_or_skip_enabled() {
+        let dry_run = DryRun::new(true);
+        let mut executed = false;
+        let result: std::result::Result<i32, &str> = dry_run.execute_or_skip(
+            "test action",
+            || {
+                executed = true;
+                Ok(42)
+            },
+            || Ok(0),
+        );
+        assert!(!executed);
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_dry_run_execute_or_skip_disabled() {
+        let dry_run = DryRun::new(false);
+        let mut executed = false;
+        let result: std::result::Result<i32, &str> = dry_run.execute_or_skip(
+            "test action",
+            || {
+                executed = true;
+                Ok(42)
+            },
+            || Ok(0),
+        );
+        assert!(executed);
+        assert_eq!(result.unwrap(), 42);
     }
 }
