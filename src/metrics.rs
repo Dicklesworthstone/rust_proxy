@@ -51,7 +51,7 @@ pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 ///
 /// Labels:
 /// - `proxy`: Proxy ID (e.g., "proxy-1")
-/// - `status`: Request outcome ("success", "error", "timeout")
+/// - `status`: Request outcome ("success", "failure")
 pub static REQUESTS_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
     CounterVec::new(
         Opts::new("rust_proxy_requests_total", "Total proxy requests"),
@@ -140,6 +140,21 @@ pub static CONNECTION_RETRIES: LazyLock<CounterVec> = LazyLock::new(|| {
     .expect("Failed to create CONNECTION_RETRIES metric")
 });
 
+/// Total connections established.
+///
+/// Labels:
+/// - `proxy`: Proxy ID
+pub static CONNECTIONS_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    CounterVec::new(
+        Opts::new(
+            "rust_proxy_connections_total",
+            "Total connections established",
+        ),
+        &["proxy"],
+    )
+    .expect("Failed to create CONNECTIONS_TOTAL metric")
+});
+
 // ============================================================================
 // Gauges
 // ============================================================================
@@ -174,6 +189,21 @@ pub static PROXY_HEALTH: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("Failed to create PROXY_HEALTH metric")
 });
 
+/// Which proxy is currently effective (1=active, 0=inactive).
+///
+/// Labels:
+/// - `proxy`: Proxy ID
+pub static EFFECTIVE_PROXY: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "rust_proxy_effective_proxy",
+            "Which proxy is currently effective (1=active, 0=inactive)",
+        ),
+        &["proxy"],
+    )
+    .expect("Failed to create EFFECTIVE_PROXY metric")
+});
+
 /// Number of IPs in the ipset.
 pub static IPSET_SIZE: LazyLock<Gauge> = LazyLock::new(|| {
     Gauge::new("rust_proxy_ipset_size", "Number of IPs in the target ipset")
@@ -181,21 +211,18 @@ pub static IPSET_SIZE: LazyLock<Gauge> = LazyLock::new(|| {
 });
 
 /// Number of target domains configured.
-pub static TARGET_DOMAINS: LazyLock<Gauge> = LazyLock::new(|| {
+pub static TARGETS_COUNT: LazyLock<Gauge> = LazyLock::new(|| {
     Gauge::new(
-        "rust_proxy_target_domains",
+        "rust_proxy_targets_count",
         "Number of target domains configured",
     )
-    .expect("Failed to create TARGET_DOMAINS metric")
+    .expect("Failed to create TARGETS_COUNT metric")
 });
 
 /// Number of proxies configured.
-pub static CONFIGURED_PROXIES: LazyLock<Gauge> = LazyLock::new(|| {
-    Gauge::new(
-        "rust_proxy_configured_proxies",
-        "Number of proxies configured",
-    )
-    .expect("Failed to create CONFIGURED_PROXIES metric")
+pub static PROXIES_COUNT: LazyLock<Gauge> = LazyLock::new(|| {
+    Gauge::new("rust_proxy_proxies_count", "Number of proxies configured")
+        .expect("Failed to create PROXIES_COUNT metric")
 });
 
 /// Daemon uptime in seconds.
@@ -281,13 +308,15 @@ pub fn init_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(FAILOVERS.clone()))?;
     REGISTRY.register(Box::new(DNS_RESOLUTIONS.clone()))?;
     REGISTRY.register(Box::new(CONNECTION_RETRIES.clone()))?;
+    REGISTRY.register(Box::new(CONNECTIONS_TOTAL.clone()))?;
 
     // Gauges
     REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()))?;
     REGISTRY.register(Box::new(PROXY_HEALTH.clone()))?;
+    REGISTRY.register(Box::new(EFFECTIVE_PROXY.clone()))?;
     REGISTRY.register(Box::new(IPSET_SIZE.clone()))?;
-    REGISTRY.register(Box::new(TARGET_DOMAINS.clone()))?;
-    REGISTRY.register(Box::new(CONFIGURED_PROXIES.clone()))?;
+    REGISTRY.register(Box::new(TARGETS_COUNT.clone()))?;
+    REGISTRY.register(Box::new(PROXIES_COUNT.clone()))?;
     REGISTRY.register(Box::new(UPTIME_SECONDS.clone()))?;
 
     // Histograms
@@ -321,14 +350,16 @@ pub fn record_request_success(proxy_id: &str) {
 /// Record a failed request through a proxy.
 #[inline]
 pub fn record_request_error(proxy_id: &str) {
-    REQUESTS_TOTAL.with_label_values(&[proxy_id, "error"]).inc();
+    REQUESTS_TOTAL
+        .with_label_values(&[proxy_id, "failure"])
+        .inc();
 }
 
 /// Record a timeout during proxy request.
 #[inline]
 pub fn record_request_timeout(proxy_id: &str) {
     REQUESTS_TOTAL
-        .with_label_values(&[proxy_id, "timeout"])
+        .with_label_values(&[proxy_id, "failure"])
         .inc();
 }
 
@@ -365,6 +396,7 @@ pub fn record_failover(from_proxy: &str, to_proxy: &str) {
 /// Increment active connections for a proxy.
 #[inline]
 pub fn connection_started(proxy_id: &str) {
+    CONNECTIONS_TOTAL.with_label_values(&[proxy_id]).inc();
     ACTIVE_CONNECTIONS.with_label_values(&[proxy_id]).inc();
 }
 
@@ -375,6 +407,29 @@ pub fn connection_ended(proxy_id: &str, duration_secs: f64) {
     CONNECTION_DURATION
         .with_label_values(&[proxy_id])
         .observe(duration_secs);
+}
+
+/// Set the configured target/proxy counts.
+#[inline]
+pub fn set_target_proxy_counts(targets: usize, proxies: usize) {
+    TARGETS_COUNT.set(targets as f64);
+    PROXIES_COUNT.set(proxies as f64);
+}
+
+/// Mark the currently effective proxy (1=active, 0=inactive).
+pub fn set_effective_proxy<I, S>(proxy_ids: I, effective: Option<&str>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for proxy_id in proxy_ids {
+        let id = proxy_id.as_ref();
+        let value = match effective {
+            Some(current) if current == id => 1.0,
+            _ => 0.0,
+        };
+        EFFECTIVE_PROXY.with_label_values(&[id]).set(value);
+    }
 }
 
 #[cfg(test)]
@@ -389,8 +444,12 @@ mod tests {
         let _ = &*BYTES_RECEIVED;
         let _ = &*HEALTH_CHECKS;
         let _ = &*FAILOVERS;
+        let _ = &*CONNECTIONS_TOTAL;
         let _ = &*ACTIVE_CONNECTIONS;
         let _ = &*PROXY_HEALTH;
+        let _ = &*EFFECTIVE_PROXY;
+        let _ = &*TARGETS_COUNT;
+        let _ = &*PROXIES_COUNT;
         let _ = &*CONNECTION_DURATION;
         let _ = &*HEALTH_CHECK_LATENCY;
     }
@@ -441,6 +500,8 @@ mod tests {
         record_bytes("helper-test", 100, 200);
         record_health_check("helper-test", true, 0.05);
         record_failover("from-proxy", "to-proxy");
+        set_target_proxy_counts(3, 2);
+        set_effective_proxy(["helper-test"], Some("helper-test"));
         connection_started("helper-test");
         connection_ended("helper-test", 1.5);
         // Just verify they don't panic

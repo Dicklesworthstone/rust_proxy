@@ -1,4 +1,6 @@
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as Base64;
+use base64::Engine as _;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use owo_colors::OwoColorize;
@@ -7,8 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 mod config;
 mod dns;
@@ -120,6 +126,31 @@ enum Commands {
         /// Skip DNS resolution (only check config)
         #[arg(long)]
         no_dns: bool,
+    },
+    /// Trace full connection flow to a target through the proxy
+    Trace {
+        /// URL or domain to trace (e.g., https://api.openai.com, api.openai.com:443)
+        target: String,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+        /// Attempt TLS handshake after CONNECT
+        #[arg(long)]
+        tls: bool,
+    },
+    /// Ping a proxy and report latency statistics
+    Ping {
+        /// Proxy ID to ping (defaults to active proxy)
+        proxy_id: Option<String>,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+        /// Number of pings to send
+        #[arg(long, default_value = "3")]
+        count: u32,
+        /// Interval between pings in milliseconds
+        #[arg(long = "interval", default_value = "1000")]
+        interval_ms: u64,
     },
     /// Generate shell completions
     Completions {
@@ -280,6 +311,19 @@ async fn main() -> Result<()> {
         } => {
             let output = OutputDispatcher::from_flags(json, false);
             test_cmd(&url, verbose, no_dns, &output).await?
+        }
+        Commands::Trace { target, json, tls } => {
+            let output = OutputDispatcher::from_flags(json, false);
+            trace_cmd(&target, tls, &output).await?
+        }
+        Commands::Ping {
+            proxy_id,
+            json,
+            count,
+            interval_ms,
+        } => {
+            let output = OutputDispatcher::from_flags(json, false);
+            ping_cmd(proxy_id, count, interval_ms, &output).await?
         }
         Commands::Completions { shell } => completions_cmd(shell),
     }
@@ -1473,6 +1517,86 @@ struct ProviderMatch {
     cidr: String,
 }
 
+#[derive(Debug)]
+struct TraceTarget {
+    input: String,
+    host: String,
+    port: u16,
+    scheme: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TraceTargetInfo {
+    host: String,
+    port: u16,
+    scheme: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TraceProxyInfo {
+    id: String,
+    url: String,
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TraceReport {
+    input: String,
+    target: TraceTargetInfo,
+    resolved_ips: Vec<String>,
+    dns_error: Option<String>,
+    proxy: Option<TraceProxyInfo>,
+    steps: Vec<TraceStep>,
+    total_ms: u64,
+}
+
+#[derive(Debug, serde::Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum TraceStatus {
+    Ok,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TraceStep {
+    name: String,
+    status: TraceStatus,
+    duration_ms: Option<u64>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PingAttempt {
+    seq: u32,
+    success: bool,
+    latency_ms: Option<f64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PingSummary {
+    sent: u32,
+    received: u32,
+    loss_pct: f64,
+    min_ms: Option<f64>,
+    avg_ms: Option<f64>,
+    max_ms: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PingReport {
+    proxy_id: String,
+    proxy_url: String,
+    proxy_host: String,
+    proxy_port: u16,
+    count: u32,
+    interval_ms: u64,
+    results: Vec<PingAttempt>,
+    summary: PingSummary,
+}
+
 /// Parse a URL or domain input and extract the domain
 fn extract_domain(input: &str) -> String {
     let input = input.trim();
@@ -1495,6 +1619,31 @@ fn extract_domain(input: &str) -> String {
 
     // Fall back to treating as domain (strip path if present)
     input.split('/').next().unwrap_or(input).to_string()
+}
+
+/// Parse a trace target into host/port with sensible defaults.
+fn parse_trace_target(input: &str) -> Result<TraceTarget> {
+    let trimmed = input.trim();
+    let url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        url::Url::parse(trimmed)
+    } else {
+        url::Url::parse(&format!("https://{}", trimmed))
+    }
+    .with_context(|| format!("Invalid target: {trimmed}"))?;
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Target missing host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("Target missing port"))?;
+
+    Ok(TraceTarget {
+        input: input.to_string(),
+        host: host.to_string(),
+        port,
+        scheme: Some(url.scheme().to_string()),
+    })
 }
 
 /// Check if an IP address is within a CIDR range
@@ -1913,6 +2062,723 @@ fn build_suggestions(decision: &RoutingDecision) -> Vec<String> {
     suggestions
 }
 
+fn push_trace_step(
+    steps: &mut Vec<TraceStep>,
+    name: &str,
+    status: TraceStatus,
+    duration: Option<Duration>,
+    detail: Option<String>,
+) {
+    steps.push(TraceStep {
+        name: name.to_string(),
+        status,
+        duration_ms: duration.map(|elapsed| elapsed.as_millis() as u64),
+        detail,
+    });
+}
+
+fn push_trace_skip(steps: &mut Vec<TraceStep>, name: &str, reason: &str) {
+    push_trace_step(
+        steps,
+        name,
+        TraceStatus::Skipped,
+        None,
+        Some(reason.to_string()),
+    );
+}
+
+async fn trace_cmd(target: &str, tls: bool, output: &OutputDispatcher) -> Result<()> {
+    let config = AppConfig::load()?;
+    let target = parse_trace_target(target)?;
+
+    let mut steps = Vec::new();
+    let overall_start = Instant::now();
+
+    // Step 1: DNS resolution
+    let dns_start = Instant::now();
+    let dns_result = dns::resolve_ipv4(std::slice::from_ref(&target.host)).await;
+    let dns_duration = dns_start.elapsed();
+    let (resolved_ips, dns_error) = match dns_result {
+        Ok(ips) => {
+            let mut list: Vec<String> = ips.into_iter().collect();
+            list.sort();
+            push_trace_step(
+                &mut steps,
+                "DNS resolution",
+                TraceStatus::Ok,
+                Some(dns_duration),
+                Some(format!(
+                    "Resolved {} IP(s): {}",
+                    list.len(),
+                    if list.is_empty() {
+                        "none".to_string()
+                    } else {
+                        list.join(", ")
+                    }
+                )),
+            );
+            (list, None)
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            push_trace_step(
+                &mut steps,
+                "DNS resolution",
+                TraceStatus::Failed,
+                Some(dns_duration),
+                Some(msg.clone()),
+            );
+            (Vec::new(), Some(msg))
+        }
+    };
+
+    // Step 2: Proxy selection
+    let selection_start = Instant::now();
+    let state = StateStore::load().await?;
+    let load_balancer = LoadBalancer::new();
+    let selected_proxy = load_balancer
+        .select_proxy(
+            config.settings.load_balance_strategy,
+            &config.proxies,
+            &state,
+        )
+        .await;
+    let selection_duration = selection_start.elapsed();
+
+    let proxy_id = match selected_proxy {
+        Some(id) => {
+            push_trace_step(
+                &mut steps,
+                "Proxy selection",
+                TraceStatus::Ok,
+                Some(selection_duration),
+                Some(format!(
+                    "Selected {id} (strategy: {:?})",
+                    config.settings.load_balance_strategy
+                )),
+            );
+            id
+        }
+        None => {
+            push_trace_step(
+                &mut steps,
+                "Proxy selection",
+                TraceStatus::Failed,
+                Some(selection_duration),
+                Some("No healthy proxy available".to_string()),
+            );
+            push_trace_skip(
+                &mut steps,
+                "Proxy connect",
+                "Skipped due to proxy selection failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "CONNECT request",
+                "Skipped due to proxy selection failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "Proxy response",
+                "Skipped due to proxy selection failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "TLS handshake",
+                "Skipped due to proxy selection failure",
+            );
+
+            let report = TraceReport {
+                input: target.input.clone(),
+                target: TraceTargetInfo {
+                    host: target.host.clone(),
+                    port: target.port,
+                    scheme: target.scheme.clone(),
+                },
+                resolved_ips,
+                dns_error,
+                proxy: None,
+                steps,
+                total_ms: overall_start.elapsed().as_millis() as u64,
+            };
+            output_trace_report(&report, output);
+            return Ok(());
+        }
+    };
+
+    let proxy_cfg = match config.proxies.iter().find(|p| p.id == proxy_id) {
+        Some(proxy) => proxy,
+        None => {
+            push_trace_step(
+                &mut steps,
+                "Proxy selection",
+                TraceStatus::Failed,
+                Some(Duration::from_millis(0)),
+                Some(format!("Proxy '{proxy_id}' not found in config")),
+            );
+            push_trace_skip(
+                &mut steps,
+                "Proxy connect",
+                "Skipped due to proxy selection failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "CONNECT request",
+                "Skipped due to proxy selection failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "Proxy response",
+                "Skipped due to proxy selection failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "TLS handshake",
+                "Skipped due to proxy selection failure",
+            );
+
+            let report = TraceReport {
+                input: target.input.clone(),
+                target: TraceTargetInfo {
+                    host: target.host.clone(),
+                    port: target.port,
+                    scheme: target.scheme.clone(),
+                },
+                resolved_ips,
+                dns_error,
+                proxy: None,
+                steps,
+                total_ms: overall_start.elapsed().as_millis() as u64,
+            };
+            output_trace_report(&report, output);
+            return Ok(());
+        }
+    };
+
+    let upstream = proxy::UpstreamProxy::from_config(proxy_cfg)?;
+    let proxy_info = TraceProxyInfo {
+        id: upstream.id.clone(),
+        url: proxy_cfg.url.clone(),
+        host: upstream.host.clone(),
+        port: upstream.port,
+    };
+
+    let timeout = util::format_timeout(config.settings.health_check_timeout_ms)?;
+
+    // Step 3: Proxy TCP connect
+    let connect_start = Instant::now();
+    let connect_result = tokio::time::timeout(
+        timeout,
+        TcpStream::connect((upstream.host.as_str(), upstream.port)),
+    )
+    .await;
+    let connect_duration = connect_start.elapsed();
+
+    let mut upstream_socket = match connect_result {
+        Ok(Ok(socket)) => {
+            push_trace_step(
+                &mut steps,
+                "Proxy connect",
+                TraceStatus::Ok,
+                Some(connect_duration),
+                Some(format!("Connected to {}:{}", upstream.host, upstream.port)),
+            );
+            socket
+        }
+        Ok(Err(err)) => {
+            push_trace_step(
+                &mut steps,
+                "Proxy connect",
+                TraceStatus::Failed,
+                Some(connect_duration),
+                Some(err.to_string()),
+            );
+            push_trace_skip(
+                &mut steps,
+                "CONNECT request",
+                "Skipped due to connect failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "Proxy response",
+                "Skipped due to connect failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "TLS handshake",
+                "Skipped due to connect failure",
+            );
+
+            let report = TraceReport {
+                input: target.input.clone(),
+                target: TraceTargetInfo {
+                    host: target.host.clone(),
+                    port: target.port,
+                    scheme: target.scheme.clone(),
+                },
+                resolved_ips,
+                dns_error,
+                proxy: Some(proxy_info),
+                steps,
+                total_ms: overall_start.elapsed().as_millis() as u64,
+            };
+            output_trace_report(&report, output);
+            return Ok(());
+        }
+        Err(_) => {
+            push_trace_step(
+                &mut steps,
+                "Proxy connect",
+                TraceStatus::Failed,
+                Some(connect_duration),
+                Some("Connection timed out".to_string()),
+            );
+            push_trace_skip(
+                &mut steps,
+                "CONNECT request",
+                "Skipped due to connect failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "Proxy response",
+                "Skipped due to connect failure",
+            );
+            push_trace_skip(
+                &mut steps,
+                "TLS handshake",
+                "Skipped due to connect failure",
+            );
+
+            let report = TraceReport {
+                input: target.input.clone(),
+                target: TraceTargetInfo {
+                    host: target.host.clone(),
+                    port: target.port,
+                    scheme: target.scheme.clone(),
+                },
+                resolved_ips,
+                dns_error,
+                proxy: Some(proxy_info),
+                steps,
+                total_ms: overall_start.elapsed().as_millis() as u64,
+            };
+            output_trace_report(&report, output);
+            return Ok(());
+        }
+    };
+
+    // Step 4: CONNECT request
+    let auth_header = if let (Some(user), Some(pass)) =
+        (upstream.username.as_ref(), upstream.password.as_ref())
+    {
+        let token = Base64.encode(format!("{user}:{pass}"));
+        format!("Proxy-Authorization: Basic {}\r\n", token)
+    } else {
+        String::new()
+    };
+
+    let connect_req = format!(
+        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
+        target.host, target.port, target.host, target.port, auth_header
+    );
+
+    let request_start = Instant::now();
+    let write_result = upstream_socket.write_all(connect_req.as_bytes()).await;
+    let request_result = match write_result {
+        Ok(()) => upstream_socket.flush().await,
+        Err(err) => Err(err),
+    };
+    let request_duration = request_start.elapsed();
+
+    if let Err(err) = request_result {
+        push_trace_step(
+            &mut steps,
+            "CONNECT request",
+            TraceStatus::Failed,
+            Some(request_duration),
+            Some(err.to_string()),
+        );
+        push_trace_skip(
+            &mut steps,
+            "Proxy response",
+            "Skipped due to CONNECT failure",
+        );
+        push_trace_skip(
+            &mut steps,
+            "TLS handshake",
+            "Skipped due to CONNECT failure",
+        );
+
+        let report = TraceReport {
+            input: target.input.clone(),
+            target: TraceTargetInfo {
+                host: target.host.clone(),
+                port: target.port,
+                scheme: target.scheme.clone(),
+            },
+            resolved_ips,
+            dns_error,
+            proxy: Some(proxy_info),
+            steps,
+            total_ms: overall_start.elapsed().as_millis() as u64,
+        };
+        output_trace_report(&report, output);
+        return Ok(());
+    }
+
+    push_trace_step(
+        &mut steps,
+        "CONNECT request",
+        TraceStatus::Ok,
+        Some(request_duration),
+        Some(format!(
+            "Sent CONNECT for {}:{}{}",
+            target.host,
+            target.port,
+            if auth_header.is_empty() {
+                ""
+            } else {
+                " (with auth)"
+            }
+        )),
+    );
+
+    // Step 5: Proxy response
+    let response_start = Instant::now();
+    let mut buffer = [0u8; 1024];
+    let response_result = tokio::time::timeout(timeout, upstream_socket.read(&mut buffer)).await;
+    let response_duration = response_start.elapsed();
+
+    let mut connect_ok = false;
+    match response_result {
+        Ok(Ok(0)) => {
+            push_trace_step(
+                &mut steps,
+                "Proxy response",
+                TraceStatus::Failed,
+                Some(response_duration),
+                Some("Proxy closed connection without response".to_string()),
+            );
+        }
+        Ok(Ok(n)) => {
+            let response = String::from_utf8_lossy(&buffer[..n]);
+            let first_line = response.lines().next().unwrap_or("");
+            if first_line.contains("200") {
+                connect_ok = true;
+                push_trace_step(
+                    &mut steps,
+                    "Proxy response",
+                    TraceStatus::Ok,
+                    Some(response_duration),
+                    Some(first_line.to_string()),
+                );
+            } else {
+                push_trace_step(
+                    &mut steps,
+                    "Proxy response",
+                    TraceStatus::Failed,
+                    Some(response_duration),
+                    Some(first_line.to_string()),
+                );
+            }
+        }
+        Ok(Err(err)) => {
+            push_trace_step(
+                &mut steps,
+                "Proxy response",
+                TraceStatus::Failed,
+                Some(response_duration),
+                Some(err.to_string()),
+            );
+        }
+        Err(_) => {
+            push_trace_step(
+                &mut steps,
+                "Proxy response",
+                TraceStatus::Failed,
+                Some(response_duration),
+                Some("Response timed out".to_string()),
+            );
+        }
+    }
+
+    // Step 6: Optional TLS handshake
+    if !connect_ok {
+        push_trace_step(
+            &mut steps,
+            "TLS handshake",
+            TraceStatus::Skipped,
+            None,
+            Some("CONNECT failed".to_string()),
+        );
+    } else if !tls {
+        push_trace_step(
+            &mut steps,
+            "TLS handshake",
+            TraceStatus::Skipped,
+            None,
+            Some("Use --tls to enable".to_string()),
+        );
+    } else {
+        let tls_start = Instant::now();
+        let tls_result = tokio::time::timeout(
+            timeout,
+            perform_tls_handshake(upstream_socket, &target.host),
+        )
+        .await;
+        let tls_duration = tls_start.elapsed();
+        match tls_result {
+            Ok(Ok(())) => {
+                push_trace_step(
+                    &mut steps,
+                    "TLS handshake",
+                    TraceStatus::Ok,
+                    Some(tls_duration),
+                    Some("Handshake completed".to_string()),
+                );
+            }
+            Ok(Err(err)) => {
+                push_trace_step(
+                    &mut steps,
+                    "TLS handshake",
+                    TraceStatus::Failed,
+                    Some(tls_duration),
+                    Some(err.to_string()),
+                );
+            }
+            Err(_) => {
+                push_trace_step(
+                    &mut steps,
+                    "TLS handshake",
+                    TraceStatus::Failed,
+                    Some(tls_duration),
+                    Some("TLS handshake timed out".to_string()),
+                );
+            }
+        }
+    }
+
+    let report = TraceReport {
+        input: target.input.clone(),
+        target: TraceTargetInfo {
+            host: target.host.clone(),
+            port: target.port,
+            scheme: target.scheme.clone(),
+        },
+        resolved_ips,
+        dns_error,
+        proxy: Some(proxy_info),
+        steps,
+        total_ms: overall_start.elapsed().as_millis() as u64,
+    };
+
+    output_trace_report(&report, output);
+    Ok(())
+}
+
+fn output_trace_report(report: &TraceReport, output: &OutputDispatcher) {
+    if output.mode().is_json() {
+        output.print_json(report);
+        return;
+    }
+
+    println!(
+        "Trace target: {} ({}:{})",
+        report.input, report.target.host, report.target.port
+    );
+    if let Some(proxy) = &report.proxy {
+        println!("Proxy: {} ({})", proxy.id, proxy.url);
+    } else {
+        println!("Proxy: -");
+    }
+    println!();
+
+    let total_steps = report.steps.len();
+    for (idx, step) in report.steps.iter().enumerate() {
+        let status = match step.status {
+            TraceStatus::Ok => "OK".green().to_string(),
+            TraceStatus::Failed => "FAIL".red().to_string(),
+            TraceStatus::Skipped => "SKIP".yellow().to_string(),
+        };
+        let duration = step
+            .duration_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "[{}/{}] {:<16} {} ({})",
+            idx + 1,
+            total_steps,
+            step.name,
+            status,
+            duration
+        );
+        if let Some(detail) = &step.detail {
+            println!("         {}", detail);
+        }
+    }
+
+    println!();
+    println!("Total: {}ms", report.total_ms);
+}
+
+async fn perform_tls_handshake(stream: TcpStream, host: &str) -> Result<()> {
+    let native = rustls_native_certs::load_native_certs();
+    if native.certs.is_empty() {
+        anyhow::bail!("No native TLS certificates available");
+    }
+
+    let mut roots = RootCertStore::empty();
+    for cert in native.certs {
+        roots
+            .add(cert)
+            .context("Failed to add TLS root certificate")?;
+    }
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(host)
+        .map_err(|_| anyhow::anyhow!("Invalid server name for TLS: {host}"))?
+        .to_owned();
+
+    connector
+        .connect(server_name, stream)
+        .await
+        .context("TLS handshake failed")?;
+    Ok(())
+}
+
+async fn ping_cmd(
+    proxy_id: Option<String>,
+    count: u32,
+    interval_ms: u64,
+    output: &OutputDispatcher,
+) -> Result<()> {
+    if count == 0 {
+        bail!("count must be greater than 0");
+    }
+
+    let config = AppConfig::load()?;
+    let selected_id = match proxy_id {
+        Some(id) => id,
+        None => config
+            .active_proxy
+            .clone()
+            .context("No proxy ID provided and no active proxy configured")?,
+    };
+
+    let proxy_cfg = config
+        .proxies
+        .iter()
+        .find(|p| p.id == selected_id)
+        .context("Proxy ID not found in config")?;
+    let upstream = proxy::UpstreamProxy::from_config(proxy_cfg)?;
+
+    let timeout_ms = config.settings.health_check_timeout_ms;
+    let mut results = Vec::with_capacity(count as usize);
+    let mut latencies = Vec::new();
+
+    if !output.mode().is_json() {
+        println!(
+            "PING {} ({}:{})",
+            proxy_cfg.id, upstream.host, upstream.port
+        );
+    }
+
+    for seq in 1..=count {
+        let result = health::check_proxy_health(proxy_cfg, timeout_ms).await;
+        if result.success {
+            latencies.push(result.latency_ms);
+            results.push(PingAttempt {
+                seq,
+                success: true,
+                latency_ms: Some(result.latency_ms),
+                error: None,
+            });
+            if !output.mode().is_json() {
+                println!("Response {}: time={:.0}ms", seq, result.latency_ms);
+            }
+        } else {
+            let error = result
+                .failure_reason
+                .clone()
+                .unwrap_or_else(|| "failed".to_string());
+            results.push(PingAttempt {
+                seq,
+                success: false,
+                latency_ms: None,
+                error: Some(error.clone()),
+            });
+            if !output.mode().is_json() {
+                println!("Response {}: FAIL ({})", seq, error);
+            }
+        }
+
+        if seq < count {
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        }
+    }
+
+    let sent = count;
+    let received = latencies.len() as u32;
+    let loss_pct = if sent == 0 {
+        0.0
+    } else {
+        ((sent - received) as f64 / sent as f64) * 100.0
+    };
+    let (min_ms, max_ms, avg_ms) = if latencies.is_empty() {
+        (None, None, None)
+    } else {
+        let min = latencies.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = latencies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
+        (Some(min), Some(max), Some(avg))
+    };
+
+    let summary = PingSummary {
+        sent,
+        received,
+        loss_pct,
+        min_ms,
+        avg_ms,
+        max_ms,
+    };
+
+    let report = PingReport {
+        proxy_id: proxy_cfg.id.clone(),
+        proxy_url: proxy_cfg.url.clone(),
+        proxy_host: upstream.host,
+        proxy_port: upstream.port,
+        count,
+        interval_ms,
+        results,
+        summary,
+    };
+
+    if output.mode().is_json() {
+        output.print_json(&report);
+        return Ok(());
+    }
+
+    println!("--- {} statistics ---", report.proxy_id);
+    println!(
+        "{} requests, {} responses, {:.0}% loss",
+        report.summary.sent, report.summary.received, report.summary.loss_pct
+    );
+    if let (Some(min), Some(avg), Some(max)) = (
+        report.summary.min_ms,
+        report.summary.avg_ms,
+        report.summary.max_ms,
+    ) {
+        println!("min/avg/max = {:.0}/{:.1}/{:.0} ms", min, avg, max);
+    } else {
+        println!("No successful responses");
+    }
+
+    Ok(())
+}
+
 fn completions_cmd(shell: Shell) {
     let mut cmd = Cli::command();
     generate(shell, &mut cmd, "rust_proxy", &mut std::io::stdout());
@@ -1953,6 +2819,12 @@ async fn run_daemon() -> Result<()> {
     if config.targets.is_empty() {
         bail!("No targets configured. Add domains with `rust_proxy targets add`.");
     }
+
+    metrics::set_target_proxy_counts(config.targets.len(), config.proxies.len());
+    metrics::set_effective_proxy(
+        config.proxies.iter().map(|p| p.id.as_str()),
+        active_id.as_deref(),
+    );
 
     // Collect all proxy hosts to exclude from iptables (prevents redirect loops)
     let mut upstream_hosts = Vec::new();

@@ -17,10 +17,12 @@ libc = "0.2"
 owo-colors = "4.1"
 prometheus = "0.14"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
+rustls-native-certs = "0.8.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tabled = "0.20"
 tokio = { version = "1.35", features = ["full"] }
+tokio-rustls = "0.26.4"
 toml = "0.9"
 tower = "0.5"
 tracing = "0.1"

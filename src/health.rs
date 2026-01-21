@@ -253,6 +253,10 @@ pub async fn health_check_loop(
                         // Record failover metric
                         metrics::record_failover(&event.from_proxy, &event.to_proxy);
                         runtime.failover_to(&event.to_proxy).await;
+                        metrics::set_effective_proxy(
+                            config.proxies.iter().map(|p| p.id.as_str()),
+                            Some(&event.to_proxy),
+                        );
                     }
                 }
 
@@ -271,6 +275,10 @@ pub async fn health_check_loop(
                         metrics::record_failover(&from, &to);
                     }
                     runtime.failback().await;
+                    metrics::set_effective_proxy(
+                        config.proxies.iter().map(|p| p.id.as_str()),
+                        original.as_deref(),
+                    );
                 }
             }
         }

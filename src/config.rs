@@ -122,6 +122,107 @@ impl LoadBalanceStrategy {
     }
 }
 
+/// Health check target configuration
+/// Specifies how proxies are health-checked: via HTTP CONNECT or HTTP GET
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthCheckTarget {
+    /// CONNECT to host:port (default: www.google.com:443)
+    Connect { host: String, port: u16 },
+    /// GET request to a URL
+    Get { url: String },
+}
+
+impl Default for HealthCheckTarget {
+    fn default() -> Self {
+        Self::Connect {
+            host: "www.google.com".to_string(),
+            port: 443,
+        }
+    }
+}
+
+impl HealthCheckTarget {
+    /// Parse from string format: "CONNECT host:port" or "GET url"
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if let Some(rest) = s.strip_prefix("CONNECT ") {
+            let rest = rest.trim();
+            Self::parse_connect(rest)
+        } else if let Some(rest) = s.strip_prefix("GET ") {
+            let rest = rest.trim();
+            Self::parse_get(rest)
+        } else {
+            // Try to parse as host:port (implicit CONNECT)
+            if s.contains(':') && !s.contains("://") {
+                Self::parse_connect(s)
+            } else {
+                anyhow::bail!(
+                    "Invalid health check target format: '{}'. Expected 'CONNECT host:port' or 'GET url'",
+                    s
+                )
+            }
+        }
+    }
+
+    fn parse_connect(s: &str) -> Result<Self> {
+        let parts: Vec<&str> = s.rsplitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "Invalid CONNECT target: '{}'. Expected 'host:port'",
+                s
+            );
+        }
+        let port: u16 = parts[0].parse().context(format!(
+            "Invalid port in CONNECT target: '{}'",
+            parts[0]
+        ))?;
+        let host = parts[1].to_string();
+        if host.is_empty() {
+            anyhow::bail!("Empty host in CONNECT target");
+        }
+        Ok(Self::Connect { host, port })
+    }
+
+    fn parse_get(s: &str) -> Result<Self> {
+        // Validate URL format
+        if !s.starts_with("http://") && !s.starts_with("https://") {
+            anyhow::bail!(
+                "Invalid GET target: '{}'. URL must start with http:// or https://",
+                s
+            );
+        }
+        url::Url::parse(s).context(format!("Invalid URL in GET target: '{}'", s))?;
+        Ok(Self::Get { url: s.to_string() })
+    }
+
+    /// Format for display
+    pub fn to_string_format(&self) -> String {
+        match self {
+            Self::Connect { host, port } => format!("CONNECT {}:{}", host, port),
+            Self::Get { url } => format!("GET {}", url),
+        }
+    }
+}
+
+impl Serialize for HealthCheckTarget {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string_format())
+    }
+}
+
+impl<'de> Deserialize<'de> for HealthCheckTarget {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TargetSpec {
@@ -238,6 +339,9 @@ pub struct Settings {
     /// Timeout for health check connections in milliseconds
     #[serde(default = "default_health_check_timeout_ms")]
     pub health_check_timeout_ms: u64,
+    /// Target for health checks: "CONNECT host:port" or "GET url"
+    #[serde(default)]
+    pub health_check_target: HealthCheckTarget,
     /// Number of consecutive failures before marking proxy unhealthy
     #[serde(default = "default_consecutive_failures_threshold")]
     pub consecutive_failures_threshold: u32,
@@ -346,6 +450,7 @@ impl Default for Settings {
             health_check_enabled: default_health_check_enabled(),
             health_check_interval_secs: default_health_check_interval_secs(),
             health_check_timeout_ms: default_health_check_timeout_ms(),
+            health_check_target: HealthCheckTarget::default(),
             consecutive_failures_threshold: default_consecutive_failures_threshold(),
             auto_failover: default_auto_failover(),
             auto_failback: default_auto_failback(),
@@ -1593,6 +1698,14 @@ fn diff_settings(old: &Settings, new: &Settings, diff: &mut ConfigDiff) {
             name: "health_check_timeout_ms".to_string(),
             old_value: old.health_check_timeout_ms.to_string(),
             new_value: new.health_check_timeout_ms.to_string(),
+        });
+    }
+
+    if old.health_check_target != new.health_check_target {
+        diff.settings_changed.push(SettingChange {
+            name: "health_check_target".to_string(),
+            old_value: old.health_check_target.to_string_format(),
+            new_value: new.health_check_target.to_string_format(),
         });
     }
 
