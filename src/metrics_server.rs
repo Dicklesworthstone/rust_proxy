@@ -81,7 +81,7 @@ mod tests {
         // Just verify the handler doesn't panic
         let result = metrics_handler().await;
         // Result may be empty if metrics aren't registered, but should be a valid string
-        assert!(result.is_empty() || result.contains("rust_proxy") || result.len() >= 0);
+        assert!(result.is_empty() || result.contains("rust_proxy"));
     }
 
     #[tokio::test]
