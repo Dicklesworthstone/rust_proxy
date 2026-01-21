@@ -978,13 +978,213 @@ pub fn state_dir() -> Result<PathBuf> {
 }
 
 // =============================================================================
+// Config Holder — Thread-safe config access with atomic reload
+// =============================================================================
+
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
+
+/// Thread-safe configuration holder with atomic reload support.
+///
+/// This struct provides:
+/// - Concurrent read access via `get()` (cheap Arc clone)
+/// - Atomic config reload via `reload()`
+/// - Change notifications via broadcast channel
+///
+/// Components that need to react to config changes should call `subscribe()`
+/// and listen for `ConfigDiff` messages.
+#[derive(Clone)]
+pub struct ConfigHolder {
+    inner: Arc<RwLock<AppConfig>>,
+    path: PathBuf,
+    change_tx: broadcast::Sender<ConfigDiff>,
+}
+
+impl ConfigHolder {
+    /// Create a new ConfigHolder with the given config and path.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Initial configuration
+    /// * `path` - Path to the config file (for reload)
+    pub fn new(config: AppConfig, path: PathBuf) -> Self {
+        // Channel capacity of 16 should be plenty for config changes
+        let (change_tx, _) = broadcast::channel(16);
+        Self {
+            inner: Arc::new(RwLock::new(config)),
+            path,
+            change_tx,
+        }
+    }
+
+    /// Load config from the default path and create a holder.
+    pub fn load() -> Result<Self> {
+        let path = config_path()?;
+        let config = AppConfig::load()?;
+        Ok(Self::new(config, path))
+    }
+
+    /// Load config from a specific path and create a holder.
+    pub fn load_from(path: PathBuf) -> Result<Self> {
+        let config = if path.exists() {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed reading config {}", path.display()))?;
+            toml::from_str(&content)
+                .with_context(|| format!("Failed parsing config {}", path.display()))?
+        } else {
+            AppConfig::default()
+        };
+        Ok(Self::new(config, path))
+    }
+
+    /// Get current config (cheap clone of Arc contents).
+    ///
+    /// This acquires a read lock briefly to clone the config.
+    /// For hot paths that need the config frequently, consider
+    /// caching the result locally for the duration of the operation.
+    pub async fn get(&self) -> AppConfig {
+        self.inner.read().await.clone()
+    }
+
+    /// Get the path to the config file.
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    /// Subscribe to config change notifications.
+    ///
+    /// Returns a receiver that will receive `ConfigDiff` messages
+    /// whenever the config is reloaded with changes.
+    pub fn subscribe(&self) -> broadcast::Receiver<ConfigDiff> {
+        self.change_tx.subscribe()
+    }
+
+    /// Attempt to reload config from disk.
+    ///
+    /// Returns:
+    /// - `Ok(Some(diff))` if reload succeeded with changes
+    /// - `Ok(None)` if config unchanged
+    /// - `Err` if config invalid (keeps running with old config)
+    ///
+    /// On successful reload with changes:
+    /// 1. Logs all changes
+    /// 2. Atomically swaps the config
+    /// 3. Sends `ConfigDiff` to all subscribers
+    pub async fn reload(&self) -> Result<Option<ConfigDiff>> {
+        // 1. Load new config from disk
+        let new_config = match Self::load_config_from_path(&self.path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "Failed to parse config, keeping current"
+                );
+                return Err(e);
+            }
+        };
+
+        // 2. Validate new config (basic validation)
+        if let Err(e) = Self::validate_config(&new_config) {
+            tracing::error!(
+                error = %e,
+                "New config invalid, keeping current"
+            );
+            return Err(e);
+        }
+
+        // 3. Compute diff (hold read lock briefly)
+        let diff = {
+            let old_config = self.inner.read().await;
+            diff_configs(&old_config, &new_config)
+        };
+
+        if diff.is_empty() {
+            tracing::debug!("Config unchanged, no reload needed");
+            return Ok(None);
+        }
+
+        // 4. Log what's changing
+        diff.log();
+
+        // 5. Atomic swap (hold write lock briefly)
+        {
+            let mut config = self.inner.write().await;
+            *config = new_config;
+        }
+
+        tracing::info!(
+            summary = %diff.summary(),
+            "Configuration reloaded successfully"
+        );
+
+        // 6. Notify subscribers (ignore send errors if no receivers)
+        let _ = self.change_tx.send(diff.clone());
+
+        Ok(Some(diff))
+    }
+
+    /// Load config from a specific path (internal helper).
+    fn load_config_from_path(path: &PathBuf) -> Result<AppConfig> {
+        if !path.exists() {
+            return Ok(AppConfig::default());
+        }
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed reading config {}", path.display()))?;
+        let config: AppConfig = toml::from_str(&content)
+            .with_context(|| format!("Failed parsing config {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Basic validation of config (internal helper).
+    ///
+    /// Returns Err if config has obvious problems that would cause
+    /// runtime failures.
+    fn validate_config(config: &AppConfig) -> Result<()> {
+        // Validate listen port is in valid range
+        if config.settings.listen_port == 0 {
+            anyhow::bail!("listen_port cannot be 0");
+        }
+
+        // Validate active_proxy references a valid proxy if set
+        if let Some(ref active) = config.active_proxy {
+            if !config.proxies.iter().any(|p| &p.id == active) {
+                anyhow::bail!(
+                    "active_proxy '{}' does not match any configured proxy",
+                    active
+                );
+            }
+        }
+
+        // Validate proxy IDs are unique
+        let mut seen_ids = std::collections::HashSet::new();
+        for proxy in &config.proxies {
+            if !seen_ids.insert(&proxy.id) {
+                anyhow::bail!("duplicate proxy id: {}", proxy.id);
+            }
+        }
+
+        // Validate proxy URLs are non-empty
+        for proxy in &config.proxies {
+            if proxy.url.is_empty() {
+                anyhow::bail!("proxy '{}' has empty url", proxy.id);
+            }
+        }
+
+        // Validate metrics port if metrics enabled
+        if config.settings.metrics_enabled && config.settings.metrics_port == 0 {
+            anyhow::bail!("metrics_port cannot be 0 when metrics are enabled");
+        }
+
+        Ok(())
+    }
+}
+
+// =============================================================================
 // Config Diff — Detect changes between two AppConfig instances
 // =============================================================================
-// Note: These are intentionally marked #[allow(dead_code)] because they will be
-// integrated in rust_proxy-7or (atomic config reload mechanism).
 
 /// Represents a change to a single setting field.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingChange {
     pub name: String,
@@ -993,7 +1193,6 @@ pub struct SettingChange {
 }
 
 /// Represents a modification to an existing proxy.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyModification {
     pub proxy_id: String,
@@ -1005,7 +1204,6 @@ pub struct ProxyModification {
 /// Captures all differences between two AppConfig instances.
 ///
 /// Used for targeted reload (only update what changed) and clear logging.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConfigDiff {
     /// Proxy IDs that were added
@@ -1026,7 +1224,6 @@ pub struct ConfigDiff {
     pub listen_port_changed: bool,
 }
 
-#[allow(dead_code)]
 impl ConfigDiff {
     /// Returns true if there are no differences.
     pub fn is_empty(&self) -> bool {
@@ -1127,7 +1324,6 @@ impl ConfigDiff {
 /// Compare two AppConfig instances and produce a ConfigDiff.
 ///
 /// This enables targeted reload (only update what changed) and clear logging.
-#[allow(dead_code)]
 pub fn diff_configs(old: &AppConfig, new: &AppConfig) -> ConfigDiff {
     use std::collections::HashSet;
 
@@ -1177,7 +1373,6 @@ pub fn diff_configs(old: &AppConfig, new: &AppConfig) -> ConfigDiff {
 }
 
 /// Compare two ProxyConfig instances and record modifications.
-#[allow(dead_code)]
 fn diff_proxy(old: &ProxyConfig, new: &ProxyConfig, modifications: &mut Vec<ProxyModification>) {
     let proxy_id = &new.id;
 
@@ -1231,7 +1426,6 @@ fn diff_proxy(old: &ProxyConfig, new: &ProxyConfig, modifications: &mut Vec<Prox
 }
 
 /// Compare two Settings instances and record changes.
-#[allow(dead_code)]
 fn diff_settings(old: &Settings, new: &Settings, diff: &mut ConfigDiff) {
     // Listen port - special handling as it requires restart
     if old.listen_port != new.listen_port {
@@ -1999,5 +2193,323 @@ mod tests {
             ..Default::default()
         };
         assert!(diff_with_listen.requires_restart());
+    }
+
+    // ==========================================================================
+    // ConfigHolder Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_config_holder_new() {
+        let config = make_minimal_config();
+        let path = PathBuf::from("/tmp/test-config.toml");
+        let holder = ConfigHolder::new(config.clone(), path.clone());
+
+        assert_eq!(holder.path(), &path);
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_get() {
+        let mut config = make_minimal_config();
+        config.active_proxy = Some("test-proxy".to_string());
+        let holder = ConfigHolder::new(config, PathBuf::from("/tmp/test.toml"));
+
+        let retrieved = holder.get().await;
+        assert_eq!(retrieved.active_proxy, Some("test-proxy".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_subscribe() {
+        let config = make_minimal_config();
+        let holder = ConfigHolder::new(config, PathBuf::from("/tmp/test.toml"));
+
+        // Should be able to create multiple subscribers
+        let _rx1 = holder.subscribe();
+        let _rx2 = holder.subscribe();
+    }
+
+    #[test]
+    fn test_config_holder_validate_empty_url() {
+        let mut config = make_minimal_config();
+        config.proxies.push(ProxyConfig {
+            id: "bad-proxy".to_string(),
+            url: "".to_string(),
+            auth: ProxyAuth::default(),
+            priority: None,
+            health_check_url: None,
+            weight: 100,
+        });
+
+        let result = ConfigHolder::validate_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty url"));
+    }
+
+    #[test]
+    fn test_config_holder_validate_duplicate_proxy_id() {
+        let mut config = make_minimal_config();
+        config
+            .proxies
+            .push(make_test_proxy("same-id", "http://a:8080"));
+        config
+            .proxies
+            .push(make_test_proxy("same-id", "http://b:8080"));
+
+        let result = ConfigHolder::validate_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate proxy id"));
+    }
+
+    #[test]
+    fn test_config_holder_validate_invalid_active_proxy() {
+        let mut config = make_minimal_config();
+        config.active_proxy = Some("nonexistent".to_string());
+
+        let result = ConfigHolder::validate_config(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not match any configured proxy"));
+    }
+
+    #[test]
+    fn test_config_holder_validate_zero_listen_port() {
+        let mut config = make_minimal_config();
+        config.settings.listen_port = 0;
+
+        let result = ConfigHolder::validate_config(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("listen_port cannot be 0"));
+    }
+
+    #[test]
+    fn test_config_holder_validate_zero_metrics_port_when_enabled() {
+        let mut config = make_minimal_config();
+        config.settings.metrics_enabled = true;
+        config.settings.metrics_port = 0;
+
+        let result = ConfigHolder::validate_config(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("metrics_port cannot be 0"));
+    }
+
+    #[test]
+    fn test_config_holder_validate_valid_config() {
+        let mut config = make_minimal_config();
+        config
+            .proxies
+            .push(make_test_proxy("proxy-1", "http://proxy:8080"));
+        config.active_proxy = Some("proxy-1".to_string());
+
+        let result = ConfigHolder::validate_config(&config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_reload_nonexistent_file() {
+        let config = make_minimal_config();
+        let path = PathBuf::from("/tmp/nonexistent-config-12345.toml");
+        let holder = ConfigHolder::new(config, path);
+
+        // Reload should return Ok(None) for nonexistent file (uses default)
+        // The file doesn't exist, so it loads default, which is same as what we started with
+        let result = holder.reload().await;
+        assert!(result.is_ok());
+        // Since we started with minimal config (similar to default), diff may be non-empty
+        // due to default targets. Let's just check it doesn't error.
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_reload_with_temp_file() {
+        use std::io::Write;
+
+        // Create initial config
+        let mut config = make_minimal_config();
+        config
+            .proxies
+            .push(make_test_proxy("proxy-1", "http://old:8080"));
+        config.active_proxy = Some("proxy-1".to_string());
+
+        // Create temp file with updated config
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let new_config_toml = r#"
+[[proxies]]
+id = "proxy-1"
+url = "http://new:9090"
+weight = 100
+
+[settings]
+listen_port = 12345
+dns_refresh_secs = 300
+ping_interval_secs = 60
+ping_timeout_ms = 1500
+ipset_name = "rust_proxy_targets"
+chain_name = "RUST_PROXY"
+include_aws_ip_ranges = true
+include_cloudflare_ip_ranges = true
+include_google_ip_ranges = true
+
+active_proxy = "proxy-1"
+"#;
+        temp_file.write_all(new_config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let holder = ConfigHolder::new(config, temp_file.path().to_path_buf());
+
+        // Subscribe before reload
+        let mut rx = holder.subscribe();
+
+        // Reload should detect the URL change
+        let result = holder.reload().await;
+        assert!(result.is_ok());
+        let diff = result.unwrap();
+        assert!(diff.is_some());
+
+        let diff = diff.unwrap();
+        assert!(!diff.proxies_modified.is_empty());
+
+        // Check subscriber received notification
+        let received_diff = rx.try_recv();
+        assert!(received_diff.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_reload_no_changes() {
+        use std::io::Write;
+
+        // Create config
+        let mut config = make_minimal_config();
+        config
+            .proxies
+            .push(make_test_proxy("proxy-1", "http://proxy:8080"));
+        config.active_proxy = Some("proxy-1".to_string());
+
+        // Create temp file with same config
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_toml = r#"
+[[proxies]]
+id = "proxy-1"
+url = "http://proxy:8080"
+weight = 100
+
+active_proxy = "proxy-1"
+
+[settings]
+listen_port = 12345
+dns_refresh_secs = 300
+ping_interval_secs = 60
+ping_timeout_ms = 1500
+ipset_name = "rust_proxy_targets"
+chain_name = "RUST_PROXY"
+include_aws_ip_ranges = true
+include_cloudflare_ip_ranges = true
+include_google_ip_ranges = true
+"#;
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let holder = ConfigHolder::new(config, temp_file.path().to_path_buf());
+
+        // Reload should return None (no changes)
+        let result = holder.reload().await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_reload_invalid_toml() {
+        use std::io::Write;
+
+        let config = make_minimal_config();
+
+        // Create temp file with invalid TOML
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file
+            .write_all(b"this is not valid toml [[[")
+            .unwrap();
+        temp_file.flush().unwrap();
+
+        let holder = ConfigHolder::new(config, temp_file.path().to_path_buf());
+
+        // Reload should fail
+        let result = holder.reload().await;
+        assert!(result.is_err());
+
+        // Original config should be preserved
+        let current = holder.get().await;
+        assert!(current.proxies.is_empty()); // Still minimal config
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_reload_invalid_config() {
+        use std::io::Write;
+
+        let mut config = make_minimal_config();
+        config
+            .proxies
+            .push(make_test_proxy("proxy-1", "http://proxy:8080"));
+
+        // Create temp file with config that has invalid active_proxy reference
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_toml = r#"
+[[proxies]]
+id = "proxy-1"
+url = "http://proxy:8080"
+weight = 100
+
+active_proxy = "nonexistent-proxy"
+
+[settings]
+listen_port = 12345
+dns_refresh_secs = 300
+ping_interval_secs = 60
+ping_timeout_ms = 1500
+ipset_name = "rust_proxy_targets"
+chain_name = "RUST_PROXY"
+include_aws_ip_ranges = true
+include_cloudflare_ip_ranges = true
+include_google_ip_ranges = true
+"#;
+        temp_file.write_all(config_toml.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let holder = ConfigHolder::new(config, temp_file.path().to_path_buf());
+
+        // Reload should fail validation
+        let result = holder.reload().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not match any configured proxy"));
+    }
+
+    #[tokio::test]
+    async fn test_config_holder_concurrent_access() {
+        let config = make_minimal_config();
+        let holder = ConfigHolder::new(config, PathBuf::from("/tmp/test.toml"));
+
+        // Spawn multiple concurrent readers
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let h = holder.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    let _ = h.get().await;
+                }
+            }));
+        }
+
+        // All should complete without deadlock
+        for handle in handles {
+            handle.await.unwrap();
+        }
     }
 }

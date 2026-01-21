@@ -280,7 +280,7 @@ mod tests {
     fn test_select_single_by_priority() {
         let balancer = LoadBalancer::new();
 
-        let proxies = vec![
+        let proxies = [
             make_proxy("low-priority", Some(100), 100),
             make_proxy("high-priority", Some(1), 100),
             make_proxy("medium-priority", Some(50), 100),
@@ -295,7 +295,7 @@ mod tests {
     fn test_select_single_default_priority() {
         let balancer = LoadBalancer::new();
 
-        let proxies = vec![
+        let proxies = [
             make_proxy("no-priority", None, 100),
             make_proxy("explicit-priority", Some(50), 100),
         ];
@@ -309,7 +309,7 @@ mod tests {
     fn test_round_robin_cycles() {
         let balancer = LoadBalancer::new();
 
-        let proxies = vec![
+        let proxies = [
             make_proxy("a", None, 100),
             make_proxy("b", None, 100),
             make_proxy("c", None, 100),
@@ -330,7 +330,7 @@ mod tests {
         // Proxy A has weight 3, proxy B has weight 1
         // Total weight = 4
         // Over 4 selections, A should be selected ~3 times, B ~1 time
-        let proxies = vec![make_proxy("a", None, 3), make_proxy("b", None, 1)];
+        let proxies = [make_proxy("a", None, 3), make_proxy("b", None, 1)];
         let refs: Vec<_> = proxies.iter().collect();
 
         let mut a_count = 0;
@@ -352,7 +352,7 @@ mod tests {
     fn test_weighted_zero_weight_skipped() {
         let balancer = LoadBalancer::new();
 
-        let proxies = vec![
+        let proxies = [
             make_proxy("zero", None, 0),
             make_proxy("nonzero", None, 100),
         ];
@@ -369,7 +369,7 @@ mod tests {
     fn test_weighted_all_zero_fallback() {
         let balancer = LoadBalancer::new();
 
-        let proxies = vec![make_proxy("zero1", None, 0), make_proxy("zero2", None, 0)];
+        let proxies = [make_proxy("zero1", None, 0), make_proxy("zero2", None, 0)];
         let refs: Vec<_> = proxies.iter().collect();
 
         // Should fall back to first proxy when all weights are zero
