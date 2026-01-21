@@ -1105,7 +1105,10 @@ impl ConfigDiff {
             parts.push(format!("{} target(s) removed", self.targets_removed.len()));
         }
         if !self.settings_changed.is_empty() {
-            parts.push(format!("{} setting(s) changed", self.settings_changed.len()));
+            parts.push(format!(
+                "{} setting(s) changed",
+                self.settings_changed.len()
+            ));
         }
         if self.active_proxy_changed {
             parts.push("active proxy changed".to_string());
@@ -1727,7 +1730,8 @@ mod tests {
         let old = make_minimal_config();
         let mut new = make_minimal_config();
 
-        new.proxies.push(make_test_proxy("new-proxy", "http://proxy:8080"));
+        new.proxies
+            .push(make_test_proxy("new-proxy", "http://proxy:8080"));
 
         let diff = diff_configs(&old, &new);
 
@@ -1741,7 +1745,8 @@ mod tests {
     #[test]
     fn test_config_diff_proxy_removed() {
         let mut old = make_minimal_config();
-        old.proxies.push(make_test_proxy("old-proxy", "http://proxy:8080"));
+        old.proxies
+            .push(make_test_proxy("old-proxy", "http://proxy:8080"));
 
         let new = make_minimal_config();
 
@@ -1755,10 +1760,12 @@ mod tests {
     #[test]
     fn test_config_diff_proxy_modified() {
         let mut old = make_minimal_config();
-        old.proxies.push(make_test_proxy("my-proxy", "http://old:8080"));
+        old.proxies
+            .push(make_test_proxy("my-proxy", "http://old:8080"));
 
         let mut new = make_minimal_config();
-        new.proxies.push(make_test_proxy("my-proxy", "http://new:9090"));
+        new.proxies
+            .push(make_test_proxy("my-proxy", "http://new:9090"));
 
         let diff = diff_configs(&old, &new);
 
@@ -1795,7 +1802,8 @@ mod tests {
         let old = make_minimal_config();
         let mut new = make_minimal_config();
 
-        new.targets.push(TargetSpec::Simple("api.anthropic.com".to_string()));
+        new.targets
+            .push(TargetSpec::Simple("api.anthropic.com".to_string()));
 
         let diff = diff_configs(&old, &new);
 
@@ -1807,7 +1815,8 @@ mod tests {
     #[test]
     fn test_config_diff_target_removed() {
         let mut old = make_minimal_config();
-        old.targets.push(TargetSpec::Simple("api.openai.com".to_string()));
+        old.targets
+            .push(TargetSpec::Simple("api.openai.com".to_string()));
 
         let new = make_minimal_config();
 
@@ -1891,7 +1900,11 @@ mod tests {
         let diff = diff_configs(&old, &new);
 
         assert_eq!(diff.settings_changed.len(), 2);
-        let names: Vec<_> = diff.settings_changed.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<_> = diff
+            .settings_changed
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert!(names.contains(&"dns_refresh_secs"));
         assert!(names.contains(&"ping_interval_secs"));
     }
@@ -1927,16 +1940,20 @@ mod tests {
     #[test]
     fn test_config_diff_complex_changes() {
         let mut old = make_minimal_config();
-        old.proxies.push(make_test_proxy("proxy-a", "http://a:8080"));
-        old.proxies.push(make_test_proxy("proxy-b", "http://b:8080"));
+        old.proxies
+            .push(make_test_proxy("proxy-a", "http://a:8080"));
+        old.proxies
+            .push(make_test_proxy("proxy-b", "http://b:8080"));
         old.targets.push(TargetSpec::Simple("old.com".to_string()));
         old.active_proxy = Some("proxy-a".to_string());
         old.settings.health_check_interval_secs = 30;
 
         let mut new = make_minimal_config();
         // proxy-a removed, proxy-b kept, proxy-c added
-        new.proxies.push(make_test_proxy("proxy-b", "http://b:8080"));
-        new.proxies.push(make_test_proxy("proxy-c", "http://c:8080"));
+        new.proxies
+            .push(make_test_proxy("proxy-b", "http://b:8080"));
+        new.proxies
+            .push(make_test_proxy("proxy-c", "http://c:8080"));
         // old.com removed, new.com added
         new.targets.push(TargetSpec::Simple("new.com".to_string()));
         new.active_proxy = Some("proxy-c".to_string());
