@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, ProxyConfig};
+use crate::config::{AppConfig, HealthCheckTarget, ProxyConfig};
 use crate::metrics;
 use crate::state::{HealthStatus, RuntimeState, StateStore};
 use anyhow::Result;
@@ -17,8 +17,12 @@ pub struct HealthCheckResult {
 }
 
 /// Perform a health check on a single proxy by testing TCP connectivity
-/// and HTTP CONNECT capability
-pub async fn check_proxy_health(proxy: &ProxyConfig, timeout_ms: u64) -> HealthCheckResult {
+/// and HTTP CONNECT or GET capability based on the configured target
+pub async fn check_proxy_health(
+    proxy: &ProxyConfig,
+    timeout_ms: u64,
+    target: &HealthCheckTarget,
+) -> HealthCheckResult {
     let timeout_dur = Duration::from_millis(timeout_ms);
     let start = Instant::now();
 
@@ -34,7 +38,11 @@ pub async fn check_proxy_health(proxy: &ProxyConfig, timeout_ms: u64) -> HealthC
         }
     };
 
-    let result = timeout(timeout_dur, check_proxy_connect(&proxy_addr)).await;
+    let result = timeout(
+        timeout_dur,
+        check_proxy_with_target(&proxy_addr, proxy, target),
+    )
+    .await;
     let latency_ms = start.elapsed().as_millis() as f64;
 
     match result {
@@ -73,13 +81,31 @@ fn parse_proxy_address(url: &str) -> Result<String> {
     Ok(format!("{}:{}", host, port))
 }
 
-/// Test that the proxy accepts CONNECT requests
-async fn check_proxy_connect(proxy_addr: &str) -> Result<()> {
+/// Test that the proxy is reachable using the configured health check target
+async fn check_proxy_with_target(
+    proxy_addr: &str,
+    proxy: &ProxyConfig,
+    target: &HealthCheckTarget,
+) -> Result<()> {
+    match target {
+        HealthCheckTarget::Connect { host, port } => {
+            check_proxy_connect(proxy_addr, host, *port).await
+        }
+        HealthCheckTarget::Get { url } => check_proxy_get(proxy_addr, proxy, url).await,
+    }
+}
+
+/// Test that the proxy accepts CONNECT requests to the specified target
+async fn check_proxy_connect(proxy_addr: &str, host: &str, port: u16) -> Result<()> {
     // Connect to proxy
     let mut stream = TcpStream::connect(proxy_addr).await?;
 
-    // Use www.google.com as a stable target for CONNECT test
-    let connect_request = "CONNECT www.google.com:443 HTTP/1.1\r\nHost: www.google.com:443\r\n\r\n";
+    // Build CONNECT request with configured target
+    let target = format!("{}:{}", host, port);
+    let connect_request = format!(
+        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+        target, target
+    );
     stream.write_all(connect_request.as_bytes()).await?;
 
     // Read response
@@ -95,6 +121,92 @@ async fn check_proxy_connect(proxy_addr: &str) -> Result<()> {
     } else if first_line.contains("407") {
         // 407 Proxy Authentication Required - proxy is reachable but needs auth
         // This is still considered "reachable" for health purposes
+        Ok(())
+    } else if first_line.starts_with("HTTP/") {
+        anyhow::bail!("Proxy returned: {}", first_line)
+    } else {
+        anyhow::bail!("Invalid response from proxy")
+    }
+}
+
+/// Test that the proxy can perform an HTTP GET request to the specified URL
+async fn check_proxy_get(proxy_addr: &str, proxy: &ProxyConfig, url: &str) -> Result<()> {
+    // Parse the target URL
+    let parsed_url = url::Url::parse(url)?;
+    let host = parsed_url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing host in URL"))?;
+    let port = parsed_url.port_or_known_default().unwrap_or(80);
+    let path = if parsed_url.path().is_empty() {
+        "/"
+    } else {
+        parsed_url.path()
+    };
+    let query = parsed_url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+
+    // Connect to proxy
+    let mut stream = TcpStream::connect(proxy_addr).await?;
+
+    // For HTTPS URLs, we need to use CONNECT first to establish tunnel
+    if parsed_url.scheme() == "https" {
+        let target = format!("{}:{}", host, port);
+        let connect_request = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+            target, target
+        );
+        stream.write_all(connect_request.as_bytes()).await?;
+
+        // Read CONNECT response
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await?;
+        let response = String::from_utf8_lossy(&buf[..n]);
+        let first_line = response.lines().next().unwrap_or("");
+
+        if !first_line.contains("200") && !first_line.contains("407") {
+            anyhow::bail!("CONNECT failed: {}", first_line);
+        }
+
+        // For HTTPS health checks via CONNECT, successful tunnel is enough
+        // We don't do TLS handshake for simplicity - the CONNECT success is sufficient
+        return Ok(());
+    }
+
+    // For HTTP URLs, send GET request through proxy
+    let get_request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        format!("{}{}", path, query),
+        host
+    );
+
+    // Add proxy auth if configured
+    let (username, password) = proxy.auth.resolve();
+    let request = if let (Some(user), Some(pass)) = (username, password) {
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{}:{}", user, pass),
+        );
+        format!(
+            "{}Proxy-Authorization: Basic {}\r\n\r\n",
+            get_request, credentials
+        )
+    } else {
+        format!("{}\r\n", get_request)
+    };
+
+    stream.write_all(request.as_bytes()).await?;
+
+    // Read response
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).await?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+
+    // Check for success response
+    let first_line = response.lines().next().unwrap_or("");
+
+    if first_line.contains("200") || first_line.contains("204") || first_line.contains("301") || first_line.contains("302") {
+        Ok(())
+    } else if first_line.contains("407") {
+        // 407 Proxy Authentication Required - proxy is reachable but needs auth
         Ok(())
     } else if first_line.starts_with("HTTP/") {
         anyhow::bail!("Proxy returned: {}", first_line)
@@ -289,9 +401,10 @@ pub async fn health_check_loop(
 async fn run_health_checks(config: &AppConfig, state: &StateStore) {
     let timeout_ms = config.settings.health_check_timeout_ms;
     let threshold = config.settings.consecutive_failures_threshold;
+    let target = &config.settings.health_check_target;
 
     for proxy in &config.proxies {
-        let result = check_proxy_health(proxy, timeout_ms).await;
+        let result = check_proxy_health(proxy, timeout_ms, target).await;
 
         tracing::debug!(
             proxy_id = %proxy.id,
