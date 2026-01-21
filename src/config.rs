@@ -167,15 +167,11 @@ impl HealthCheckTarget {
     fn parse_connect(s: &str) -> Result<Self> {
         let parts: Vec<&str> = s.rsplitn(2, ':').collect();
         if parts.len() != 2 {
-            anyhow::bail!(
-                "Invalid CONNECT target: '{}'. Expected 'host:port'",
-                s
-            );
+            anyhow::bail!("Invalid CONNECT target: '{}'. Expected 'host:port'", s);
         }
-        let port: u16 = parts[0].parse().context(format!(
-            "Invalid port in CONNECT target: '{}'",
-            parts[0]
-        ))?;
+        let port: u16 = parts[0]
+            .parse()
+            .context(format!("Invalid port in CONNECT target: '{}'", parts[0]))?;
         let host = parts[1].to_string();
         if host.is_empty() {
             anyhow::bail!("Empty host in CONNECT target");
