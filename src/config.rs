@@ -2257,7 +2257,10 @@ mod tests {
 
         let result = ConfigHolder::validate_config(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("duplicate proxy id"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate proxy id"));
     }
 
     #[test]
@@ -2431,9 +2434,7 @@ include_google_ip_ranges = true
 
         // Create temp file with invalid TOML
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
-        temp_file
-            .write_all(b"this is not valid toml [[[")
-            .unwrap();
+        temp_file.write_all(b"this is not valid toml [[[").unwrap();
         temp_file.flush().unwrap();
 
         let holder = ConfigHolder::new(config, temp_file.path().to_path_buf());

@@ -430,7 +430,7 @@ mod tests {
 
         let output = encode_metrics();
         // Output might be empty if registry not initialized, but should not panic
-        assert!(output.is_empty() || output.contains("rust_proxy") || true);
+        assert!(output.is_empty() || output.contains("rust_proxy"));
     }
 
     #[test]
