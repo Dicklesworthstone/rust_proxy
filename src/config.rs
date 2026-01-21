@@ -993,6 +993,7 @@ use tokio::sync::{broadcast, RwLock};
 ///
 /// Components that need to react to config changes should call `subscribe()`
 /// and listen for `ConfigDiff` messages.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ConfigHolder {
     inner: Arc<RwLock<AppConfig>>,
@@ -1000,6 +1001,7 @@ pub struct ConfigHolder {
     change_tx: broadcast::Sender<ConfigDiff>,
 }
 
+#[allow(dead_code)]
 impl ConfigHolder {
     /// Create a new ConfigHolder with the given config and path.
     ///
@@ -1186,6 +1188,7 @@ impl ConfigHolder {
 
 /// Represents a change to a single setting field.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct SettingChange {
     pub name: String,
     pub old_value: String,
@@ -1194,6 +1197,7 @@ pub struct SettingChange {
 
 /// Represents a modification to an existing proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ProxyModification {
     pub proxy_id: String,
     pub field: String,
@@ -1205,6 +1209,7 @@ pub struct ProxyModification {
 ///
 /// Used for targeted reload (only update what changed) and clear logging.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct ConfigDiff {
     /// Proxy IDs that were added
     pub proxies_added: Vec<String>,
@@ -1224,6 +1229,7 @@ pub struct ConfigDiff {
     pub listen_port_changed: bool,
 }
 
+#[allow(dead_code)]
 impl ConfigDiff {
     /// Returns true if there are no differences.
     pub fn is_empty(&self) -> bool {
@@ -1324,6 +1330,7 @@ impl ConfigDiff {
 /// Compare two AppConfig instances and produce a ConfigDiff.
 ///
 /// This enables targeted reload (only update what changed) and clear logging.
+#[allow(dead_code)]
 pub fn diff_configs(old: &AppConfig, new: &AppConfig) -> ConfigDiff {
     use std::collections::HashSet;
 
@@ -1373,6 +1380,7 @@ pub fn diff_configs(old: &AppConfig, new: &AppConfig) -> ConfigDiff {
 }
 
 /// Compare two ProxyConfig instances and record modifications.
+#[allow(dead_code)]
 fn diff_proxy(old: &ProxyConfig, new: &ProxyConfig, modifications: &mut Vec<ProxyModification>) {
     let proxy_id = &new.id;
 
@@ -1426,6 +1434,7 @@ fn diff_proxy(old: &ProxyConfig, new: &ProxyConfig, modifications: &mut Vec<Prox
 }
 
 /// Compare two Settings instances and record changes.
+#[allow(dead_code)]
 fn diff_settings(old: &Settings, new: &Settings, diff: &mut ConfigDiff) {
     // Listen port - special handling as it requires restart
     if old.listen_port != new.listen_port {
@@ -2341,8 +2350,11 @@ mod tests {
         config.active_proxy = Some("proxy-1".to_string());
 
         // Create temp file with updated config
+        // Note: active_proxy must come BEFORE [[proxies]] in TOML
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
         let new_config_toml = r#"
+active_proxy = "proxy-1"
+
 [[proxies]]
 id = "proxy-1"
 url = "http://new:9090"
@@ -2358,8 +2370,6 @@ chain_name = "RUST_PROXY"
 include_aws_ip_ranges = true
 include_cloudflare_ip_ranges = true
 include_google_ip_ranges = true
-
-active_proxy = "proxy-1"
 "#;
         temp_file.write_all(new_config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();
@@ -2387,7 +2397,7 @@ active_proxy = "proxy-1"
     async fn test_config_holder_reload_no_changes() {
         use std::io::Write;
 
-        // Create config
+        // Create config with full settings to match what TOML will parse with defaults
         let mut config = make_minimal_config();
         config
             .proxies
@@ -2395,14 +2405,15 @@ active_proxy = "proxy-1"
         config.active_proxy = Some("proxy-1".to_string());
 
         // Create temp file with same config
+        // Note: active_proxy must come BEFORE [[proxies]] in TOML
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
         let config_toml = r#"
+active_proxy = "proxy-1"
+
 [[proxies]]
 id = "proxy-1"
 url = "http://proxy:8080"
 weight = 100
-
-active_proxy = "proxy-1"
 
 [settings]
 listen_port = 12345
@@ -2458,14 +2469,16 @@ include_google_ip_ranges = true
             .push(make_test_proxy("proxy-1", "http://proxy:8080"));
 
         // Create temp file with config that has invalid active_proxy reference
+        // Note: active_proxy must come BEFORE [[proxies]] in TOML, otherwise
+        // it gets parsed as part of the proxies array entry
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
         let config_toml = r#"
+active_proxy = "nonexistent-proxy"
+
 [[proxies]]
 id = "proxy-1"
 url = "http://proxy:8080"
 weight = 100
-
-active_proxy = "nonexistent-proxy"
 
 [settings]
 listen_port = 12345

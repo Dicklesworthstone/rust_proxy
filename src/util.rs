@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use owo_colors::OwoColorize;
+use std::path::Path;
 use std::time::Duration;
 use url::Url;
 
@@ -137,6 +138,83 @@ pub fn parse_proxy_url(raw: &str) -> Result<ProxyEndpoint> {
         host: host.to_string(),
         port,
     })
+}
+
+#[allow(dead_code)]
+pub fn generate_service_file(
+    binary_path: &Path,
+    config_path: &Path,
+    user: &str,
+    group: &str,
+    hardened: bool,
+) -> String {
+    let mut service = format!(
+        r#"[Unit]
+Description=rust_proxy - Targeted transparent proxy daemon
+Documentation=https://github.com/Dicklesworthstone/rust_proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={binary} daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+User={user}
+Group={group}
+
+# Config file path (for reference)
+Environment=RUST_PROXY_CONFIG={config}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rust_proxy
+
+# Resource limits
+LimitNOFILE=65535
+"#,
+        binary = binary_path.display(),
+        config = config_path.display(),
+        user = user,
+        group = group
+    );
+
+    if hardened {
+        service.push_str(&hardening_section(config_path));
+    }
+
+    service.push_str(
+        r#"
+[Install]
+WantedBy=multi-user.target
+"#,
+    );
+
+    service
+}
+
+#[allow(dead_code)]
+fn hardening_section(config_path: &Path) -> String {
+    let config_dir = config_path.parent().unwrap_or(config_path);
+    let mut section = String::new();
+    section.push_str("\n# Security hardening (limited due to iptables requirement)\n");
+    section.push_str("ProtectSystem=strict\n");
+    section.push_str(&format!("ReadWritePaths={}\n", config_dir.display()));
+    if let Ok(state_dir) = crate::config::state_dir() {
+        section.push_str(&format!("ReadWritePaths={}\n", state_dir.display()));
+    }
+    section.push_str("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n");
+    section.push_str("NoNewPrivileges=no\n");
+    section.push_str("PrivateTmp=true\n");
+    section.push_str("ProtectHome=read-only\n");
+    section.push_str("ProtectKernelTunables=true\n");
+    section.push_str("ProtectKernelModules=true\n");
+    section.push_str("ProtectControlGroups=true\n");
+    section
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -406,5 +484,26 @@ mod tests {
         );
         assert!(executed);
         assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_generate_service_file_basic() {
+        let binary = std::path::Path::new("/usr/local/bin/rust_proxy");
+        let config = std::path::Path::new("/etc/rust_proxy/config.toml");
+        let service = generate_service_file(binary, config, "root", "root", false);
+        assert!(service.contains("ExecStart=/usr/local/bin/rust_proxy daemon"));
+        assert!(service.contains("Environment=RUST_PROXY_CONFIG=/etc/rust_proxy/config.toml"));
+        assert!(service.contains("User=root"));
+        assert!(service.contains("Group=root"));
+        assert!(!service.contains("ProtectSystem=strict"));
+    }
+
+    #[test]
+    fn test_generate_service_file_hardened() {
+        let binary = std::path::Path::new("/usr/local/bin/rust_proxy");
+        let config = std::path::Path::new("/etc/rust_proxy/config.toml");
+        let service = generate_service_file(binary, config, "root", "root", true);
+        assert!(service.contains("ProtectSystem=strict"));
+        assert!(service.contains("ReadWritePaths=/etc/rust_proxy"));
     }
 }
