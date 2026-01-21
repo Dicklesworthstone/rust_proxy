@@ -977,6 +977,487 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
+// =============================================================================
+// Config Diff — Detect changes between two AppConfig instances
+// =============================================================================
+// Note: These are intentionally marked #[allow(dead_code)] because they will be
+// integrated in rust_proxy-7or (atomic config reload mechanism).
+
+/// Represents a change to a single setting field.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingChange {
+    pub name: String,
+    pub old_value: String,
+    pub new_value: String,
+}
+
+/// Represents a modification to an existing proxy.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyModification {
+    pub proxy_id: String,
+    pub field: String,
+    pub old_value: String,
+    pub new_value: String,
+}
+
+/// Captures all differences between two AppConfig instances.
+///
+/// Used for targeted reload (only update what changed) and clear logging.
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigDiff {
+    /// Proxy IDs that were added
+    pub proxies_added: Vec<String>,
+    /// Proxy IDs that were removed
+    pub proxies_removed: Vec<String>,
+    /// Proxies whose configuration changed
+    pub proxies_modified: Vec<ProxyModification>,
+    /// Target domains that were added
+    pub targets_added: Vec<String>,
+    /// Target domains that were removed
+    pub targets_removed: Vec<String>,
+    /// Settings that changed
+    pub settings_changed: Vec<SettingChange>,
+    /// Whether the active proxy selection changed
+    pub active_proxy_changed: bool,
+    /// Whether the listen port changed (requires restart)
+    pub listen_port_changed: bool,
+}
+
+#[allow(dead_code)]
+impl ConfigDiff {
+    /// Returns true if there are no differences.
+    pub fn is_empty(&self) -> bool {
+        self.proxies_added.is_empty()
+            && self.proxies_removed.is_empty()
+            && self.proxies_modified.is_empty()
+            && self.targets_added.is_empty()
+            && self.targets_removed.is_empty()
+            && self.settings_changed.is_empty()
+            && !self.active_proxy_changed
+            && !self.listen_port_changed
+    }
+
+    /// Returns true if the changes require a daemon restart to take effect.
+    ///
+    /// Currently, only listen port changes require restart.
+    pub fn requires_restart(&self) -> bool {
+        self.listen_port_changed
+    }
+
+    /// Log all changes using tracing.
+    pub fn log(&self) {
+        for id in &self.proxies_added {
+            tracing::info!(proxy_id = %id, "Proxy added");
+        }
+        for id in &self.proxies_removed {
+            tracing::info!(proxy_id = %id, "Proxy removed");
+        }
+        for modification in &self.proxies_modified {
+            tracing::info!(
+                proxy_id = %modification.proxy_id,
+                field = %modification.field,
+                old = %modification.old_value,
+                new = %modification.new_value,
+                "Proxy modified"
+            );
+        }
+        for domain in &self.targets_added {
+            tracing::info!(domain = %domain, "Target added");
+        }
+        for domain in &self.targets_removed {
+            tracing::info!(domain = %domain, "Target removed");
+        }
+        for change in &self.settings_changed {
+            tracing::info!(
+                setting = %change.name,
+                old = %change.old_value,
+                new = %change.new_value,
+                "Setting changed"
+            );
+        }
+        if self.active_proxy_changed {
+            tracing::info!("Active proxy selection changed");
+        }
+        if self.listen_port_changed {
+            tracing::warn!("Listen port changed - restart required for this to take effect");
+        }
+    }
+
+    /// Returns a human-readable summary of changes.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.proxies_added.is_empty() {
+            parts.push(format!("{} proxy(s) added", self.proxies_added.len()));
+        }
+        if !self.proxies_removed.is_empty() {
+            parts.push(format!("{} proxy(s) removed", self.proxies_removed.len()));
+        }
+        if !self.proxies_modified.is_empty() {
+            parts.push(format!("{} proxy(s) modified", self.proxies_modified.len()));
+        }
+        if !self.targets_added.is_empty() {
+            parts.push(format!("{} target(s) added", self.targets_added.len()));
+        }
+        if !self.targets_removed.is_empty() {
+            parts.push(format!("{} target(s) removed", self.targets_removed.len()));
+        }
+        if !self.settings_changed.is_empty() {
+            parts.push(format!("{} setting(s) changed", self.settings_changed.len()));
+        }
+        if self.active_proxy_changed {
+            parts.push("active proxy changed".to_string());
+        }
+        if self.listen_port_changed {
+            parts.push("listen port changed (restart required)".to_string());
+        }
+        if parts.is_empty() {
+            "No changes".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+/// Compare two AppConfig instances and produce a ConfigDiff.
+///
+/// This enables targeted reload (only update what changed) and clear logging.
+#[allow(dead_code)]
+pub fn diff_configs(old: &AppConfig, new: &AppConfig) -> ConfigDiff {
+    use std::collections::HashSet;
+
+    let mut diff = ConfigDiff::default();
+
+    // Compare proxy lists
+    let old_proxy_ids: HashSet<_> = old.proxies.iter().map(|p| p.id.as_str()).collect();
+    let new_proxy_ids: HashSet<_> = new.proxies.iter().map(|p| p.id.as_str()).collect();
+
+    // Find added proxies
+    for id in new_proxy_ids.difference(&old_proxy_ids) {
+        diff.proxies_added.push((*id).to_string());
+    }
+
+    // Find removed proxies
+    for id in old_proxy_ids.difference(&new_proxy_ids) {
+        diff.proxies_removed.push((*id).to_string());
+    }
+
+    // Find modified proxies (those that exist in both but have changed)
+    for new_proxy in &new.proxies {
+        if let Some(old_proxy) = old.proxies.iter().find(|p| p.id == new_proxy.id) {
+            diff_proxy(old_proxy, new_proxy, &mut diff.proxies_modified);
+        }
+    }
+
+    // Compare target lists
+    let old_domains: HashSet<_> = old.targets.iter().map(|t| t.domain()).collect();
+    let new_domains: HashSet<_> = new.targets.iter().map(|t| t.domain()).collect();
+
+    for domain in new_domains.difference(&old_domains) {
+        diff.targets_added.push((*domain).to_string());
+    }
+    for domain in old_domains.difference(&new_domains) {
+        diff.targets_removed.push((*domain).to_string());
+    }
+
+    // Compare active proxy
+    if old.active_proxy != new.active_proxy {
+        diff.active_proxy_changed = true;
+    }
+
+    // Compare settings
+    diff_settings(&old.settings, &new.settings, &mut diff);
+
+    diff
+}
+
+/// Compare two ProxyConfig instances and record modifications.
+#[allow(dead_code)]
+fn diff_proxy(old: &ProxyConfig, new: &ProxyConfig, modifications: &mut Vec<ProxyModification>) {
+    let proxy_id = &new.id;
+
+    if old.url != new.url {
+        modifications.push(ProxyModification {
+            proxy_id: proxy_id.clone(),
+            field: "url".to_string(),
+            old_value: old.url.clone(),
+            new_value: new.url.clone(),
+        });
+    }
+
+    if old.priority != new.priority {
+        modifications.push(ProxyModification {
+            proxy_id: proxy_id.clone(),
+            field: "priority".to_string(),
+            old_value: format!("{:?}", old.priority),
+            new_value: format!("{:?}", new.priority),
+        });
+    }
+
+    if old.weight != new.weight {
+        modifications.push(ProxyModification {
+            proxy_id: proxy_id.clone(),
+            field: "weight".to_string(),
+            old_value: old.weight.to_string(),
+            new_value: new.weight.to_string(),
+        });
+    }
+
+    if old.health_check_url != new.health_check_url {
+        modifications.push(ProxyModification {
+            proxy_id: proxy_id.clone(),
+            field: "health_check_url".to_string(),
+            old_value: format!("{:?}", old.health_check_url),
+            new_value: format!("{:?}", new.health_check_url),
+        });
+    }
+
+    // Compare auth (check if credentials changed without exposing values)
+    let old_auth = old.auth.resolve();
+    let new_auth = new.auth.resolve();
+    if old_auth != new_auth {
+        modifications.push(ProxyModification {
+            proxy_id: proxy_id.clone(),
+            field: "auth".to_string(),
+            old_value: "[credentials]".to_string(),
+            new_value: "[credentials changed]".to_string(),
+        });
+    }
+}
+
+/// Compare two Settings instances and record changes.
+#[allow(dead_code)]
+fn diff_settings(old: &Settings, new: &Settings, diff: &mut ConfigDiff) {
+    // Listen port - special handling as it requires restart
+    if old.listen_port != new.listen_port {
+        diff.listen_port_changed = true;
+        diff.settings_changed.push(SettingChange {
+            name: "listen_port".to_string(),
+            old_value: old.listen_port.to_string(),
+            new_value: new.listen_port.to_string(),
+        });
+    }
+
+    // DNS and ping settings
+    if old.dns_refresh_secs != new.dns_refresh_secs {
+        diff.settings_changed.push(SettingChange {
+            name: "dns_refresh_secs".to_string(),
+            old_value: old.dns_refresh_secs.to_string(),
+            new_value: new.dns_refresh_secs.to_string(),
+        });
+    }
+
+    if old.ping_interval_secs != new.ping_interval_secs {
+        diff.settings_changed.push(SettingChange {
+            name: "ping_interval_secs".to_string(),
+            old_value: old.ping_interval_secs.to_string(),
+            new_value: new.ping_interval_secs.to_string(),
+        });
+    }
+
+    if old.ping_timeout_ms != new.ping_timeout_ms {
+        diff.settings_changed.push(SettingChange {
+            name: "ping_timeout_ms".to_string(),
+            old_value: old.ping_timeout_ms.to_string(),
+            new_value: new.ping_timeout_ms.to_string(),
+        });
+    }
+
+    // iptables/ipset settings
+    if old.ipset_name != new.ipset_name {
+        diff.settings_changed.push(SettingChange {
+            name: "ipset_name".to_string(),
+            old_value: old.ipset_name.clone(),
+            new_value: new.ipset_name.clone(),
+        });
+    }
+
+    if old.chain_name != new.chain_name {
+        diff.settings_changed.push(SettingChange {
+            name: "chain_name".to_string(),
+            old_value: old.chain_name.clone(),
+            new_value: new.chain_name.clone(),
+        });
+    }
+
+    // IP range toggles
+    if old.include_aws_ip_ranges != new.include_aws_ip_ranges {
+        diff.settings_changed.push(SettingChange {
+            name: "include_aws_ip_ranges".to_string(),
+            old_value: old.include_aws_ip_ranges.to_string(),
+            new_value: new.include_aws_ip_ranges.to_string(),
+        });
+    }
+
+    if old.include_cloudflare_ip_ranges != new.include_cloudflare_ip_ranges {
+        diff.settings_changed.push(SettingChange {
+            name: "include_cloudflare_ip_ranges".to_string(),
+            old_value: old.include_cloudflare_ip_ranges.to_string(),
+            new_value: new.include_cloudflare_ip_ranges.to_string(),
+        });
+    }
+
+    if old.include_google_ip_ranges != new.include_google_ip_ranges {
+        diff.settings_changed.push(SettingChange {
+            name: "include_google_ip_ranges".to_string(),
+            old_value: old.include_google_ip_ranges.to_string(),
+            new_value: new.include_google_ip_ranges.to_string(),
+        });
+    }
+
+    // Metrics settings
+    if old.metrics_enabled != new.metrics_enabled {
+        diff.settings_changed.push(SettingChange {
+            name: "metrics_enabled".to_string(),
+            old_value: old.metrics_enabled.to_string(),
+            new_value: new.metrics_enabled.to_string(),
+        });
+    }
+
+    if old.metrics_port != new.metrics_port {
+        diff.settings_changed.push(SettingChange {
+            name: "metrics_port".to_string(),
+            old_value: old.metrics_port.to_string(),
+            new_value: new.metrics_port.to_string(),
+        });
+    }
+
+    if old.metrics_path != new.metrics_path {
+        diff.settings_changed.push(SettingChange {
+            name: "metrics_path".to_string(),
+            old_value: old.metrics_path.clone(),
+            new_value: new.metrics_path.clone(),
+        });
+    }
+
+    if old.metrics_bind != new.metrics_bind {
+        diff.settings_changed.push(SettingChange {
+            name: "metrics_bind".to_string(),
+            old_value: old.metrics_bind.clone(),
+            new_value: new.metrics_bind.clone(),
+        });
+    }
+
+    // Connection retry settings
+    if old.connect_max_retries != new.connect_max_retries {
+        diff.settings_changed.push(SettingChange {
+            name: "connect_max_retries".to_string(),
+            old_value: old.connect_max_retries.to_string(),
+            new_value: new.connect_max_retries.to_string(),
+        });
+    }
+
+    if old.connect_initial_backoff_ms != new.connect_initial_backoff_ms {
+        diff.settings_changed.push(SettingChange {
+            name: "connect_initial_backoff_ms".to_string(),
+            old_value: old.connect_initial_backoff_ms.to_string(),
+            new_value: new.connect_initial_backoff_ms.to_string(),
+        });
+    }
+
+    if old.connect_max_backoff_ms != new.connect_max_backoff_ms {
+        diff.settings_changed.push(SettingChange {
+            name: "connect_max_backoff_ms".to_string(),
+            old_value: old.connect_max_backoff_ms.to_string(),
+            new_value: new.connect_max_backoff_ms.to_string(),
+        });
+    }
+
+    // Health check settings
+    if old.health_check_enabled != new.health_check_enabled {
+        diff.settings_changed.push(SettingChange {
+            name: "health_check_enabled".to_string(),
+            old_value: old.health_check_enabled.to_string(),
+            new_value: new.health_check_enabled.to_string(),
+        });
+    }
+
+    if old.health_check_interval_secs != new.health_check_interval_secs {
+        diff.settings_changed.push(SettingChange {
+            name: "health_check_interval_secs".to_string(),
+            old_value: old.health_check_interval_secs.to_string(),
+            new_value: new.health_check_interval_secs.to_string(),
+        });
+    }
+
+    if old.health_check_timeout_ms != new.health_check_timeout_ms {
+        diff.settings_changed.push(SettingChange {
+            name: "health_check_timeout_ms".to_string(),
+            old_value: old.health_check_timeout_ms.to_string(),
+            new_value: new.health_check_timeout_ms.to_string(),
+        });
+    }
+
+    if old.consecutive_failures_threshold != new.consecutive_failures_threshold {
+        diff.settings_changed.push(SettingChange {
+            name: "consecutive_failures_threshold".to_string(),
+            old_value: old.consecutive_failures_threshold.to_string(),
+            new_value: new.consecutive_failures_threshold.to_string(),
+        });
+    }
+
+    // Failover settings
+    if old.auto_failover != new.auto_failover {
+        diff.settings_changed.push(SettingChange {
+            name: "auto_failover".to_string(),
+            old_value: old.auto_failover.to_string(),
+            new_value: new.auto_failover.to_string(),
+        });
+    }
+
+    if old.auto_failback != new.auto_failback {
+        diff.settings_changed.push(SettingChange {
+            name: "auto_failback".to_string(),
+            old_value: old.auto_failback.to_string(),
+            new_value: new.auto_failback.to_string(),
+        });
+    }
+
+    if old.failback_delay_secs != new.failback_delay_secs {
+        diff.settings_changed.push(SettingChange {
+            name: "failback_delay_secs".to_string(),
+            old_value: old.failback_delay_secs.to_string(),
+            new_value: new.failback_delay_secs.to_string(),
+        });
+    }
+
+    // Degradation settings
+    if old.degradation_policy != new.degradation_policy {
+        diff.settings_changed.push(SettingChange {
+            name: "degradation_policy".to_string(),
+            old_value: format!("{:?}", old.degradation_policy),
+            new_value: format!("{:?}", new.degradation_policy),
+        });
+    }
+
+    if old.degradation_delay_secs != new.degradation_delay_secs {
+        diff.settings_changed.push(SettingChange {
+            name: "degradation_delay_secs".to_string(),
+            old_value: old.degradation_delay_secs.to_string(),
+            new_value: new.degradation_delay_secs.to_string(),
+        });
+    }
+
+    if old.allow_direct_fallback != new.allow_direct_fallback {
+        diff.settings_changed.push(SettingChange {
+            name: "allow_direct_fallback".to_string(),
+            old_value: old.allow_direct_fallback.to_string(),
+            new_value: new.allow_direct_fallback.to_string(),
+        });
+    }
+
+    // Load balancing
+    if old.load_balance_strategy != new.load_balance_strategy {
+        diff.settings_changed.push(SettingChange {
+            name: "load_balance_strategy".to_string(),
+            old_value: format!("{:?}", old.load_balance_strategy),
+            new_value: format!("{:?}", new.load_balance_strategy),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,5 +1685,302 @@ mod tests {
         assert!(template.contains("metrics_port = 9090"));
         assert!(template.contains("metrics_path = \"/metrics\""));
         assert!(template.contains("metrics_bind = \"0.0.0.0\""));
+    }
+
+    // ==========================================================================
+    // ConfigDiff Tests
+    // ==========================================================================
+
+    fn make_test_proxy(id: &str, url: &str) -> ProxyConfig {
+        ProxyConfig {
+            id: id.to_string(),
+            url: url.to_string(),
+            auth: ProxyAuth::default(),
+            priority: None,
+            health_check_url: None,
+            weight: 100,
+        }
+    }
+
+    fn make_minimal_config() -> AppConfig {
+        AppConfig {
+            proxies: vec![],
+            targets: vec![],
+            active_proxy: None,
+            settings: Settings::default(),
+        }
+    }
+
+    #[test]
+    fn test_config_diff_identical_configs() {
+        let config1 = make_minimal_config();
+        let config2 = config1.clone();
+        let diff = diff_configs(&config1, &config2);
+
+        assert!(diff.is_empty());
+        assert!(!diff.requires_restart());
+        assert_eq!(diff.summary(), "No changes");
+    }
+
+    #[test]
+    fn test_config_diff_proxy_added() {
+        let old = make_minimal_config();
+        let mut new = make_minimal_config();
+
+        new.proxies.push(make_test_proxy("new-proxy", "http://proxy:8080"));
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert_eq!(diff.proxies_added, vec!["new-proxy"]);
+        assert!(diff.proxies_removed.is_empty());
+        assert!(diff.proxies_modified.is_empty());
+        assert!(diff.summary().contains("1 proxy(s) added"));
+    }
+
+    #[test]
+    fn test_config_diff_proxy_removed() {
+        let mut old = make_minimal_config();
+        old.proxies.push(make_test_proxy("old-proxy", "http://proxy:8080"));
+
+        let new = make_minimal_config();
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert_eq!(diff.proxies_removed, vec!["old-proxy"]);
+        assert!(diff.proxies_added.is_empty());
+    }
+
+    #[test]
+    fn test_config_diff_proxy_modified() {
+        let mut old = make_minimal_config();
+        old.proxies.push(make_test_proxy("my-proxy", "http://old:8080"));
+
+        let mut new = make_minimal_config();
+        new.proxies.push(make_test_proxy("my-proxy", "http://new:9090"));
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert!(diff.proxies_added.is_empty());
+        assert!(diff.proxies_removed.is_empty());
+        assert_eq!(diff.proxies_modified.len(), 1);
+        assert_eq!(diff.proxies_modified[0].proxy_id, "my-proxy");
+        assert_eq!(diff.proxies_modified[0].field, "url");
+        assert_eq!(diff.proxies_modified[0].old_value, "http://old:8080");
+        assert_eq!(diff.proxies_modified[0].new_value, "http://new:9090");
+    }
+
+    #[test]
+    fn test_config_diff_proxy_weight_changed() {
+        let mut old = make_minimal_config();
+        let mut proxy = make_test_proxy("my-proxy", "http://proxy:8080");
+        proxy.weight = 100;
+        old.proxies.push(proxy);
+
+        let mut new = make_minimal_config();
+        let mut proxy = make_test_proxy("my-proxy", "http://proxy:8080");
+        proxy.weight = 200;
+        new.proxies.push(proxy);
+
+        let diff = diff_configs(&old, &new);
+
+        assert_eq!(diff.proxies_modified.len(), 1);
+        assert_eq!(diff.proxies_modified[0].field, "weight");
+    }
+
+    #[test]
+    fn test_config_diff_target_added() {
+        let old = make_minimal_config();
+        let mut new = make_minimal_config();
+
+        new.targets.push(TargetSpec::Simple("api.anthropic.com".to_string()));
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert_eq!(diff.targets_added, vec!["api.anthropic.com"]);
+        assert!(diff.targets_removed.is_empty());
+    }
+
+    #[test]
+    fn test_config_diff_target_removed() {
+        let mut old = make_minimal_config();
+        old.targets.push(TargetSpec::Simple("api.openai.com".to_string()));
+
+        let new = make_minimal_config();
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert_eq!(diff.targets_removed, vec!["api.openai.com"]);
+    }
+
+    #[test]
+    fn test_config_diff_active_proxy_changed() {
+        let mut old = make_minimal_config();
+        old.active_proxy = Some("proxy-a".to_string());
+
+        let mut new = make_minimal_config();
+        new.active_proxy = Some("proxy-b".to_string());
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert!(diff.active_proxy_changed);
+        assert!(diff.summary().contains("active proxy changed"));
+    }
+
+    #[test]
+    fn test_config_diff_active_proxy_cleared() {
+        let mut old = make_minimal_config();
+        old.active_proxy = Some("proxy-a".to_string());
+
+        let new = make_minimal_config();
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(diff.active_proxy_changed);
+    }
+
+    #[test]
+    fn test_config_diff_listen_port_requires_restart() {
+        let mut old = make_minimal_config();
+        old.settings.listen_port = 12345;
+
+        let mut new = make_minimal_config();
+        new.settings.listen_port = 54321;
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert!(diff.requires_restart());
+        assert!(diff.listen_port_changed);
+        assert!(diff.summary().contains("restart required"));
+    }
+
+    #[test]
+    fn test_config_diff_setting_changed() {
+        let mut old = make_minimal_config();
+        old.settings.health_check_interval_secs = 30;
+
+        let mut new = make_minimal_config();
+        new.settings.health_check_interval_secs = 60;
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert!(!diff.requires_restart());
+        assert_eq!(diff.settings_changed.len(), 1);
+        assert_eq!(diff.settings_changed[0].name, "health_check_interval_secs");
+        assert_eq!(diff.settings_changed[0].old_value, "30");
+        assert_eq!(diff.settings_changed[0].new_value, "60");
+    }
+
+    #[test]
+    fn test_config_diff_multiple_settings_changed() {
+        let mut old = make_minimal_config();
+        old.settings.dns_refresh_secs = 300;
+        old.settings.ping_interval_secs = 60;
+
+        let mut new = make_minimal_config();
+        new.settings.dns_refresh_secs = 600;
+        new.settings.ping_interval_secs = 120;
+
+        let diff = diff_configs(&old, &new);
+
+        assert_eq!(diff.settings_changed.len(), 2);
+        let names: Vec<_> = diff.settings_changed.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"dns_refresh_secs"));
+        assert!(names.contains(&"ping_interval_secs"));
+    }
+
+    #[test]
+    fn test_config_diff_load_balance_strategy_changed() {
+        let mut old = make_minimal_config();
+        old.settings.load_balance_strategy = LoadBalanceStrategy::Single;
+
+        let mut new = make_minimal_config();
+        new.settings.load_balance_strategy = LoadBalanceStrategy::RoundRobin;
+
+        let diff = diff_configs(&old, &new);
+
+        assert_eq!(diff.settings_changed.len(), 1);
+        assert_eq!(diff.settings_changed[0].name, "load_balance_strategy");
+    }
+
+    #[test]
+    fn test_config_diff_degradation_policy_changed() {
+        let mut old = make_minimal_config();
+        old.settings.degradation_policy = DegradationPolicy::FailClosed;
+
+        let mut new = make_minimal_config();
+        new.settings.degradation_policy = DegradationPolicy::TryAll;
+
+        let diff = diff_configs(&old, &new);
+
+        assert_eq!(diff.settings_changed.len(), 1);
+        assert_eq!(diff.settings_changed[0].name, "degradation_policy");
+    }
+
+    #[test]
+    fn test_config_diff_complex_changes() {
+        let mut old = make_minimal_config();
+        old.proxies.push(make_test_proxy("proxy-a", "http://a:8080"));
+        old.proxies.push(make_test_proxy("proxy-b", "http://b:8080"));
+        old.targets.push(TargetSpec::Simple("old.com".to_string()));
+        old.active_proxy = Some("proxy-a".to_string());
+        old.settings.health_check_interval_secs = 30;
+
+        let mut new = make_minimal_config();
+        // proxy-a removed, proxy-b kept, proxy-c added
+        new.proxies.push(make_test_proxy("proxy-b", "http://b:8080"));
+        new.proxies.push(make_test_proxy("proxy-c", "http://c:8080"));
+        // old.com removed, new.com added
+        new.targets.push(TargetSpec::Simple("new.com".to_string()));
+        new.active_proxy = Some("proxy-c".to_string());
+        new.settings.health_check_interval_secs = 60;
+
+        let diff = diff_configs(&old, &new);
+
+        assert!(!diff.is_empty());
+        assert_eq!(diff.proxies_added, vec!["proxy-c"]);
+        assert_eq!(diff.proxies_removed, vec!["proxy-a"]);
+        assert_eq!(diff.targets_added, vec!["new.com"]);
+        assert_eq!(diff.targets_removed, vec!["old.com"]);
+        assert!(diff.active_proxy_changed);
+        assert_eq!(diff.settings_changed.len(), 1);
+
+        // Check summary contains multiple parts
+        let summary = diff.summary();
+        assert!(summary.contains("proxy(s) added"));
+        assert!(summary.contains("proxy(s) removed"));
+        assert!(summary.contains("target(s) added"));
+        assert!(summary.contains("target(s) removed"));
+        assert!(summary.contains("active proxy changed"));
+        assert!(summary.contains("setting(s) changed"));
+    }
+
+    #[test]
+    fn test_config_diff_is_empty() {
+        let diff = ConfigDiff::default();
+        assert!(diff.is_empty());
+
+        let mut diff_with_proxy = ConfigDiff::default();
+        diff_with_proxy.proxies_added.push("test".to_string());
+        assert!(!diff_with_proxy.is_empty());
+    }
+
+    #[test]
+    fn test_config_diff_requires_restart() {
+        let diff = ConfigDiff::default();
+        assert!(!diff.requires_restart());
+
+        let diff_with_listen = ConfigDiff {
+            listen_port_changed: true,
+            ..Default::default()
+        };
+        assert!(diff_with_listen.requires_restart());
     }
 }
