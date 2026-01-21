@@ -2639,4 +2639,148 @@ include_google_ip_ranges = true
             handle.await.unwrap();
         }
     }
+
+    // Health check target tests
+    #[test]
+    fn test_health_check_target_parse_connect() {
+        let target = HealthCheckTarget::parse("CONNECT www.example.com:443").unwrap();
+        assert_eq!(
+            target,
+            HealthCheckTarget::Connect {
+                host: "www.example.com".to_string(),
+                port: 443
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_check_target_parse_connect_trimmed() {
+        let target = HealthCheckTarget::parse("  CONNECT   www.example.com:8080  ").unwrap();
+        assert_eq!(
+            target,
+            HealthCheckTarget::Connect {
+                host: "www.example.com".to_string(),
+                port: 8080
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_check_target_parse_implicit_connect() {
+        // host:port without CONNECT prefix should be treated as CONNECT
+        let target = HealthCheckTarget::parse("proxy.example.com:3128").unwrap();
+        assert_eq!(
+            target,
+            HealthCheckTarget::Connect {
+                host: "proxy.example.com".to_string(),
+                port: 3128
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_check_target_parse_get_https() {
+        let target = HealthCheckTarget::parse("GET https://httpbin.org/status/200").unwrap();
+        assert_eq!(
+            target,
+            HealthCheckTarget::Get {
+                url: "https://httpbin.org/status/200".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_check_target_parse_get_http() {
+        let target = HealthCheckTarget::parse("GET http://example.com/health").unwrap();
+        assert_eq!(
+            target,
+            HealthCheckTarget::Get {
+                url: "http://example.com/health".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_check_target_parse_invalid_get_no_scheme() {
+        let result = HealthCheckTarget::parse("GET example.com/health");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_health_check_target_parse_invalid_format() {
+        let result = HealthCheckTarget::parse("INVALID format");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_health_check_target_parse_invalid_connect_no_port() {
+        let result = HealthCheckTarget::parse("CONNECT www.example.com");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_health_check_target_parse_invalid_connect_bad_port() {
+        let result = HealthCheckTarget::parse("CONNECT www.example.com:notanumber");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_health_check_target_default() {
+        let target = HealthCheckTarget::default();
+        assert_eq!(
+            target,
+            HealthCheckTarget::Connect {
+                host: "www.google.com".to_string(),
+                port: 443
+            }
+        );
+    }
+
+    #[test]
+    fn test_health_check_target_to_string_format() {
+        let connect = HealthCheckTarget::Connect {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        assert_eq!(connect.to_string_format(), "CONNECT example.com:443");
+
+        let get = HealthCheckTarget::Get {
+            url: "https://example.com/health".to_string(),
+        };
+        assert_eq!(get.to_string_format(), "GET https://example.com/health");
+    }
+
+    #[test]
+    fn test_health_check_target_serialize_deserialize() {
+        let target = HealthCheckTarget::Connect {
+            host: "test.com".to_string(),
+            port: 8080,
+        };
+        let serialized = serde_json::to_string(&target).unwrap();
+        assert_eq!(serialized, r#""CONNECT test.com:8080""#);
+
+        let deserialized: HealthCheckTarget = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, target);
+
+        let get_target = HealthCheckTarget::Get {
+            url: "https://api.example.com/health".to_string(),
+        };
+        let serialized = serde_json::to_string(&get_target).unwrap();
+        assert_eq!(serialized, r#""GET https://api.example.com/health""#);
+
+        let deserialized: HealthCheckTarget = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, get_target);
+    }
+
+    #[test]
+    fn test_settings_health_check_target_default() {
+        let settings = Settings::default();
+        assert_eq!(
+            settings.health_check_target,
+            HealthCheckTarget::Connect {
+                host: "www.google.com".to_string(),
+                port: 443
+            }
+        );
+    }
 }
