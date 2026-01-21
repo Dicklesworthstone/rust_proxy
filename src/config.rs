@@ -173,6 +173,18 @@ pub struct Settings {
     pub include_aws_ip_ranges: bool,
     pub include_cloudflare_ip_ranges: bool,
     pub include_google_ip_ranges: bool,
+    /// Enable Prometheus metrics endpoint (default: true)
+    #[serde(default = "default_metrics_enabled")]
+    pub metrics_enabled: bool,
+    /// Port for metrics HTTP server (default: 9090)
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+    /// Path for metrics endpoint (default: "/metrics")
+    #[serde(default = "default_metrics_path")]
+    pub metrics_path: String,
+    /// Bind address for metrics server (default: "0.0.0.0")
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: String,
     /// Max retry attempts for upstream proxy connections (0 = no retries)
     #[serde(default = "default_connect_max_retries")]
     pub connect_max_retries: u32,
@@ -226,6 +238,22 @@ fn default_connect_max_backoff_ms() -> u64 {
     5000
 }
 
+fn default_metrics_enabled() -> bool {
+    true
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+
+fn default_metrics_bind() -> String {
+    "0.0.0.0".to_string()
+}
+
 fn default_health_check_enabled() -> bool {
     true
 }
@@ -270,6 +298,10 @@ impl Default for Settings {
             include_aws_ip_ranges: true,
             include_cloudflare_ip_ranges: true,
             include_google_ip_ranges: true,
+            metrics_enabled: default_metrics_enabled(),
+            metrics_port: default_metrics_port(),
+            metrics_path: default_metrics_path(),
+            metrics_bind: default_metrics_bind(),
             connect_max_retries: default_connect_max_retries(),
             connect_initial_backoff_ms: default_connect_initial_backoff_ms(),
             connect_max_backoff_ms: default_connect_max_backoff_ms(),
@@ -868,6 +900,26 @@ impl AppConfig {
     }
 }
 
+pub fn default_config_template() -> Result<String> {
+    let base = toml::to_string_pretty(&AppConfig::default())?;
+    Ok(insert_metrics_comments(&base))
+}
+
+pub fn write_config_template(path: &PathBuf) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed creating config dir {}", parent.display()))?;
+    }
+    let content = default_config_template()?;
+    fs::write(path, content).with_context(|| format!("Failed writing config {}", path.display()))?;
+    Ok(())
+}
+
+fn insert_metrics_comments(content: &str) -> String {
+    let metrics_comment = "\n# Prometheus metrics\n# metrics_enabled = true\n# metrics_port = 9090\n# metrics_path = \"/metrics\"\n# metrics_bind = \"127.0.0.1\"  # Bind to localhost only for security\n";
+    content.replacen("metrics_enabled = ", &format!("{metrics_comment}metrics_enabled = "), 1)
+}
+
 pub fn config_path() -> Result<PathBuf> {
     let proj = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME)
         .context("Failed to resolve project dirs")?;
@@ -1035,6 +1087,10 @@ mod tests {
         assert!(settings.include_aws_ip_ranges);
         assert!(settings.include_cloudflare_ip_ranges);
         assert!(settings.include_google_ip_ranges);
+        assert!(settings.metrics_enabled);
+        assert_eq!(settings.metrics_port, 9090);
+        assert_eq!(settings.metrics_path, "/metrics");
+        assert_eq!(settings.metrics_bind, "0.0.0.0");
         // Health check settings
         assert!(settings.health_check_enabled);
         assert_eq!(settings.health_check_interval_secs, 30);
@@ -1093,5 +1149,15 @@ mod tests {
         assert!(!config.targets.is_empty());
         assert!(config.proxies.is_empty());
         assert!(config.active_proxy.is_none());
+    }
+
+    #[test]
+    fn test_default_config_template_includes_metrics_comments() {
+        let template = default_config_template().unwrap();
+        assert!(template.contains("# Prometheus metrics"));
+        assert!(template.contains("metrics_enabled = true"));
+        assert!(template.contains("metrics_port = 9090"));
+        assert!(template.contains("metrics_path = \"/metrics\""));
+        assert!(template.contains("metrics_bind = \"0.0.0.0\""));
     }
 }

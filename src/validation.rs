@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, DegradationPolicy, ProxyConfig, Settings, TargetSpec};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 /// Severity level for validation results
@@ -350,6 +351,14 @@ fn is_valid_hostname(hostname: &str) -> bool {
     true
 }
 
+/// Validate a bind address as either an IP address or hostname.
+fn is_valid_bind_addr(addr: &str) -> bool {
+    if addr.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    is_valid_hostname(addr)
+}
+
 /// Validate settings
 pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
     let mut results = Vec::new();
@@ -365,6 +374,75 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
                 ),
             )
             .with_id("listen_port"),
+        );
+    }
+
+    // metrics_port
+    if settings.metrics_enabled && settings.metrics_port == settings.listen_port {
+        results.push(
+            ValidationResult::error(
+                "settings",
+                "metrics_port must be different from listen_port to avoid conflicts",
+            )
+            .with_id("metrics_port")
+            .with_suggestion("Choose a different metrics_port or change listen_port"),
+        );
+    }
+    if settings.metrics_port == 0 {
+        results.push(
+            ValidationResult::error("settings", "metrics_port cannot be 0")
+                .with_id("metrics_port")
+                .with_suggestion("Set metrics_port to a valid TCP port (e.g., 9090)"),
+        );
+    } else if settings.metrics_enabled && settings.metrics_port < 1024 {
+        results.push(
+            ValidationResult::warning(
+                "settings",
+                format!(
+                    "metrics_port ({}) is below 1024, requires root privileges",
+                    settings.metrics_port
+                ),
+            )
+            .with_id("metrics_port"),
+        );
+    }
+
+    // metrics_path
+    if settings.metrics_path.trim().is_empty() {
+        results.push(
+            ValidationResult::error("settings", "metrics_path cannot be empty")
+                .with_id("metrics_path")
+                .with_suggestion("Use a path like /metrics"),
+        );
+    } else if !settings.metrics_path.starts_with('/') {
+        results.push(
+            ValidationResult::error(
+                "settings",
+                format!(
+                    "metrics_path must start with '/': {}",
+                    settings.metrics_path
+                ),
+            )
+            .with_id("metrics_path")
+            .with_suggestion("Prefix the path with '/', e.g. /metrics"),
+        );
+    }
+
+    // metrics_bind
+    if settings.metrics_bind.trim().is_empty() {
+        results.push(
+            ValidationResult::error("settings", "metrics_bind cannot be empty")
+                .with_id("metrics_bind")
+                .with_suggestion("Use an IP address like 0.0.0.0 or 127.0.0.1"),
+        );
+    } else if !is_valid_bind_addr(&settings.metrics_bind) {
+        results.push(
+            ValidationResult::error(
+                "settings",
+                format!("metrics_bind is not a valid address: {}", settings.metrics_bind),
+            )
+            .with_id("metrics_bind")
+            .with_suggestion("Use an IP address like 0.0.0.0 or 127.0.0.1"),
         );
     }
 
@@ -718,6 +796,44 @@ mod tests {
             .iter()
             .any(|r| r.severity == ValidationSeverity::Error
                 && r.message.contains("ping_timeout_ms")));
+    }
+
+    #[test]
+    fn test_validate_metrics_port_conflict() {
+        let settings = Settings {
+            metrics_enabled: true,
+            metrics_port: 12345,
+            listen_port: 12345,
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(results.iter().any(|r| {
+            r.severity == ValidationSeverity::Error && r.message.contains("metrics_port")
+        }));
+    }
+
+    #[test]
+    fn test_validate_metrics_path_requires_slash() {
+        let settings = Settings {
+            metrics_path: "metrics".to_string(),
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(results.iter().any(|r| {
+            r.severity == ValidationSeverity::Error && r.message.contains("metrics_path")
+        }));
+    }
+
+    #[test]
+    fn test_validate_metrics_bind_invalid() {
+        let settings = Settings {
+            metrics_bind: "bad addr".to_string(),
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(results.iter().any(|r| {
+            r.severity == ValidationSeverity::Error && r.message.contains("metrics_bind")
+        }));
     }
 
     #[test]

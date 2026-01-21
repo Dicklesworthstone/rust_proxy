@@ -15,12 +15,14 @@ mod dns;
 mod health;
 mod ip_ranges;
 mod iptables;
+mod output;
 mod proxy;
 mod state;
 mod util;
 mod validation;
 
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
+use output::OutputDispatcher;
 use proxy::{RetryConfig, UpstreamProxy};
 use state::{HealthStatus, RuntimeState, State, StateStore};
 
@@ -203,46 +205,75 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { force } => init_config(force)?,
-        Commands::Proxy { command } => proxy_cmd(command)?,
-        Commands::Targets { command } => targets_cmd(command)?,
-        Commands::List(args) => list_cmd(args.json)?,
-        Commands::Activate { id, select, run } => activate_cmd(id, select, run).await?,
-        Commands::Deactivate { keep_rules } => deactivate_cmd(keep_rules)?,
+        Commands::Init { force } => {
+            let output = OutputDispatcher::from_flags(false, false);
+            init_config(force, &output)?
+        }
+        Commands::Proxy { command } => {
+            let output = OutputDispatcher::from_flags(false, false);
+            proxy_cmd(command, &output)?
+        }
+        Commands::Targets { command } => {
+            let output = OutputDispatcher::from_flags(false, false);
+            targets_cmd(command, &output)?
+        }
+        Commands::List(args) => {
+            let output = OutputDispatcher::from_flags(args.json, false);
+            list_cmd(&output)?
+        }
+        Commands::Activate { id, select, run } => {
+            let output = OutputDispatcher::from_flags(false, false);
+            activate_cmd(id, select, run, &output).await?
+        }
+        Commands::Deactivate { keep_rules } => {
+            let output = OutputDispatcher::from_flags(false, false);
+            deactivate_cmd(keep_rules, &output)?
+        }
         Commands::Daemon => run_daemon().await?,
-        Commands::Status(args) => status_cmd(args.json)?,
-        Commands::Diagnose => diagnose_cmd()?,
+        Commands::Status(args) => {
+            let output = OutputDispatcher::from_flags(args.json, false);
+            status_cmd(&output)?
+        }
+        Commands::Diagnose => {
+            let output = OutputDispatcher::from_flags(false, false);
+            diagnose_cmd(&output)?
+        }
         Commands::Check {
             strict,
             json,
             quiet,
             test_connectivity,
-        } => check_cmd(strict, json, quiet, test_connectivity).await?,
+        } => {
+            let output = OutputDispatcher::from_flags(json, quiet);
+            check_cmd(strict, test_connectivity, &output).await?
+        }
         Commands::Test {
             url,
             json,
             verbose,
             no_dns,
-        } => test_cmd(&url, json, verbose, no_dns).await?,
+        } => {
+            let output = OutputDispatcher::from_flags(json, false);
+            test_cmd(&url, verbose, no_dns, &output).await?
+        }
         Commands::Completions { shell } => completions_cmd(shell),
     }
 
     Ok(())
 }
 
-fn init_config(force: bool) -> Result<()> {
+fn init_config(force: bool, _output: &OutputDispatcher) -> Result<()> {
     let path = config::config_path()?;
     if path.exists() && !force {
         println!("Config already exists at {}", path.display());
         return Ok(());
     }
-    let config = AppConfig::default();
-    config.save()?;
+    config::write_config_template(&path)?;
     println!("Wrote config to {}", path.display());
     Ok(())
 }
 
-fn proxy_cmd(cmd: ProxyCmd) -> Result<()> {
+fn proxy_cmd(cmd: ProxyCmd, _output: &OutputDispatcher) -> Result<()> {
     let mut config = AppConfig::load()?;
     match cmd {
         ProxyCmd::Add {
@@ -293,7 +324,7 @@ fn proxy_cmd(cmd: ProxyCmd) -> Result<()> {
     Ok(())
 }
 
-fn targets_cmd(cmd: TargetCmd) -> Result<()> {
+fn targets_cmd(cmd: TargetCmd, _output: &OutputDispatcher) -> Result<()> {
     let mut config = AppConfig::load()?;
     match cmd {
         TargetCmd::Add { domain, provider } => {
@@ -337,18 +368,18 @@ fn targets_cmd(cmd: TargetCmd) -> Result<()> {
     Ok(())
 }
 
-fn list_cmd(json: bool) -> Result<()> {
+fn list_cmd(output: &OutputDispatcher) -> Result<()> {
     let config = AppConfig::load()?;
     let state_path = state::state_path()?;
     let state = State::load(&state_path)?;
 
-    if json {
+    if output.mode().is_json() {
         let payload = serde_json::json!({
             "active_proxy": config.active_proxy,
             "proxies": config.proxies,
             "stats": state,
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        output.print_json(&payload);
         return Ok(());
     }
 
@@ -359,13 +390,13 @@ fn list_cmd(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn status_cmd(json: bool) -> Result<()> {
+fn status_cmd(output: &OutputDispatcher) -> Result<()> {
     let config = AppConfig::load()?;
     let state_path = state::state_path()?;
     let state = State::load(&state_path)?;
     let rules_active = iptables::chain_present(&config.settings.chain_name);
 
-    if json {
+    if output.mode().is_json() {
         // Build health info for JSON output
         let proxy_health: Vec<_> = config
             .proxies
@@ -407,7 +438,7 @@ fn status_cmd(json: bool) -> Result<()> {
             "proxy_health": proxy_health,
             "stats": state,
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        output.print_json(&payload);
         return Ok(());
     }
 
@@ -504,7 +535,7 @@ fn format_time_ago(dt: Option<chrono::DateTime<chrono::Utc>>) -> String {
     .unwrap_or_else(|| "never".to_string())
 }
 
-async fn activate_cmd(id: Option<String>, select: bool, run: bool) -> Result<()> {
+async fn activate_cmd(id: Option<String>, select: bool, run: bool, _output: &OutputDispatcher) -> Result<()> {
     let mut config = AppConfig::load()?;
     if config.proxies.is_empty() {
         bail!("No proxies configured. Add one first.");
@@ -548,7 +579,7 @@ async fn activate_cmd(id: Option<String>, select: bool, run: bool) -> Result<()>
     Ok(())
 }
 
-fn deactivate_cmd(keep_rules: bool) -> Result<()> {
+fn deactivate_cmd(keep_rules: bool, _output: &OutputDispatcher) -> Result<()> {
     let mut config = AppConfig::load()?;
     config.active_proxy = None;
     config.save()?;
@@ -568,7 +599,7 @@ fn deactivate_cmd(keep_rules: bool) -> Result<()> {
     Ok(())
 }
 
-fn diagnose_cmd() -> Result<()> {
+fn diagnose_cmd(_output: &OutputDispatcher) -> Result<()> {
     let iptables_ok = std::process::Command::new("iptables")
         .arg("-V")
         .output()
@@ -631,7 +662,7 @@ async fn test_proxy_connectivity(
     }
 }
 
-async fn check_cmd(strict: bool, json: bool, quiet: bool, test_connectivity: bool) -> Result<()> {
+async fn check_cmd(strict: bool, test_connectivity: bool, output: &OutputDispatcher) -> Result<()> {
     use validation::{validate_config, ValidationSeverity};
 
     let config_path = config::config_path()?;
@@ -640,8 +671,8 @@ async fn check_cmd(strict: bool, json: bool, quiet: bool, test_connectivity: boo
     let config = match AppConfig::load() {
         Ok(config) => config,
         Err(err) => {
-            if json {
-                let output = serde_json::json!({
+            if output.mode().is_json() {
+                let json_output = serde_json::json!({
                     "valid": false,
                     "config_path": config_path.display().to_string(),
                     "errors": [{
@@ -650,7 +681,7 @@ async fn check_cmd(strict: bool, json: bool, quiet: bool, test_connectivity: boo
                     }],
                     "warnings": [],
                 });
-                println!("{}", serde_json::to_string_pretty(&output)?);
+                output.print_json(&json_output);
             } else {
                 eprintln!("{} Failed to load configuration: {}", "✗".red(), err);
             }
@@ -674,7 +705,7 @@ async fn check_cmd(strict: bool, json: bool, quiet: bool, test_connectivity: boo
             Vec::new()
         };
 
-    if json {
+    if output.mode().is_json() {
         let errors: Vec<serde_json::Value> = report
             .results
             .iter()
@@ -713,7 +744,7 @@ async fn check_cmd(strict: bool, json: bool, quiet: bool, test_connectivity: boo
             })
             .collect();
 
-        let mut output = serde_json::json!({
+        let mut json_output = serde_json::json!({
             "valid": !report.has_errors(),
             "config_path": config_path.display().to_string(),
             "errors": errors,
@@ -726,11 +757,11 @@ async fn check_cmd(strict: bool, json: bool, quiet: bool, test_connectivity: boo
 
         // Add connectivity results if tested
         if test_connectivity {
-            output["connectivity"] = serde_json::json!(connectivity_results);
+            json_output["connectivity"] = serde_json::json!(connectivity_results);
         }
 
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else if !quiet || report.has_errors() || (strict && report.has_warnings()) {
+        output.print_json(&json_output);
+    } else if !output.mode().is_quiet() || report.has_errors() || (strict && report.has_warnings()) {
         println!("Configuration: {}", config_path.display());
         println!();
 
@@ -980,7 +1011,7 @@ fn is_daemon_running(port: u16) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
 
-async fn test_cmd(url: &str, json: bool, verbose: bool, no_dns: bool) -> Result<()> {
+async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatcher) -> Result<()> {
     let config = AppConfig::load()?;
 
     let domain = extract_domain(url);
@@ -1148,7 +1179,7 @@ async fn test_cmd(url: &str, json: bool, verbose: bool, no_dns: bool) -> Result<
     };
 
     // Output
-    if json {
+    if output.mode().is_json() {
         output_test_json(&decision)?;
     } else {
         output_test_standard(&decision, verbose);
