@@ -290,6 +290,134 @@ impl OutputDispatcher {
     pub const fn has_rich(&self) -> bool {
         self.console.is_some()
     }
+
+    /// Display an error with optional context and suggestions.
+    ///
+    /// This provides a consistent error presentation across all commands:
+    /// - In Human mode: Rich formatted error panel with suggestions
+    /// - In Machine mode: JSON object with error details
+    /// - In Quiet mode: Plain error message to stderr only
+    ///
+    /// # Arguments
+    ///
+    /// * `title` - Brief error title (e.g., "Connection Failed")
+    /// * `message` - Detailed error message
+    /// * `context` - Optional additional context (e.g., proxy ID, file path)
+    /// * `suggestions` - Optional list of actionable suggestions
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// output.display_error(
+    ///     "Unable to start daemon",
+    ///     "Port 12345 is already in use",
+    ///     Some("listen_port: 12345"),
+    ///     Some(&["Check if another proxy is running", "Use a different port with --port"]),
+    /// );
+    /// ```
+    pub fn display_error(
+        &self,
+        title: &str,
+        message: &str,
+        context: Option<&str>,
+        suggestions: Option<&[&str]>,
+    ) {
+        match self.mode {
+            OutputMode::Human => {
+                if let Some(console) = &self.console {
+                    // Build panel content
+                    let mut content = format!("[bold red]{}[/]\n\n{}", title, message);
+
+                    if let Some(ctx) = context {
+                        content.push_str(&format!("\n\n[dim]Context:[/] {}", ctx));
+                    }
+
+                    if let Some(suggestions) = suggestions {
+                        if !suggestions.is_empty() {
+                            content.push_str("\n\n[dim]Suggestions:[/]");
+                            for suggestion in suggestions {
+                                content.push_str(&format!("\n  • {}", suggestion));
+                            }
+                        }
+                    }
+
+                    let panel = Panel::from_text(&content)
+                        .title("Error")
+                        .border_style(theme::styles::error_msg());
+                    console.print_renderable(&panel);
+                }
+            }
+            OutputMode::Machine => {
+                // JSON format for machine consumption
+                let mut error_obj = serde_json::json!({
+                    "error": true,
+                    "title": title,
+                    "message": message,
+                });
+
+                if let Some(ctx) = context {
+                    error_obj["context"] = serde_json::Value::String(ctx.to_string());
+                }
+
+                if let Some(suggestions) = suggestions {
+                    error_obj["suggestions"] = serde_json::json!(suggestions);
+                }
+
+                if let Ok(json) = serde_json::to_string_pretty(&error_obj) {
+                    eprintln!("{json}");
+                }
+            }
+            OutputMode::Quiet => {
+                // Minimal output to stderr
+                eprintln!("Error: {}", message);
+            }
+        }
+    }
+
+    /// Display a warning with optional suggestions.
+    ///
+    /// Similar to display_error but uses warning styling.
+    pub fn display_warning(&self, title: &str, message: &str, suggestions: Option<&[&str]>) {
+        match self.mode {
+            OutputMode::Human => {
+                if let Some(console) = &self.console {
+                    let mut content = format!("[bold yellow]{}[/]\n\n{}", title, message);
+
+                    if let Some(suggestions) = suggestions {
+                        if !suggestions.is_empty() {
+                            content.push_str("\n\n[dim]Suggestions:[/]");
+                            for suggestion in suggestions {
+                                content.push_str(&format!("\n  • {}", suggestion));
+                            }
+                        }
+                    }
+
+                    let panel = Panel::from_text(&content)
+                        .title("Warning")
+                        .border_style(theme::styles::warning_msg());
+                    console.print_renderable(&panel);
+                }
+            }
+            OutputMode::Machine => {
+                let mut warning_obj = serde_json::json!({
+                    "warning": true,
+                    "title": title,
+                    "message": message,
+                });
+
+                if let Some(suggestions) = suggestions {
+                    warning_obj["suggestions"] = serde_json::json!(suggestions);
+                }
+
+                if let Ok(json) = serde_json::to_string_pretty(&warning_obj) {
+                    println!("{json}");
+                }
+            }
+            OutputMode::Quiet => {
+                // Warnings are suppressed in quiet mode
+            }
+        }
+    }
 }
 
 impl Default for OutputDispatcher {

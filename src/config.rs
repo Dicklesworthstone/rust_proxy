@@ -44,6 +44,13 @@ pub struct ProxyConfig {
     /// Optional custom health check URL
     #[serde(default)]
     pub health_check_url: Option<String>,
+    /// Weight for weighted load balancing (default: 100)
+    #[serde(default = "default_proxy_weight")]
+    pub weight: u32,
+}
+
+fn default_proxy_weight() -> u32 {
+    100
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +92,34 @@ pub enum DegradationPolicy {
     UseLast,
     /// Connect directly without proxy (must enable allow_direct_fallback)
     Direct,
+}
+
+/// Load balancing strategy for distributing requests across proxies
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalanceStrategy {
+    /// Use single active proxy with failover (current default behavior)
+    #[default]
+    Single,
+    /// Cycle through healthy proxies sequentially
+    RoundRobin,
+    /// Prefer proxy with lowest recent latency
+    LeastLatency,
+    /// Distribute by configured weights
+    Weighted,
+}
+
+impl LoadBalanceStrategy {
+    /// Returns a human-readable description of the strategy.
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LoadBalanceStrategy::Single => "single",
+            LoadBalanceStrategy::RoundRobin => "round_robin",
+            LoadBalanceStrategy::LeastLatency => "least_latency",
+            LoadBalanceStrategy::Weighted => "weighted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +259,9 @@ pub struct Settings {
     /// Allow direct connections as fallback (required for Direct policy)
     #[serde(default)]
     pub allow_direct_fallback: bool,
+    /// Load balancing strategy for distributing requests across proxies
+    #[serde(default)]
+    pub load_balance_strategy: LoadBalanceStrategy,
 }
 
 fn default_connect_max_retries() -> u32 {
@@ -315,6 +353,7 @@ impl Default for Settings {
             degradation_policy: DegradationPolicy::default(),
             degradation_delay_secs: default_degradation_delay_secs(),
             allow_direct_fallback: false,
+            load_balance_strategy: LoadBalanceStrategy::default(),
         }
     }
 }
@@ -911,13 +950,18 @@ pub fn write_config_template(path: &PathBuf) -> Result<()> {
             .with_context(|| format!("Failed creating config dir {}", parent.display()))?;
     }
     let content = default_config_template()?;
-    fs::write(path, content).with_context(|| format!("Failed writing config {}", path.display()))?;
+    fs::write(path, content)
+        .with_context(|| format!("Failed writing config {}", path.display()))?;
     Ok(())
 }
 
 fn insert_metrics_comments(content: &str) -> String {
     let metrics_comment = "\n# Prometheus metrics\n# metrics_enabled = true\n# metrics_port = 9090\n# metrics_path = \"/metrics\"\n# metrics_bind = \"127.0.0.1\"  # Bind to localhost only for security\n";
-    content.replacen("metrics_enabled = ", &format!("{metrics_comment}metrics_enabled = "), 1)
+    content.replacen(
+        "metrics_enabled = ",
+        &format!("{metrics_comment}metrics_enabled = "),
+        1,
+    )
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -1135,6 +1179,7 @@ mod tests {
             auth: ProxyAuth::default(),
             priority: Some(1),
             health_check_url: Some("http://example.com".to_string()),
+            weight: 100,
         };
         assert_eq!(proxy.priority, Some(1));
         assert_eq!(

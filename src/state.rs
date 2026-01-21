@@ -215,6 +215,13 @@ impl StateStore {
         state.proxies.clone()
     }
 
+    /// Get the average latency for a proxy (used by LeastLatency load balancing)
+    #[allow(dead_code)]
+    pub async fn get_latency(&self, proxy_id: &str) -> Option<f64> {
+        let state = self.inner.read().await;
+        state.proxies.get(proxy_id).and_then(|s| s.ping_avg_ms)
+    }
+
     pub async fn flush(&self) -> Result<()> {
         let state = self.inner.read().await;
         state.save(&self.path)

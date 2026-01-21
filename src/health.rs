@@ -1,4 +1,5 @@
 use crate::config::{AppConfig, ProxyConfig};
+use crate::metrics;
 use crate::state::{HealthStatus, RuntimeState, StateStore};
 use anyhow::Result;
 use std::sync::Arc;
@@ -249,6 +250,8 @@ pub async fn health_check_loop(
                             reason = %event.reason,
                             "Failover triggered"
                         );
+                        // Record failover metric
+                        metrics::record_failover(&event.from_proxy, &event.to_proxy);
                         runtime.failover_to(&event.to_proxy).await;
                     }
                 }
@@ -258,10 +261,15 @@ pub async fn health_check_loop(
                     && check_and_perform_failback(&config, &state, &runtime).await
                 {
                     let original = runtime.get_original_proxy().await;
+                    let effective = runtime.get_effective_proxy().await;
                     tracing::info!(
                         to = ?original,
                         "Failback triggered - returning to original proxy"
                     );
+                    // Record failback metric (counts as a failover from current to original)
+                    if let (Some(from), Some(to)) = (effective, original.clone()) {
+                        metrics::record_failover(&from, &to);
+                    }
                     runtime.failback().await;
                 }
             }
@@ -284,6 +292,10 @@ async fn run_health_checks(config: &AppConfig, state: &StateStore) {
             failure_reason = ?result.failure_reason,
             "Health check completed"
         );
+
+        // Record metrics for this health check
+        let latency_secs = result.latency_ms / 1000.0;
+        metrics::record_health_check(&proxy.id, result.success, latency_secs);
 
         state
             .record_health_check(

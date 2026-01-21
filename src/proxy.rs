@@ -4,12 +4,39 @@ use base64::Engine as _;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::config::ProxyConfig;
+use crate::config::{AppConfig, ProxyConfig};
+use crate::load_balancer::LoadBalancer;
+use crate::metrics;
 use crate::state::StateStore;
+
+/// Guard that tracks connection metrics with RAII pattern.
+///
+/// When dropped, automatically decrements active connections and records duration.
+struct ConnectionGuard {
+    proxy_id: String,
+    start: Instant,
+}
+
+impl ConnectionGuard {
+    fn new(proxy_id: String) -> Self {
+        metrics::connection_started(&proxy_id);
+        Self {
+            proxy_id,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let duration_secs = self.start.elapsed().as_secs_f64();
+        metrics::connection_ended(&self.proxy_id, duration_secs);
+    }
+}
 
 /// Check if an accept() error is transient and should be retried.
 ///
@@ -115,6 +142,11 @@ impl UpstreamProxy {
     }
 }
 
+/// Run the proxy with a single fixed upstream proxy.
+///
+/// This function is kept for backward compatibility and simple use cases
+/// where load balancing is not needed.
+#[allow(dead_code)]
 pub async fn run_proxy(
     listen_port: u16,
     upstream: UpstreamProxy,
@@ -165,6 +197,240 @@ pub async fn run_proxy(
     }
 }
 
+/// Run the proxy with load balancing - selects a proxy for each connection.
+///
+/// This function uses the configured load balancing strategy to select
+/// a proxy for each incoming connection, enabling distribution across
+/// multiple healthy proxies.
+pub async fn run_proxy_with_load_balancing(
+    listen_port: u16,
+    config: Arc<AppConfig>,
+    state: Arc<StateStore>,
+    load_balancer: Arc<LoadBalancer>,
+    retry_config: RetryConfig,
+) -> Result<()> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind to {addr}"))?;
+    tracing::info!(
+        "transparent proxy listening on {addr} (strategy: {:?})",
+        config.settings.load_balance_strategy
+    );
+
+    let mut backoff = AcceptBackoff::new();
+
+    loop {
+        let (client, client_addr) = match listener.accept().await {
+            Ok(conn) => {
+                backoff.record_success();
+                conn
+            }
+            Err(e) if is_transient_accept_error(&e) => {
+                let delay = backoff.record_error();
+                tracing::warn!(
+                    error = %e,
+                    error_code = ?e.raw_os_error(),
+                    consecutive_errors = backoff.consecutive_errors,
+                    backoff_ms = delay.as_millis(),
+                    "Accept error (transient, will retry)"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Accept error (fatal, exiting)");
+                return Err(e.into());
+            }
+        };
+
+        let config_clone = config.clone();
+        let state_clone = state.clone();
+        let lb_clone = load_balancer.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_connection_with_load_balancing(
+                client,
+                client_addr,
+                config_clone,
+                state_clone,
+                lb_clone,
+                retry_config,
+            )
+            .await
+            {
+                tracing::warn!("connection error: {err}");
+            }
+        });
+    }
+}
+
+/// Handle a single connection with load-balanced proxy selection.
+async fn handle_connection_with_load_balancing(
+    mut client: TcpStream,
+    client_addr: SocketAddr,
+    config: Arc<AppConfig>,
+    state: Arc<StateStore>,
+    load_balancer: Arc<LoadBalancer>,
+    retry_config: RetryConfig,
+) -> Result<()> {
+    // Select proxy using load balancer
+    let proxy_id = load_balancer
+        .select_proxy(
+            config.settings.load_balance_strategy,
+            &config.proxies,
+            &state,
+        )
+        .await;
+
+    let proxy_id = match proxy_id {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                client = %client_addr,
+                "No healthy proxy available, dropping connection"
+            );
+            // TODO: Apply degradation policy (separate feature bd-xw7)
+            return Err(anyhow!("No healthy proxy available"));
+        }
+    };
+
+    // Find the proxy config
+    let proxy_cfg = config
+        .proxies
+        .iter()
+        .find(|p| p.id == proxy_id)
+        .ok_or_else(|| anyhow!("Selected proxy '{}' not found in config", proxy_id))?;
+
+    // Create upstream proxy from config
+    let upstream = UpstreamProxy::from_config(proxy_cfg)?;
+
+    // Create connection guard to track metrics (RAII pattern)
+    // This will automatically decrement active connections and record duration on drop
+    let _guard = ConnectionGuard::new(proxy_id.clone());
+
+    tracing::debug!(
+        proxy = %proxy_id,
+        strategy = ?config.settings.load_balance_strategy,
+        client = %client_addr,
+        "Selected proxy for connection"
+    );
+
+    // Get original destination
+    let original = get_original_dst(&client)?;
+    let target = match original {
+        SocketAddr::V4(v4) => v4,
+        _ => {
+            metrics::record_request_error(&proxy_id);
+            return Err(anyhow!("IPv6 destinations are not supported"));
+        }
+    };
+    let target_host = target.ip().to_string();
+    let target_port = target.port();
+
+    let mut upstream_socket =
+        match connect_with_retry(&upstream.host, upstream.port, &retry_config).await {
+            Ok(socket) => socket,
+            Err(e) => {
+                metrics::record_request_error(&proxy_id);
+                return Err(e);
+            }
+        };
+
+    let auth_header = if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
+        let token = Base64.encode(format!("{}:{}", user, pass));
+        format!("Proxy-Authorization: Basic {}\r\n", token)
+    } else {
+        String::new()
+    };
+
+    let connect_req = format!(
+        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
+        target_host, target_port, target_host, target_port, auth_header
+    );
+
+    if let Err(e) = upstream_socket.write_all(connect_req.as_bytes()).await {
+        metrics::record_request_error(&proxy_id);
+        return Err(e.into());
+    }
+    if let Err(e) = upstream_socket.flush().await {
+        metrics::record_request_error(&proxy_id);
+        return Err(e.into());
+    }
+
+    let mut header_buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 512];
+    let header_end = loop {
+        let n = match upstream_socket.read(&mut tmp).await {
+            Ok(0) => {
+                metrics::record_request_error(&proxy_id);
+                return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
+            }
+            Ok(n) => n,
+            Err(e) => {
+                metrics::record_request_error(&proxy_id);
+                return Err(e.into());
+            }
+        };
+        header_buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if header_buf.len() > 16 * 1024 {
+            metrics::record_request_error(&proxy_id);
+            return Err(anyhow!("Proxy CONNECT response too large"));
+        }
+    };
+
+    let header_bytes = &header_buf[..header_end];
+    let trailer = &header_buf[header_end..];
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let status_line = header_text.lines().next().unwrap_or_default();
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|token| token.parse::<u16>().ok())
+        .ok_or_else(|| {
+            metrics::record_request_error(&proxy_id);
+            anyhow!("Proxy CONNECT invalid status line: {status_line}")
+        })?;
+    if !(200..300).contains(&status_code) {
+        metrics::record_request_error(&proxy_id);
+        return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
+    }
+
+    if !trailer.is_empty() {
+        if let Err(e) = client.write_all(trailer).await {
+            metrics::record_request_error(&proxy_id);
+            return Err(e.into());
+        }
+        if let Err(e) = client.flush().await {
+            metrics::record_request_error(&proxy_id);
+            return Err(e.into());
+        }
+    }
+
+    let (bytes_to_up, bytes_to_client) =
+        match tokio::io::copy_bidirectional(&mut client, &mut upstream_socket).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                metrics::record_request_error(&proxy_id);
+                return Err(e.into());
+            }
+        };
+
+    // Record successful request and bytes transferred
+    metrics::record_request_success(&proxy_id);
+    metrics::record_bytes(&proxy_id, bytes_to_up, bytes_to_client);
+
+    state
+        .record_traffic(&upstream.id, bytes_to_up, bytes_to_client)
+        .await;
+
+    Ok(())
+}
+
+/// Handle a single connection with a fixed upstream proxy.
+#[allow(dead_code)]
 async fn handle_connection(
     mut client: TcpStream,
     upstream: UpstreamProxy,

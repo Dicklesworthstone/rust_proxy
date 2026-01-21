@@ -12,9 +12,13 @@ use tokio::time::Instant;
 
 mod config;
 mod dns;
+mod error;
 mod health;
 mod ip_ranges;
 mod iptables;
+mod load_balancer;
+mod metrics;
+mod metrics_server;
 mod output;
 mod proxy;
 mod state;
@@ -22,8 +26,9 @@ mod util;
 mod validation;
 
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
+use load_balancer::LoadBalancer;
 use output::OutputDispatcher;
-use proxy::{RetryConfig, UpstreamProxy};
+use proxy::RetryConfig;
 use state::{HealthStatus, RuntimeState, State, StateStore};
 
 #[derive(Parser)]
@@ -73,8 +78,20 @@ enum Commands {
     Daemon,
     /// Show current status
     Status(OutputArgs),
-    /// Check system dependencies
+    /// Check system dependencies (deprecated, use doctor)
     Diagnose,
+    /// Comprehensive health check for rust_proxy
+    Doctor {
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+        /// Only output errors (no success messages)
+        #[arg(long)]
+        quiet: bool,
+        /// Skip network connectivity tests
+        #[arg(long)]
+        offline: bool,
+    },
     /// Validate configuration without side effects
     Check {
         /// Treat warnings as errors (exit code 2)
@@ -238,6 +255,14 @@ async fn main() -> Result<()> {
             let output = OutputDispatcher::from_flags(false, false);
             diagnose_cmd(&output)?
         }
+        Commands::Doctor {
+            json,
+            quiet,
+            offline,
+        } => {
+            let output = OutputDispatcher::from_flags(json, quiet);
+            doctor_cmd(&output, offline).await?
+        }
         Commands::Check {
             strict,
             json,
@@ -262,14 +287,71 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_config(force: bool, _output: &OutputDispatcher) -> Result<()> {
-    let path = config::config_path()?;
-    if path.exists() && !force {
-        println!("Config already exists at {}", path.display());
+fn init_config(force: bool, output: &OutputDispatcher) -> Result<()> {
+    let config_path = config::config_path()?;
+    let state_path = state::state_path()?;
+
+    // Check if config already exists
+    let already_exists = config_path.exists() && !force;
+
+    if already_exists {
+        // Config exists and --force not used
+        if output.mode().is_json() {
+            output.print_json(&serde_json::json!({
+                "config_path": config_path.display().to_string(),
+                "state_path": state_path.display().to_string(),
+                "created": false,
+                "message": "Config already exists"
+            }));
+        } else if output.mode().is_rich() {
+            let content = format!(
+                "[bold cyan]rust_proxy[/] is already initialized.\n\n\
+                 [bold]Config:[/]  {}\n\
+                 [bold]State:[/]   {}\n\n\
+                 Use [dim]--force[/] to overwrite the existing configuration.",
+                config_path.display(),
+                state_path.display()
+            );
+            let panel = output::widgets::info_panel(&content, "Already Initialized");
+            output.print_renderable(&panel);
+        } else {
+            output.print_plain(&format!(
+                "Config already exists at {}",
+                config_path.display()
+            ));
+        }
         return Ok(());
     }
-    config::write_config_template(&path)?;
-    println!("Wrote config to {}", path.display());
+
+    // Create the config
+    config::write_config_template(&config_path)?;
+
+    if output.mode().is_json() {
+        output.print_json(&serde_json::json!({
+            "config_path": config_path.display().to_string(),
+            "state_path": state_path.display().to_string(),
+            "created": true,
+            "message": "Configuration initialized successfully"
+        }));
+    } else if output.mode().is_rich() {
+        let content = format!(
+            "[bold cyan]rust_proxy[/] initialized successfully!\n\n\
+             [bold]Config:[/]  {}\n\
+             [bold]State:[/]   {}\n\n\
+             [bold]Next steps:[/]\n\
+             1. Add a proxy:    [dim]rust_proxy proxy add <id> <host:port>[/]\n\
+             2. Add targets:    [dim]rust_proxy targets add <domain>[/]\n\
+             3. Activate:       [dim]rust_proxy activate --select[/]\n\
+             4. Start daemon:   [dim]sudo rust_proxy daemon[/]",
+            config_path.display(),
+            state_path.display()
+        );
+        let panel = output::widgets::success_panel(&content);
+        output.print_renderable(&panel);
+    } else {
+        output.print_plain(&format!("Wrote config to {}", config_path.display()));
+    }
+
     Ok(())
 }
 
@@ -299,6 +381,7 @@ fn proxy_cmd(cmd: ProxyCmd, _output: &OutputDispatcher) -> Result<()> {
                 auth,
                 priority: None,
                 health_check_url: None,
+                weight: 100,
             });
             config.save()?;
             println!("Proxy added.");
@@ -407,6 +490,7 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
                     "id": p.id,
                     "status": stats.map(|s| s.health_status.to_string()).unwrap_or_else(|| "unknown".to_string()),
                     "priority": p.priority,
+                    "weight": p.weight,
                     "latency_ms": stats.and_then(|s| s.ping_avg_ms),
                     "last_check": stats.and_then(|s| s.last_health_check),
                     "consecutive_failures": stats.map(|s| s.consecutive_failures).unwrap_or(0),
@@ -427,6 +511,12 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
             })
         });
 
+        // Build load balancing info
+        let load_balancing = serde_json::json!({
+            "strategy": format!("{:?}", config.settings.load_balance_strategy).to_lowercase(),
+            "note": "Selection stats only available when daemon is running"
+        });
+
         let payload = serde_json::json!({
             "active_proxy": config.active_proxy,
             "active_proxy_health": active_health,
@@ -435,6 +525,7 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
             "auto_failover": config.settings.auto_failover,
             "auto_failback": config.settings.auto_failback,
             "targets": config.targets.len(),
+            "load_balancing": load_balancing,
             "proxy_health": proxy_health,
             "stats": state,
         });
@@ -468,14 +559,32 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
     println!("Rules active: {}", if rules_active { "yes" } else { "no" });
     println!("Targets: {}", config.targets.len());
 
+    // Show load balancing configuration
+    let strategy_str = match config.settings.load_balance_strategy {
+        config::LoadBalanceStrategy::Single => "single".to_string(),
+        config::LoadBalanceStrategy::RoundRobin => "round_robin".cyan().to_string(),
+        config::LoadBalanceStrategy::LeastLatency => "least_latency".cyan().to_string(),
+        config::LoadBalanceStrategy::Weighted => "weighted".cyan().to_string(),
+    };
+    println!("Load balancing: {}", strategy_str);
+
     // Show health summary if health checks are enabled and there are proxies
+    let show_weight =
+        config.settings.load_balance_strategy == config::LoadBalanceStrategy::Weighted;
     if config.settings.health_check_enabled && !config.proxies.is_empty() {
         println!();
         println!("Proxy Health Summary:");
-        println!(
-            "  {:<12} {:<12} {:<10} {:<10} {:<12} Failures",
-            "ID", "Status", "Priority", "Latency", "Last Check"
-        );
+        if show_weight {
+            println!(
+                "  {:<12} {:<12} {:<10} {:<8} {:<10} {:<12} Failures",
+                "ID", "Status", "Priority", "Weight", "Latency", "Last Check"
+            );
+        } else {
+            println!(
+                "  {:<12} {:<12} {:<10} {:<10} {:<12} Failures",
+                "ID", "Status", "Priority", "Latency", "Last Check"
+            );
+        }
         for proxy in &config.proxies {
             let stats = state.proxies.get(&proxy.id);
             let status = stats
@@ -495,10 +604,17 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
                 .unwrap_or_else(|| "never".to_string());
             let failures = stats.map(|s| s.consecutive_failures).unwrap_or(0);
 
-            println!(
-                "  {:<12} {:<12} {:<10} {:<10} {:<12} {}",
-                proxy.id, status, priority, latency, last_check, failures
-            );
+            if show_weight {
+                println!(
+                    "  {:<12} {:<12} {:<10} {:<8} {:<10} {:<12} {}",
+                    proxy.id, status, priority, proxy.weight, latency, last_check, failures
+                );
+            } else {
+                println!(
+                    "  {:<12} {:<12} {:<10} {:<10} {:<12} {}",
+                    proxy.id, status, priority, latency, last_check, failures
+                );
+            }
         }
     } else if !config.settings.health_check_enabled {
         println!();
@@ -535,7 +651,12 @@ fn format_time_ago(dt: Option<chrono::DateTime<chrono::Utc>>) -> String {
     .unwrap_or_else(|| "never".to_string())
 }
 
-async fn activate_cmd(id: Option<String>, select: bool, run: bool, _output: &OutputDispatcher) -> Result<()> {
+async fn activate_cmd(
+    id: Option<String>,
+    select: bool,
+    run: bool,
+    _output: &OutputDispatcher,
+) -> Result<()> {
     let mut config = AppConfig::load()?;
     if config.proxies.is_empty() {
         bail!("No proxies configured. Add one first.");
@@ -614,6 +735,465 @@ fn diagnose_cmd(_output: &OutputDispatcher) -> Result<()> {
     println!("iptables: {}", if iptables_ok { "ok" } else { "missing" });
     println!("ipset:    {}", if ipset_ok { "ok" } else { "missing" });
     Ok(())
+}
+
+// ============================================================================
+// Doctor Command - Comprehensive Health Check
+// ============================================================================
+
+/// Individual check result for doctor command
+#[derive(Debug, Clone, serde::Serialize)]
+struct DoctorCheck {
+    name: String,
+    status: DoctorStatus,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DoctorStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+/// Overall doctor report
+#[derive(Debug, Clone, serde::Serialize)]
+struct DoctorReport {
+    healthy: bool,
+    checks: Vec<DoctorCheck>,
+    summary: DoctorSummary,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DoctorSummary {
+    total: usize,
+    passed: usize,
+    warnings: usize,
+    errors: usize,
+}
+
+impl DoctorCheck {
+    fn ok(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: DoctorStatus::Ok,
+            message: message.into(),
+            suggestion: None,
+        }
+    }
+
+    fn warning(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        suggestion: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: DoctorStatus::Warning,
+            message: message.into(),
+            suggestion: Some(suggestion.into()),
+        }
+    }
+
+    fn error(
+        name: impl Into<String>,
+        message: impl Into<String>,
+        suggestion: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: DoctorStatus::Error,
+            message: message.into(),
+            suggestion: Some(suggestion.into()),
+        }
+    }
+}
+
+/// Comprehensive health check command
+async fn doctor_cmd(output: &OutputDispatcher, offline: bool) -> Result<()> {
+    let mut checks = Vec::new();
+
+    // 1. Check config file
+    checks.push(check_config_file().await);
+
+    // 2. Check config validity (if file exists)
+    let config = check_config_validity(&mut checks).await;
+
+    // 3. Check state directory
+    checks.push(check_state_directory().await);
+
+    // 4. Check system dependencies (iptables, ipset)
+    checks.extend(check_system_dependencies().await);
+
+    // 5. Check listen port availability (if config loaded)
+    if let Some(ref cfg) = config {
+        checks.push(check_listen_port(cfg.settings.listen_port).await);
+    }
+
+    // 6. Network checks (unless offline)
+    if !offline {
+        if let Some(ref cfg) = config {
+            // Check proxy connectivity
+            checks.extend(check_proxy_connectivity(cfg).await);
+
+            // Check DNS resolution for a sample domain
+            checks.push(check_dns_resolution().await);
+        }
+    } else {
+        checks.push(DoctorCheck::ok("Network Tests", "Skipped (--offline mode)"));
+    }
+
+    // Build report
+    let passed = checks
+        .iter()
+        .filter(|c| c.status == DoctorStatus::Ok)
+        .count();
+    let warnings = checks
+        .iter()
+        .filter(|c| c.status == DoctorStatus::Warning)
+        .count();
+    let errors = checks
+        .iter()
+        .filter(|c| c.status == DoctorStatus::Error)
+        .count();
+
+    let report = DoctorReport {
+        healthy: errors == 0,
+        checks: checks.clone(),
+        summary: DoctorSummary {
+            total: checks.len(),
+            passed,
+            warnings,
+            errors,
+        },
+    };
+
+    // Output based on mode
+    if output.mode().is_json() {
+        output.print_json(&report);
+    } else {
+        print_doctor_report(output, &report);
+    }
+
+    // Exit with error code if unhealthy
+    if !report.healthy {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn print_doctor_report(output: &OutputDispatcher, report: &DoctorReport) {
+    output.print_rich("\n[bold]rust_proxy doctor[/]\n");
+
+    for check in &report.checks {
+        let (icon, color) = match check.status {
+            DoctorStatus::Ok => ("✓", "green"),
+            DoctorStatus::Warning => ("!", "yellow"),
+            DoctorStatus::Error => ("✗", "red"),
+        };
+
+        output.print_rich(&format!(
+            "[{color}]{icon}[/] [bold]{}[/]: {}",
+            check.name, check.message
+        ));
+
+        if let Some(ref suggestion) = check.suggestion {
+            output.print_rich(&format!("  [dim]→ {}[/]", suggestion));
+        }
+    }
+
+    output.newline();
+
+    // Summary line
+    let summary = &report.summary;
+    let status_text = if report.healthy {
+        "[bold green]All checks passed[/]"
+    } else {
+        "[bold red]Issues detected[/]"
+    };
+
+    output.print_rich(&format!(
+        "{} ({} passed, {} warnings, {} errors)",
+        status_text, summary.passed, summary.warnings, summary.errors
+    ));
+    output.newline();
+}
+
+async fn check_config_file() -> DoctorCheck {
+    match config::config_path() {
+        Ok(path) => {
+            if path.exists() {
+                DoctorCheck::ok("Config File", format!("Found at {}", path.display()))
+            } else {
+                DoctorCheck::error(
+                    "Config File",
+                    format!("Not found at {}", path.display()),
+                    "Run 'rp init' to create a default configuration",
+                )
+            }
+        }
+        Err(e) => DoctorCheck::error(
+            "Config File",
+            format!("Cannot determine path: {}", e),
+            "Check your home directory permissions",
+        ),
+    }
+}
+
+async fn check_config_validity(checks: &mut Vec<DoctorCheck>) -> Option<AppConfig> {
+    match AppConfig::load() {
+        Ok(config) => {
+            // Basic validation
+            if config.proxies.is_empty() {
+                checks.push(DoctorCheck::warning(
+                    "Config Validation",
+                    "No proxies configured",
+                    "Add a proxy with 'rp proxy add <id> <url>'",
+                ));
+            } else {
+                checks.push(DoctorCheck::ok(
+                    "Config Validation",
+                    format!(
+                        "{} proxies, {} targets configured",
+                        config.proxies.len(),
+                        config.targets.len()
+                    ),
+                ));
+            }
+
+            if config.active_proxy.is_none() && !config.proxies.is_empty() {
+                checks.push(DoctorCheck::warning(
+                    "Active Proxy",
+                    "No proxy is currently active",
+                    "Run 'rp activate <proxy-id>' to activate a proxy",
+                ));
+            } else if let Some(ref active) = config.active_proxy {
+                let exists = config.proxies.iter().any(|p| &p.id == active);
+                if exists {
+                    checks.push(DoctorCheck::ok(
+                        "Active Proxy",
+                        format!("'{}' is active", active),
+                    ));
+                } else {
+                    checks.push(DoctorCheck::error(
+                        "Active Proxy",
+                        format!("'{}' is set but not found in proxies", active),
+                        "Update active_proxy in config or run 'rp activate <valid-id>'",
+                    ));
+                }
+            }
+
+            Some(config)
+        }
+        Err(e) => {
+            checks.push(DoctorCheck::error(
+                "Config Validation",
+                format!("Failed to load: {}", e),
+                "Check config syntax with 'rp check'",
+            ));
+            None
+        }
+    }
+}
+
+async fn check_state_directory() -> DoctorCheck {
+    match config::state_dir() {
+        Ok(dir) => {
+            // Check if directory exists
+            if !dir.exists() {
+                // Try to create it
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    return DoctorCheck::ok(
+                        "State Directory",
+                        format!("Created at {}", dir.display()),
+                    );
+                } else {
+                    return DoctorCheck::error(
+                        "State Directory",
+                        format!("Cannot create {}", dir.display()),
+                        "Check parent directory permissions",
+                    );
+                }
+            }
+
+            // Check if writable by creating a temp file
+            let test_file = dir.join(".doctor_test");
+            match std::fs::write(&test_file, "test") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&test_file);
+                    DoctorCheck::ok("State Directory", format!("Writable at {}", dir.display()))
+                }
+                Err(e) => DoctorCheck::error(
+                    "State Directory",
+                    format!("Not writable: {}", e),
+                    "Check directory permissions",
+                ),
+            }
+        }
+        Err(e) => DoctorCheck::error(
+            "State Directory",
+            format!("Cannot determine path: {}", e),
+            "Check your home directory permissions",
+        ),
+    }
+}
+
+async fn check_system_dependencies() -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    // Check iptables
+    let iptables_ok = std::process::Command::new("iptables")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if iptables_ok {
+        checks.push(DoctorCheck::ok("iptables", "Available"));
+    } else {
+        checks.push(DoctorCheck::error(
+            "iptables",
+            "Not found or not executable",
+            "Install iptables (apt install iptables / dnf install iptables)",
+        ));
+    }
+
+    // Check ipset
+    let ipset_ok = std::process::Command::new("ipset")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if ipset_ok {
+        checks.push(DoctorCheck::ok("ipset", "Available"));
+    } else {
+        checks.push(DoctorCheck::error(
+            "ipset",
+            "Not found or not executable",
+            "Install ipset (apt install ipset / dnf install ipset)",
+        ));
+    }
+
+    checks
+}
+
+async fn check_listen_port(port: u16) -> DoctorCheck {
+    use tokio::net::TcpListener;
+
+    match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+        Ok(_) => DoctorCheck::ok("Listen Port", format!("Port {} is available", port)),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                // Check if it's our daemon
+                DoctorCheck::warning(
+                    "Listen Port",
+                    format!("Port {} is in use", port),
+                    "This may be the rust_proxy daemon or another process",
+                )
+            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                DoctorCheck::warning(
+                    "Listen Port",
+                    format!("Port {} requires elevated privileges", port),
+                    "Run with sudo or use a port >= 1024",
+                )
+            } else {
+                DoctorCheck::error(
+                    "Listen Port",
+                    format!("Cannot bind to port {}: {}", port, e),
+                    "Check if port is in use or try a different port",
+                )
+            }
+        }
+    }
+}
+
+async fn check_proxy_connectivity(config: &AppConfig) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    if config.proxies.is_empty() {
+        return checks;
+    }
+
+    let timeout_ms = config.settings.health_check_timeout_ms;
+
+    for proxy in &config.proxies {
+        let result = health::check_proxy_health(proxy, timeout_ms).await;
+
+        if result.success {
+            checks.push(DoctorCheck::ok(
+                format!("Proxy '{}'", proxy.id),
+                format!("Reachable ({}ms)", result.latency_ms as u64),
+            ));
+        } else {
+            let reason = result
+                .failure_reason
+                .unwrap_or_else(|| "Unknown".to_string());
+            if reason.contains("timeout") {
+                checks.push(DoctorCheck::warning(
+                    format!("Proxy '{}'", proxy.id),
+                    format!("Timeout after {}ms", timeout_ms),
+                    "Check proxy URL and network connectivity",
+                ));
+            } else if reason.contains("407") {
+                checks.push(DoctorCheck::warning(
+                    format!("Proxy '{}'", proxy.id),
+                    "Authentication required (407)",
+                    "Configure proxy credentials with --username/--password",
+                ));
+            } else {
+                checks.push(DoctorCheck::error(
+                    format!("Proxy '{}'", proxy.id),
+                    format!("Connection failed: {}", reason),
+                    "Verify proxy URL and that the proxy is running",
+                ));
+            }
+        }
+    }
+
+    checks
+}
+
+async fn check_dns_resolution() -> DoctorCheck {
+    // Test DNS resolution with a reliable domain
+    let test_domain = "www.google.com";
+
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((test_domain, 80)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => {
+            let count = addrs.count();
+            if count > 0 {
+                DoctorCheck::ok(
+                    "DNS Resolution",
+                    format!("{} resolved ({} addresses)", test_domain, count),
+                )
+            } else {
+                DoctorCheck::warning(
+                    "DNS Resolution",
+                    format!("{} returned no addresses", test_domain),
+                    "Check your DNS configuration",
+                )
+            }
+        }
+        Ok(Err(e)) => DoctorCheck::error(
+            "DNS Resolution",
+            format!("Failed to resolve {}: {}", test_domain, e),
+            "Check your network and DNS settings",
+        ),
+        Err(_) => DoctorCheck::error(
+            "DNS Resolution",
+            "DNS lookup timed out after 5 seconds",
+            "Check your network connectivity and DNS settings",
+        ),
+    }
 }
 
 /// Result of testing connectivity to a proxy
@@ -761,7 +1341,8 @@ async fn check_cmd(strict: bool, test_connectivity: bool, output: &OutputDispatc
         }
 
         output.print_json(&json_output);
-    } else if !output.mode().is_quiet() || report.has_errors() || (strict && report.has_warnings()) {
+    } else if !output.mode().is_quiet() || report.has_errors() || (strict && report.has_warnings())
+    {
         println!("Configuration: {}", config_path.display());
         println!();
 
@@ -1340,35 +1921,64 @@ fn completions_cmd(shell: Shell) {
 async fn run_daemon() -> Result<()> {
     iptables::require_root()?;
     let config = AppConfig::load()?;
-    let active_id = config
-        .active_proxy
-        .clone()
-        .context("No active proxy configured")?;
 
-    let proxy_cfg = config
-        .proxies
-        .iter()
-        .find(|p| p.id == active_id)
-        .context("Active proxy not found in config")?;
+    // Initialize metrics registry (safe to call even if already initialized)
+    if let Err(e) = metrics::init_metrics() {
+        tracing::warn!(error = %e, "Failed to initialize metrics (continuing without metrics)");
+    }
+
+    // For Single strategy, require active_proxy; for load-balanced strategies, just need proxies
+    let active_id = match config.settings.load_balance_strategy {
+        config::LoadBalanceStrategy::Single => {
+            let id = config
+                .active_proxy
+                .clone()
+                .context("No active proxy configured (required for Single strategy)")?;
+            // Verify active proxy exists
+            if !config.proxies.iter().any(|p| p.id == id) {
+                bail!("Active proxy '{}' not found in config", id);
+            }
+            Some(id)
+        }
+        _ => {
+            // For load-balanced strategies, active_proxy is optional
+            // (load balancer will select from healthy proxies)
+            if config.proxies.is_empty() {
+                bail!("No proxies configured");
+            }
+            config.active_proxy.clone()
+        }
+    };
 
     if config.targets.is_empty() {
         bail!("No targets configured. Add domains with `rust_proxy targets add`.");
     }
 
-    let upstream = UpstreamProxy::from_config(proxy_cfg)?;
-    let upstream_host = upstream.host.clone();
-    let upstream_hosts = vec![upstream_host.clone()];
+    // Collect all proxy hosts to exclude from iptables (prevents redirect loops)
+    let mut upstream_hosts = Vec::new();
+    for proxy in &config.proxies {
+        if let Ok(endpoint) = util::parse_proxy_url(&proxy.url) {
+            upstream_hosts.push(endpoint.host);
+        }
+    }
+    upstream_hosts.sort();
+    upstream_hosts.dedup();
+
     let upstream_excludes = dns::resolve_ipv4(&upstream_hosts).await?;
     if upstream_excludes.is_empty() {
         tracing::warn!(
-            "No IPv4 addresses found for upstream {}. Upstream traffic may be redirected.",
-            upstream_host
+            "No IPv4 addresses found for upstream proxies. Upstream traffic may be redirected."
         );
     }
 
     let state = Arc::new(StateStore::load().await?);
-    state.record_activated(&active_id, chrono::Utc::now()).await;
+    if let Some(ref id) = active_id {
+        state.record_activated(id, chrono::Utc::now()).await;
+    }
     state.clone().start_flush_loop(Duration::from_secs(5));
+
+    // Create load balancer
+    let load_balancer = Arc::new(LoadBalancer::new());
 
     // Create runtime state for dynamic proxy management
     let runtime_state = RuntimeState::new(config.active_proxy.clone());
@@ -1458,12 +2068,49 @@ async fn run_daemon() -> Result<()> {
         initial_backoff_ms: config.settings.connect_initial_backoff_ms,
         max_backoff_ms: config.settings.connect_max_backoff_ms,
     };
-    let proxy_task = tokio::spawn(proxy::run_proxy(
+
+    // Wrap config in Arc for sharing with proxy task
+    let config_arc = Arc::new(config.clone());
+
+    let proxy_task = tokio::spawn(proxy::run_proxy_with_load_balancing(
         config.settings.listen_port,
-        upstream,
+        config_arc,
         state.clone(),
+        load_balancer,
         retry_config,
     ));
+
+    // Metrics server task (only if enabled)
+    let metrics_task = if config.settings.metrics_enabled {
+        let metrics_bind = format!(
+            "{}:{}",
+            config.settings.metrics_bind, config.settings.metrics_port
+        );
+        let metrics_addr = match metrics_bind.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::warn!(
+                    bind = %metrics_bind,
+                    error = %e,
+                    "Invalid metrics bind address (continuing without metrics)"
+                );
+                // Use a dummy address - server will fail gracefully
+                "0.0.0.0:0".parse().unwrap()
+            }
+        };
+        let metrics_path = config.settings.metrics_path.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        Some((
+            tokio::spawn(metrics_server::run_metrics_server(
+                metrics_addr,
+                metrics_path,
+                shutdown_rx,
+            )),
+            shutdown_tx,
+        ))
+    } else {
+        None
+    };
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -1481,6 +2128,10 @@ async fn run_daemon() -> Result<()> {
     refresh_task.abort();
     ping_task.abort();
     if let Some((task, shutdown_tx)) = health_task {
+        let _ = shutdown_tx.send(true);
+        task.abort();
+    }
+    if let Some((task, shutdown_tx)) = metrics_task {
         let _ = shutdown_tx.send(true);
         task.abort();
     }

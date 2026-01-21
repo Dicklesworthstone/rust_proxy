@@ -1,4 +1,6 @@
-use crate::config::{AppConfig, DegradationPolicy, ProxyConfig, Settings, TargetSpec};
+use crate::config::{
+    AppConfig, DegradationPolicy, LoadBalanceStrategy, ProxyConfig, Settings, TargetSpec,
+};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -106,6 +108,12 @@ pub fn validate_config(config: &AppConfig, config_path: &Path) -> ValidationRepo
     // Validate active proxy reference
     results.extend(validate_active_proxy(
         config.active_proxy.as_deref(),
+        &config.proxies,
+    ));
+
+    // Validate load balance configuration
+    results.extend(validate_load_balance_config(
+        config.settings.load_balance_strategy,
         &config.proxies,
     ));
 
@@ -439,7 +447,10 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
         results.push(
             ValidationResult::error(
                 "settings",
-                format!("metrics_bind is not a valid address: {}", settings.metrics_bind),
+                format!(
+                    "metrics_bind is not a valid address: {}",
+                    settings.metrics_bind
+                ),
             )
             .with_id("metrics_bind")
             .with_suggestion("Use an IP address like 0.0.0.0 or 127.0.0.1"),
@@ -648,6 +659,87 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
     results
 }
 
+/// Validate load balance strategy configuration against proxy weights.
+///
+/// This function checks for strategy-specific issues:
+/// - If strategy is "weighted", warn if any proxy has weight = 0 (will never be selected)
+/// - Strategy is already validated by serde deserialization (only valid enum variants allowed)
+pub fn validate_load_balance_config(
+    strategy: LoadBalanceStrategy,
+    proxies: &[ProxyConfig],
+) -> Vec<ValidationResult> {
+    let mut results = Vec::new();
+
+    // For weighted strategy, check proxy weights
+    if strategy == LoadBalanceStrategy::Weighted {
+        if proxies.is_empty() {
+            results.push(
+                ValidationResult::warning(
+                    "settings",
+                    "load_balance_strategy is 'weighted' but no proxies are configured",
+                )
+                .with_id("load_balance_strategy")
+                .with_suggestion("Add proxies or change strategy to 'single'"),
+            );
+        } else {
+            // Check for zero weights
+            let zero_weight_proxies: Vec<_> = proxies
+                .iter()
+                .filter(|p| p.weight == 0)
+                .map(|p| p.id.as_str())
+                .collect();
+
+            if !zero_weight_proxies.is_empty() {
+                results.push(
+                    ValidationResult::warning(
+                        "proxy",
+                        format!(
+                            "Proxies with weight=0 will never be selected in weighted mode: {}",
+                            zero_weight_proxies.join(", ")
+                        ),
+                    )
+                    .with_suggestion(
+                        "Set weight > 0 for proxies you want included in load balancing",
+                    ),
+                );
+            }
+
+            // Check if all proxies have the same weight (effectively round-robin)
+            if proxies.len() > 1 {
+                let first_weight = proxies[0].weight;
+                let all_same = proxies.iter().all(|p| p.weight == first_weight);
+                if all_same && first_weight > 0 {
+                    results.push(
+                        ValidationResult::warning(
+                            "settings",
+                            format!(
+                                "All proxies have the same weight ({}), equivalent to round_robin",
+                                first_weight
+                            ),
+                        )
+                        .with_id("load_balance_strategy")
+                        .with_suggestion("Consider using 'round_robin' strategy for clarity, or set different weights"),
+                    );
+                }
+            }
+        }
+    }
+
+    // For least_latency strategy, note that it requires health check data
+    if strategy == LoadBalanceStrategy::LeastLatency {
+        results.push(
+            ValidationResult::warning(
+                "settings",
+                "load_balance_strategy 'least_latency' requires health checks to be enabled",
+            )
+            .with_id("load_balance_strategy")
+            .with_suggestion("Ensure health_check_enabled = true for accurate latency tracking"),
+        );
+    }
+
+    results
+}
+
 /// Check if a string is a valid identifier (alphanumeric + underscore)
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -740,6 +832,7 @@ mod tests {
                 auth: ProxyAuth::default(),
                 priority: None,
                 health_check_url: None,
+                weight: 100,
             },
             ProxyConfig {
                 id: "test".to_string(),
@@ -747,6 +840,7 @@ mod tests {
                 auth: ProxyAuth::default(),
                 priority: None,
                 health_check_url: None,
+                weight: 100,
             },
         ];
         let results = validate_proxies(&proxies);
@@ -844,6 +938,7 @@ mod tests {
             auth: ProxyAuth::default(),
             priority: None,
             health_check_url: None,
+            weight: 100,
         }];
         let results = validate_active_proxy(Some("nonexistent"), &proxies);
         assert!(results.iter().any(|r| r.message.contains("not found")));
