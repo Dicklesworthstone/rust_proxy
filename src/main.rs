@@ -1166,7 +1166,9 @@ async fn check_proxy_connectivity(config: &AppConfig) -> Vec<DoctorCheck> {
     let timeout_ms = config.settings.health_check_timeout_ms;
 
     for proxy in &config.proxies {
-        let result = health::check_proxy_health(proxy, timeout_ms).await;
+        let result =
+            health::check_proxy_health(proxy, timeout_ms, &config.settings.health_check_target)
+                .await;
 
         if result.success {
             checks.push(DoctorCheck::ok(
@@ -1253,10 +1255,11 @@ struct ConnectivityResult {
 async fn test_proxy_connectivity(
     proxy: &config::ProxyConfig,
     timeout_ms: u64,
+    target: &config::HealthCheckTarget,
 ) -> ConnectivityResult {
     use health::check_proxy_health;
 
-    let result = check_proxy_health(proxy, timeout_ms).await;
+    let result = check_proxy_health(proxy, timeout_ms, target).await;
 
     ConnectivityResult {
         proxy_id: proxy.id.clone(),
@@ -1319,10 +1322,11 @@ async fn check_cmd(strict: bool, test_connectivity: bool, output: &OutputDispatc
     let connectivity_results: Vec<ConnectivityResult> =
         if test_connectivity && !config.proxies.is_empty() {
             let timeout_ms = config.settings.health_check_timeout_ms;
+            let target = &config.settings.health_check_target;
             let futures: Vec<_> = config
                 .proxies
                 .iter()
-                .map(|proxy| test_proxy_connectivity(proxy, timeout_ms))
+                .map(|proxy| test_proxy_connectivity(proxy, timeout_ms, target))
                 .collect();
             futures::future::join_all(futures).await
         } else {
@@ -2687,7 +2691,9 @@ async fn ping_cmd(
     }
 
     for seq in 1..=count {
-        let result = health::check_proxy_health(proxy_cfg, timeout_ms).await;
+        let result =
+            health::check_proxy_health(proxy_cfg, timeout_ms, &config.settings.health_check_target)
+                .await;
         if result.success {
             latencies.push(result.latency_ms);
             results.push(PingAttempt {

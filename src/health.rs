@@ -102,10 +102,7 @@ async fn check_proxy_connect(proxy_addr: &str, host: &str, port: u16) -> Result<
 
     // Build CONNECT request with configured target
     let target = format!("{}:{}", host, port);
-    let connect_request = format!(
-        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
-        target, target
-    );
+    let connect_request = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target);
     stream.write_all(connect_request.as_bytes()).await?;
 
     // Read response
@@ -142,7 +139,10 @@ async fn check_proxy_get(proxy_addr: &str, proxy: &ProxyConfig, url: &str) -> Re
     } else {
         parsed_url.path()
     };
-    let query = parsed_url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let query = parsed_url
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
 
     // Connect to proxy
     let mut stream = TcpStream::connect(proxy_addr).await?;
@@ -150,10 +150,7 @@ async fn check_proxy_get(proxy_addr: &str, proxy: &ProxyConfig, url: &str) -> Re
     // For HTTPS URLs, we need to use CONNECT first to establish tunnel
     if parsed_url.scheme() == "https" {
         let target = format!("{}:{}", host, port);
-        let connect_request = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
-            target, target
-        );
+        let connect_request = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target);
         stream.write_all(connect_request.as_bytes()).await?;
 
         // Read CONNECT response
@@ -173,9 +170,8 @@ async fn check_proxy_get(proxy_addr: &str, proxy: &ProxyConfig, url: &str) -> Re
 
     // For HTTP URLs, send GET request through proxy
     let get_request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-        format!("{}{}", path, query),
-        host
+        "GET {}{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        path, query, host
     );
 
     // Add proxy auth if configured
@@ -203,7 +199,11 @@ async fn check_proxy_get(proxy_addr: &str, proxy: &ProxyConfig, url: &str) -> Re
     // Check for success response
     let first_line = response.lines().next().unwrap_or("");
 
-    if first_line.contains("200") || first_line.contains("204") || first_line.contains("301") || first_line.contains("302") {
+    if first_line.contains("200")
+        || first_line.contains("204")
+        || first_line.contains("301")
+        || first_line.contains("302")
+    {
         Ok(())
     } else if first_line.contains("407") {
         // 407 Proxy Authentication Required - proxy is reachable but needs auth
