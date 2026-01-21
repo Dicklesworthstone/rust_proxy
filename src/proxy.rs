@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::config::{AppConfig, ProxyConfig};
+use crate::config::{AppConfig, DegradationPolicy, ProxyConfig};
 use crate::load_balancer::LoadBalancer;
 use crate::metrics;
 use crate::state::StateStore;
@@ -285,11 +285,24 @@ async fn handle_connection_with_load_balancing(
     let proxy_id = match proxy_id {
         Some(id) => id,
         None => {
-            tracing::warn!(
-                client = %client_addr,
-                "No healthy proxy available, dropping connection"
-            );
-            // TODO: Apply degradation policy (separate feature bd-xw7)
+            match config.settings.degradation_policy {
+                DegradationPolicy::FailClosed => {
+                    tracing::warn!(
+                        client = %client_addr,
+                        "Rejecting connection: no healthy proxy available (fail_closed)"
+                    );
+                    if let Err(err) = send_degradation_error(&mut client).await {
+                        tracing::debug!(error = %err, "Failed to send degradation response");
+                    }
+                }
+                policy => {
+                    tracing::warn!(
+                        client = %client_addr,
+                        policy = ?policy,
+                        "No healthy proxy available (policy not yet implemented)"
+                    );
+                }
+            }
             return Err(anyhow!("No healthy proxy available"));
         }
     };
@@ -426,6 +439,19 @@ async fn handle_connection_with_load_balancing(
         .record_traffic(&upstream.id, bytes_to_up, bytes_to_client)
         .await;
 
+    Ok(())
+}
+
+async fn send_degradation_error(stream: &mut TcpStream) -> Result<()> {
+    let response = concat!(
+        "HTTP/1.1 503 Service Unavailable\r\n",
+        "Content-Type: text/plain\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "No healthy proxy available"
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }
 

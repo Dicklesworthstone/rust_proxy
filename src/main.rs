@@ -30,6 +30,7 @@ mod proxy;
 mod state;
 mod util;
 mod validation;
+mod watcher;
 
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
 use load_balancer::LoadBalancer;
@@ -112,6 +113,9 @@ enum Commands {
         /// Test actual network connectivity to proxies
         #[arg(long)]
         test_connectivity: bool,
+        /// Validate health check target is reachable through proxies
+        #[arg(long)]
+        validate_health_target: bool,
     },
     /// Test how a URL would be routed (proxied or direct)
     Test {
