@@ -7,3 +7,6 @@ mod common;
 
 #[path = "e2e/basic_operations.rs"]
 mod basic_operations;
+
+#[path = "e2e/load_balancing.rs"]
+mod load_balancing;
