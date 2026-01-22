@@ -13,6 +13,9 @@ use crate::load_balancer::LoadBalancer;
 use crate::metrics;
 use crate::state::StateStore;
 
+/// Timeout for each proxy attempt when using try_all degradation policy
+const TRY_ALL_TIMEOUT_PER_PROXY_SECS: u64 = 10;
+
 /// Guard that tracks connection metrics with RAII pattern.
 ///
 /// When dropped, automatically decrements active connections and records duration.
@@ -273,6 +276,17 @@ async fn handle_connection_with_load_balancing(
     load_balancer: Arc<LoadBalancer>,
     retry_config: RetryConfig,
 ) -> Result<()> {
+    // Get original destination first (needed for all code paths including try_all)
+    let original = get_original_dst(&client)?;
+    let target = match original {
+        SocketAddr::V4(v4) => v4,
+        _ => {
+            return Err(anyhow!("IPv6 destinations are not supported"));
+        }
+    };
+    let target_host = target.ip().to_string();
+    let target_port = target.port();
+
     // Select proxy using load balancer
     let proxy_id = load_balancer
         .select_proxy(
@@ -282,9 +296,118 @@ async fn handle_connection_with_load_balancing(
         )
         .await;
 
-    let proxy_id = match proxy_id {
-        Some(id) => id,
+    // If no healthy proxy, apply degradation policy
+    let (proxy_id, upstream, mut upstream_socket) = match proxy_id {
+        Some(id) => {
+            // Find the proxy config
+            let proxy_cfg = config
+                .proxies
+                .iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| anyhow!("Selected proxy '{}' not found in config", id))?;
+
+            // Create upstream proxy from config
+            let upstream = UpstreamProxy::from_config(proxy_cfg)?;
+
+            tracing::debug!(
+                proxy = %id,
+                strategy = ?config.settings.load_balance_strategy,
+                client = %client_addr,
+                "Selected proxy for connection"
+            );
+
+            // Connect to upstream
+            let upstream_socket =
+                match connect_with_retry(&upstream.host, upstream.port, &retry_config).await {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        metrics::record_request_error(&id);
+                        return Err(e);
+                    }
+                };
+
+            // Build auth header and send CONNECT
+            let auth_header =
+                if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
+                    let token = Base64.encode(format!("{}:{}", user, pass));
+                    format!("Proxy-Authorization: Basic {}\r\n", token)
+                } else {
+                    String::new()
+                };
+
+            let connect_req = format!(
+                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
+                target_host, target_port, target_host, target_port, auth_header
+            );
+
+            let mut socket = upstream_socket;
+            if let Err(e) = socket.write_all(connect_req.as_bytes()).await {
+                metrics::record_request_error(&id);
+                return Err(e.into());
+            }
+            if let Err(e) = socket.flush().await {
+                metrics::record_request_error(&id);
+                return Err(e.into());
+            }
+
+            // Read and validate CONNECT response
+            let mut header_buf = Vec::with_capacity(4096);
+            let mut tmp = [0u8; 512];
+            let header_end = loop {
+                let n = match socket.read(&mut tmp).await {
+                    Ok(0) => {
+                        metrics::record_request_error(&id);
+                        return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
+                    }
+                    Ok(n) => n,
+                    Err(e) => {
+                        metrics::record_request_error(&id);
+                        return Err(e.into());
+                    }
+                };
+                header_buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if header_buf.len() > 16 * 1024 {
+                    metrics::record_request_error(&id);
+                    return Err(anyhow!("Proxy CONNECT response too large"));
+                }
+            };
+
+            let header_bytes = &header_buf[..header_end];
+            let trailer = &header_buf[header_end..];
+            let header_text = String::from_utf8_lossy(header_bytes);
+            let status_line = header_text.lines().next().unwrap_or_default();
+            let status_code = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|token| token.parse::<u16>().ok())
+                .ok_or_else(|| {
+                    metrics::record_request_error(&id);
+                    anyhow!("Proxy CONNECT invalid status line: {status_line}")
+                })?;
+            if !(200..300).contains(&status_code) {
+                metrics::record_request_error(&id);
+                return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
+            }
+
+            // Send any trailer data to client
+            if !trailer.is_empty() {
+                if let Err(e) = client.write_all(trailer).await {
+                    metrics::record_request_error(&id);
+                    return Err(e.into());
+                }
+                if let Err(e) = client.flush().await {
+                    metrics::record_request_error(&id);
+                    return Err(e.into());
+                }
+            }
+
+            (id, upstream, socket)
+        }
         None => {
+            // No healthy proxy - apply degradation policy
             match config.settings.degradation_policy {
                 DegradationPolicy::FailClosed => {
                     tracing::warn!(
@@ -294,6 +417,31 @@ async fn handle_connection_with_load_balancing(
                     if let Err(err) = send_degradation_error(&mut client).await {
                         tracing::debug!(error = %err, "Failed to send degradation response");
                     }
+                    return Err(anyhow!("No healthy proxy available (fail_closed)"));
+                }
+                DegradationPolicy::TryAll => {
+                    // Try each proxy sequentially until one works
+                    match try_all_proxies(&config, &target_host, target_port, &retry_config).await {
+                        Ok((socket, id, upstream)) => {
+                            tracing::info!(
+                                proxy = %id,
+                                client = %client_addr,
+                                "try_all degradation policy succeeded"
+                            );
+                            (id, upstream, socket)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                client = %client_addr,
+                                error = %e,
+                                "try_all policy exhausted all proxies"
+                            );
+                            if let Err(err) = send_degradation_error(&mut client).await {
+                                tracing::debug!(error = %err, "Failed to send degradation response");
+                            }
+                            return Err(e);
+                        }
+                    }
                 }
                 policy => {
                     tracing::warn!(
@@ -301,127 +449,17 @@ async fn handle_connection_with_load_balancing(
                         policy = ?policy,
                         "No healthy proxy available (policy not yet implemented)"
                     );
+                    return Err(anyhow!("No healthy proxy available"));
                 }
             }
-            return Err(anyhow!("No healthy proxy available"));
         }
     };
-
-    // Find the proxy config
-    let proxy_cfg = config
-        .proxies
-        .iter()
-        .find(|p| p.id == proxy_id)
-        .ok_or_else(|| anyhow!("Selected proxy '{}' not found in config", proxy_id))?;
-
-    // Create upstream proxy from config
-    let upstream = UpstreamProxy::from_config(proxy_cfg)?;
 
     // Create connection guard to track metrics (RAII pattern)
     // This will automatically decrement active connections and record duration on drop
     let _guard = ConnectionGuard::new(proxy_id.clone());
 
-    tracing::debug!(
-        proxy = %proxy_id,
-        strategy = ?config.settings.load_balance_strategy,
-        client = %client_addr,
-        "Selected proxy for connection"
-    );
-
-    // Get original destination
-    let original = get_original_dst(&client)?;
-    let target = match original {
-        SocketAddr::V4(v4) => v4,
-        _ => {
-            metrics::record_request_error(&proxy_id);
-            return Err(anyhow!("IPv6 destinations are not supported"));
-        }
-    };
-    let target_host = target.ip().to_string();
-    let target_port = target.port();
-
-    let mut upstream_socket =
-        match connect_with_retry(&upstream.host, upstream.port, &retry_config).await {
-            Ok(socket) => socket,
-            Err(e) => {
-                metrics::record_request_error(&proxy_id);
-                return Err(e);
-            }
-        };
-
-    let auth_header = if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
-        let token = Base64.encode(format!("{}:{}", user, pass));
-        format!("Proxy-Authorization: Basic {}\r\n", token)
-    } else {
-        String::new()
-    };
-
-    let connect_req = format!(
-        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
-        target_host, target_port, target_host, target_port, auth_header
-    );
-
-    if let Err(e) = upstream_socket.write_all(connect_req.as_bytes()).await {
-        metrics::record_request_error(&proxy_id);
-        return Err(e.into());
-    }
-    if let Err(e) = upstream_socket.flush().await {
-        metrics::record_request_error(&proxy_id);
-        return Err(e.into());
-    }
-
-    let mut header_buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 512];
-    let header_end = loop {
-        let n = match upstream_socket.read(&mut tmp).await {
-            Ok(0) => {
-                metrics::record_request_error(&proxy_id);
-                return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
-            }
-            Ok(n) => n,
-            Err(e) => {
-                metrics::record_request_error(&proxy_id);
-                return Err(e.into());
-            }
-        };
-        header_buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if header_buf.len() > 16 * 1024 {
-            metrics::record_request_error(&proxy_id);
-            return Err(anyhow!("Proxy CONNECT response too large"));
-        }
-    };
-
-    let header_bytes = &header_buf[..header_end];
-    let trailer = &header_buf[header_end..];
-    let header_text = String::from_utf8_lossy(header_bytes);
-    let status_line = header_text.lines().next().unwrap_or_default();
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|token| token.parse::<u16>().ok())
-        .ok_or_else(|| {
-            metrics::record_request_error(&proxy_id);
-            anyhow!("Proxy CONNECT invalid status line: {status_line}")
-        })?;
-    if !(200..300).contains(&status_code) {
-        metrics::record_request_error(&proxy_id);
-        return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
-    }
-
-    if !trailer.is_empty() {
-        if let Err(e) = client.write_all(trailer).await {
-            metrics::record_request_error(&proxy_id);
-            return Err(e.into());
-        }
-        if let Err(e) = client.flush().await {
-            metrics::record_request_error(&proxy_id);
-            return Err(e.into());
-        }
-    }
-
+    // Bidirectional copy - tunnel is already established
     let (bytes_to_up, bytes_to_client) =
         match tokio::io::copy_bidirectional(&mut client, &mut upstream_socket).await {
             Ok(bytes) => bytes,
@@ -453,6 +491,148 @@ async fn send_degradation_error(stream: &mut TcpStream) -> Result<()> {
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Attempt to connect through each proxy in priority order (try_all degradation policy).
+///
+/// Returns (upstream_socket, proxy_id) on first successful connection, or an error
+/// if all proxies fail.
+async fn try_all_proxies(
+    config: &AppConfig,
+    target_host: &str,
+    target_port: u16,
+    retry_config: &RetryConfig,
+) -> Result<(TcpStream, String, UpstreamProxy)> {
+    tracing::warn!(
+        "All proxies unhealthy, trying each sequentially (try_all policy)"
+    );
+
+    // Sort proxies by priority (lower = higher priority)
+    let mut proxies: Vec<_> = config.proxies.iter().collect();
+    proxies.sort_by_key(|p| p.priority.unwrap_or(100));
+
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for (idx, proxy_cfg) in proxies.iter().enumerate() {
+        tracing::debug!(
+            proxy = %proxy_cfg.id,
+            attempt = idx + 1,
+            total = proxies.len(),
+            "Attempting connection (try_all policy)"
+        );
+
+        // Convert to UpstreamProxy
+        let upstream = match UpstreamProxy::from_config(proxy_cfg) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::debug!(
+                    proxy = %proxy_cfg.id,
+                    error = %e,
+                    "Failed to parse proxy config, skipping"
+                );
+                last_error = Some(e);
+                continue;
+            }
+        };
+
+        // Try to connect with timeout
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(TRY_ALL_TIMEOUT_PER_PROXY_SECS),
+            try_proxy_connect(&upstream, target_host, target_port, retry_config),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(stream)) => {
+                tracing::info!(
+                    proxy = %proxy_cfg.id,
+                    "Connection succeeded despite unhealthy status (try_all policy)"
+                );
+                return Ok((stream, proxy_cfg.id.clone(), upstream));
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    proxy = %proxy_cfg.id,
+                    error = %e,
+                    "Connection attempt failed"
+                );
+                last_error = Some(e);
+            }
+            Err(_) => {
+                tracing::debug!(
+                    proxy = %proxy_cfg.id,
+                    timeout_secs = TRY_ALL_TIMEOUT_PER_PROXY_SECS,
+                    "Connection attempt timed out"
+                );
+                last_error = Some(anyhow!("Connection timeout after {}s", TRY_ALL_TIMEOUT_PER_PROXY_SECS));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("No proxies configured")))
+}
+
+/// Try to establish a CONNECT tunnel through a single proxy.
+///
+/// Returns the connected upstream socket ready for bidirectional copy.
+async fn try_proxy_connect(
+    upstream: &UpstreamProxy,
+    target_host: &str,
+    target_port: u16,
+    retry_config: &RetryConfig,
+) -> Result<TcpStream> {
+    // Connect to upstream proxy
+    let mut upstream_socket =
+        connect_with_retry(&upstream.host, upstream.port, retry_config).await?;
+
+    // Build auth header
+    let auth_header = if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
+        let token = Base64.encode(format!("{}:{}", user, pass));
+        format!("Proxy-Authorization: Basic {}\r\n", token)
+    } else {
+        String::new()
+    };
+
+    // Send CONNECT request
+    let connect_req = format!(
+        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
+        target_host, target_port, target_host, target_port, auth_header
+    );
+
+    upstream_socket.write_all(connect_req.as_bytes()).await?;
+    upstream_socket.flush().await?;
+
+    // Read and validate response
+    let mut header_buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 512];
+    let header_end = loop {
+        let n = upstream_socket.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
+        }
+        header_buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if header_buf.len() > 16 * 1024 {
+            return Err(anyhow!("Proxy CONNECT response too large"));
+        }
+    };
+
+    let header_bytes = &header_buf[..header_end];
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let status_line = header_text.lines().next().unwrap_or_default();
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|token| token.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("Proxy CONNECT invalid status line: {status_line}"))?;
+
+    if !(200..300).contains(&status_code) {
+        return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
+    }
+
+    Ok(upstream_socket)
 }
 
 /// Handle a single connection with a fixed upstream proxy.
