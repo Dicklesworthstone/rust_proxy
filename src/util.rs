@@ -61,7 +61,7 @@ impl Shell {
 
     /// Convert to clap_complete::Shell if supported.
     #[must_use]
-    pub fn to_clap_shell(&self) -> Option<clap_complete::Shell> {
+    pub fn to_clap_shell(self) -> Option<clap_complete::Shell> {
         match self {
             Self::Bash => Some(clap_complete::Shell::Bash),
             Self::Zsh => Some(clap_complete::Shell::Zsh),
@@ -77,6 +77,46 @@ impl std::fmt::Display for Shell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.display_name())
     }
+}
+
+// =============================================================================
+// Completion Script Generation
+// =============================================================================
+
+/// Generate shell completion script for the given shell.
+///
+/// Returns the completion script as a String, which can be written to a file
+/// or printed to stdout.
+///
+/// # Arguments
+///
+/// * `shell` - The shell to generate completions for (must be a known shell)
+/// * `cmd` - The clap Command to generate completions from
+/// * `bin_name` - The binary name to use in the completions
+///
+/// # Panics
+///
+/// Panics if the shell is `Shell::Unknown` as we cannot generate completions
+/// for an unknown shell type.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use clap::CommandFactory;
+/// use rust_proxy::util::{generate_completions, Shell};
+///
+/// let mut cmd = Cli::command();
+/// let script = generate_completions(Shell::Bash, &mut cmd, "rust_proxy");
+/// println!("{}", script);
+/// ```
+pub fn generate_completions(shell: Shell, cmd: &mut clap::Command, bin_name: &str) -> String {
+    let clap_shell = shell
+        .to_clap_shell()
+        .expect("Cannot generate completions for unknown shell");
+
+    let mut buf = Vec::new();
+    clap_complete::generate(clap_shell, cmd, bin_name, &mut buf);
+    String::from_utf8(buf).expect("clap_complete generates valid UTF-8")
 }
 
 /// Detect the user's current shell using multiple fallback methods.
@@ -948,5 +988,131 @@ mod tests {
         // Ensure Debug is implemented correctly
         let debug_str = format!("{:?}", Shell::Bash);
         assert!(debug_str.contains("Bash"));
+    }
+
+    // =========================================================================
+    // Completion Generation Tests
+    // =========================================================================
+
+    // Helper: create a minimal test CLI command for completion testing
+    fn test_cli_command() -> clap::Command {
+        clap::Command::new("rust_proxy")
+            .version("0.1.0")
+            .about("Test CLI for completion generation")
+            .subcommand(clap::Command::new("init").about("Initialize configuration"))
+            .subcommand(clap::Command::new("status").about("Show status"))
+            .subcommand(
+                clap::Command::new("proxy")
+                    .about("Manage proxies")
+                    .subcommand(clap::Command::new("add").about("Add a proxy"))
+                    .subcommand(clap::Command::new("remove").about("Remove a proxy"))
+                    .subcommand(clap::Command::new("list").about("List proxies")),
+            )
+    }
+
+    #[test]
+    fn test_bash_completions() {
+        let mut cmd = test_cli_command();
+        let script = generate_completions(Shell::Bash, &mut cmd, "rust_proxy");
+
+        // Bash completions should contain the complete builtin
+        assert!(
+            script.contains("complete -F") || script.contains("complete -C"),
+            "Bash completions should contain complete -F or -C, got: {}",
+            &script[..script.len().min(200)]
+        );
+        // Should contain the binary name
+        assert!(
+            script.contains("rust_proxy"),
+            "Bash completions should contain binary name 'rust_proxy'"
+        );
+    }
+
+    #[test]
+    fn test_zsh_completions() {
+        let mut cmd = test_cli_command();
+        let script = generate_completions(Shell::Zsh, &mut cmd, "rust_proxy");
+
+        // Zsh completions should contain compdef directive
+        assert!(
+            script.contains("#compdef rust_proxy"),
+            "Zsh completions should contain '#compdef rust_proxy'"
+        );
+        // Should contain the binary name
+        assert!(
+            script.contains("rust_proxy"),
+            "Zsh completions should contain binary name 'rust_proxy'"
+        );
+    }
+
+    #[test]
+    fn test_fish_completions() {
+        let mut cmd = test_cli_command();
+        let script = generate_completions(Shell::Fish, &mut cmd, "rust_proxy");
+
+        // Fish completions should contain complete -c <command>
+        assert!(
+            script.contains("complete -c rust_proxy"),
+            "Fish completions should contain 'complete -c rust_proxy'"
+        );
+    }
+
+    #[test]
+    fn test_powershell_completions() {
+        let mut cmd = test_cli_command();
+        let script = generate_completions(Shell::PowerShell, &mut cmd, "rust_proxy");
+
+        // PowerShell completions should contain Register-ArgumentCompleter
+        assert!(
+            script.contains("Register-ArgumentCompleter"),
+            "PowerShell completions should contain 'Register-ArgumentCompleter'"
+        );
+        // Should contain the binary name
+        assert!(
+            script.contains("rust_proxy"),
+            "PowerShell completions should contain binary name 'rust_proxy'"
+        );
+    }
+
+    #[test]
+    fn test_elvish_completions() {
+        let mut cmd = test_cli_command();
+        let script = generate_completions(Shell::Elvish, &mut cmd, "rust_proxy");
+
+        // Elvish completions should contain set-env or edit:completion
+        assert!(
+            script.contains("edit:completion") || script.contains("rust_proxy"),
+            "Elvish completions should be valid Elvish script"
+        );
+    }
+
+    #[test]
+    fn test_completions_are_valid_utf8() {
+        let mut cmd = test_cli_command();
+
+        // All shell completions should produce valid UTF-8
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let script = generate_completions(shell, &mut cmd.clone(), "rust_proxy");
+            assert!(
+                !script.is_empty(),
+                "Completions for {:?} should not be empty",
+                shell
+            );
+            // The script being a valid String already proves it's valid UTF-8
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot generate completions for unknown shell")]
+    fn test_unknown_shell_completions_panics() {
+        let mut cmd = test_cli_command();
+        // This should panic
+        let _ = generate_completions(Shell::Unknown, &mut cmd, "rust_proxy");
     }
 }
