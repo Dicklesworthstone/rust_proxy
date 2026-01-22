@@ -469,13 +469,29 @@ async fn handle_connection_with_load_balancing(
                         }
                     }
                 }
-                policy => {
-                    tracing::warn!(
-                        client = %client_addr,
-                        policy = ?policy,
-                        "No healthy proxy available (policy not yet implemented)"
-                    );
-                    return Err(anyhow!("No healthy proxy available"));
+                DegradationPolicy::Direct => {
+                    // Connect directly to target, bypassing all proxies
+                    match direct_connect(&config, &target_host, target_port).await {
+                        Ok((socket, id, upstream)) => {
+                            tracing::info!(
+                                client = %client_addr,
+                                target = %target_host,
+                                "direct degradation policy succeeded"
+                            );
+                            (id, upstream, socket)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                client = %client_addr,
+                                error = %e,
+                                "direct connection failed"
+                            );
+                            if let Err(err) = send_degradation_error(&mut client).await {
+                                tracing::debug!(error = %err, "Failed to send degradation response");
+                            }
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -685,6 +701,57 @@ async fn use_last_proxy(
             try_all_proxies(config, target_host, target_port, retry_config).await
         }
     }
+}
+
+/// Establish a direct connection to the target, bypassing all proxies.
+///
+/// This is used by the Direct degradation policy when all proxies are unhealthy
+/// and allow_direct_fallback is enabled in the configuration.
+///
+/// **Security Warning**: Direct connections bypass all proxy security controls,
+/// may expose the client's IP address to targets, and skip any proxy-based
+/// audit logging. This should only be used when availability is more important
+/// than proxy enforcement.
+async fn direct_connect(
+    config: &AppConfig,
+    target_host: &str,
+    target_port: u16,
+) -> Result<(TcpStream, String, UpstreamProxy)> {
+    // Verify direct fallback is explicitly enabled in configuration
+    if !config.settings.allow_direct_fallback {
+        return Err(anyhow!(
+            "Direct fallback requested but allow_direct_fallback is false. \
+             Set allow_direct_fallback = true in config to enable direct connections."
+        ));
+    }
+
+    tracing::warn!(
+        target = %target_host,
+        port = target_port,
+        "DIRECT CONNECTION: All proxies unhealthy, connecting directly. \
+         This bypasses proxy security controls!"
+    );
+
+    // Connect directly to the target
+    let target_addr = format!("{}:{}", target_host, target_port);
+    let socket = tokio::time::timeout(
+        Duration::from_secs(TRY_ALL_TIMEOUT_PER_PROXY_SECS),
+        TcpStream::connect(&target_addr),
+    )
+    .await
+    .map_err(|_| anyhow!("Direct connection to {} timed out", target_addr))?
+    .context(format!("Direct connection to {} failed", target_addr))?;
+
+    // Create a synthetic UpstreamProxy to track as "direct"
+    let direct_upstream = UpstreamProxy {
+        id: "direct".to_string(),
+        host: target_host.to_string(),
+        port: target_port,
+        username: None,
+        password: None,
+    };
+
+    Ok((socket, "direct".to_string(), direct_upstream))
 }
 
 /// Try to establish a CONNECT tunnel through a single proxy.
