@@ -598,6 +598,14 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
             "note": "Selection stats only available when daemon is running"
         });
 
+        // Build degradation policy info
+        let degradation = serde_json::json!({
+            "policy": format!("{:?}", config.settings.degradation_policy).to_lowercase(),
+            "delay_secs": config.settings.degradation_delay_secs,
+            "allow_direct_fallback": config.settings.allow_direct_fallback,
+            "note": "Live degradation status only available when daemon is running"
+        });
+
         let payload = serde_json::json!({
             "active_proxy": config.active_proxy,
             "active_proxy_health": active_health,
@@ -607,6 +615,7 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
             "auto_failback": config.settings.auto_failback,
             "targets": config.targets.len(),
             "load_balancing": load_balancing,
+            "degradation": degradation,
             "proxy_health": proxy_health,
             "stats": state,
         });
@@ -648,6 +657,24 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
         config::LoadBalanceStrategy::Weighted => "weighted".cyan().to_string(),
     };
     println!("Load balancing: {}", strategy_str);
+
+    // Show degradation policy configuration
+    let degradation_str = match config.settings.degradation_policy {
+        config::DegradationPolicy::FailClosed => "fail_closed".to_string(),
+        config::DegradationPolicy::TryAll => "try_all".cyan().to_string(),
+        config::DegradationPolicy::UseLast => "use_last".cyan().to_string(),
+        config::DegradationPolicy::Direct => {
+            if config.settings.allow_direct_fallback {
+                "direct".yellow().to_string()
+            } else {
+                "direct (disabled)".red().to_string()
+            }
+        }
+    };
+    println!(
+        "Degradation: {} (delay: {}s)",
+        degradation_str, config.settings.degradation_delay_secs
+    );
 
     // Show health summary if health checks are enabled and there are proxies
     let show_weight =
@@ -3047,10 +3074,12 @@ async fn run_daemon() -> Result<()> {
     // Wrap config in Arc for sharing with proxy task
     let config_arc = Arc::new(config.clone());
 
+    let runtime_arc = Arc::new(runtime_state.clone());
     let proxy_task = tokio::spawn(proxy::run_proxy_with_load_balancing(
         config.settings.listen_port,
         config_arc,
         state.clone(),
+        runtime_arc,
         load_balancer,
         retry_config,
     ));

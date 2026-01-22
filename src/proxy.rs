@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::{AppConfig, DegradationPolicy, ProxyConfig};
 use crate::load_balancer::LoadBalancer;
 use crate::metrics;
-use crate::state::StateStore;
+use crate::state::{RuntimeState, StateStore};
 
 /// Timeout for each proxy attempt when using try_all degradation policy
 const TRY_ALL_TIMEOUT_PER_PROXY_SECS: u64 = 10;
@@ -209,6 +209,7 @@ pub async fn run_proxy_with_load_balancing(
     listen_port: u16,
     config: Arc<AppConfig>,
     state: Arc<StateStore>,
+    runtime: Arc<RuntimeState>,
     load_balancer: Arc<LoadBalancer>,
     retry_config: RetryConfig,
 ) -> Result<()> {
@@ -249,6 +250,7 @@ pub async fn run_proxy_with_load_balancing(
 
         let config_clone = config.clone();
         let state_clone = state.clone();
+        let runtime_clone = runtime.clone();
         let lb_clone = load_balancer.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection_with_load_balancing(
@@ -256,6 +258,7 @@ pub async fn run_proxy_with_load_balancing(
                 client_addr,
                 config_clone,
                 state_clone,
+                runtime_clone,
                 lb_clone,
                 retry_config,
             )
@@ -273,6 +276,7 @@ async fn handle_connection_with_load_balancing(
     client_addr: SocketAddr,
     config: Arc<AppConfig>,
     state: Arc<StateStore>,
+    runtime: Arc<RuntimeState>,
     load_balancer: Arc<LoadBalancer>,
     retry_config: RetryConfig,
 ) -> Result<()> {
@@ -408,90 +412,50 @@ async fn handle_connection_with_load_balancing(
         }
         None => {
             // No healthy proxy - apply degradation policy
-            match config.settings.degradation_policy {
-                DegradationPolicy::FailClosed => {
+            match handle_degradation(
+                &config,
+                &state,
+                &runtime,
+                &target_host,
+                target_port,
+                &retry_config,
+            )
+            .await
+            {
+                Ok(Some((socket, id, upstream))) => {
+                    tracing::info!(
+                        proxy = %id,
+                        client = %client_addr,
+                        policy = ?config.settings.degradation_policy,
+                        "Degradation policy succeeded"
+                    );
+                    (id, upstream, socket)
+                }
+                Ok(None) => {
+                    // Degradation delay not yet elapsed - use fail_closed behavior
                     tracing::warn!(
                         client = %client_addr,
-                        "Rejecting connection: no healthy proxy available (fail_closed)"
+                        delay_secs = config.settings.degradation_delay_secs,
+                        "Rejecting connection: no healthy proxy (within degradation delay)"
                     );
                     if let Err(err) = send_degradation_error(&mut client).await {
                         tracing::debug!(error = %err, "Failed to send degradation response");
                     }
-                    return Err(anyhow!("No healthy proxy available (fail_closed)"));
+                    return Err(anyhow!(
+                        "No healthy proxy available (within degradation delay)"
+                    ));
                 }
-                DegradationPolicy::TryAll => {
-                    // Try each proxy sequentially until one works
-                    match try_all_proxies(&config, &target_host, target_port, &retry_config).await {
-                        Ok((socket, id, upstream)) => {
-                            tracing::info!(
-                                proxy = %id,
-                                client = %client_addr,
-                                "try_all degradation policy succeeded"
-                            );
-                            (id, upstream, socket)
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                client = %client_addr,
-                                error = %e,
-                                "try_all policy exhausted all proxies"
-                            );
-                            if let Err(err) = send_degradation_error(&mut client).await {
-                                tracing::debug!(error = %err, "Failed to send degradation response");
-                            }
-                            return Err(e);
-                        }
+                Err(e) => {
+                    tracing::error!(
+                        client = %client_addr,
+                        error = %e,
+                        policy = ?config.settings.degradation_policy,
+                        "Degradation policy failed"
+                    );
+                    if let Err(err) = send_degradation_error(&mut client).await {
+                        tracing::debug!(error = %err, "Failed to send degradation response");
                     }
-                }
-                DegradationPolicy::UseLast => {
-                    // Try the most recently healthy proxy, fall back to try_all if it fails
-                    match use_last_proxy(&config, &state, &target_host, target_port, &retry_config)
-                        .await
-                    {
-                        Ok((socket, id, upstream)) => {
-                            tracing::info!(
-                                proxy = %id,
-                                client = %client_addr,
-                                "use_last degradation policy succeeded"
-                            );
-                            (id, upstream, socket)
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                client = %client_addr,
-                                error = %e,
-                                "use_last policy exhausted all proxies"
-                            );
-                            if let Err(err) = send_degradation_error(&mut client).await {
-                                tracing::debug!(error = %err, "Failed to send degradation response");
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-                DegradationPolicy::Direct => {
-                    // Connect directly to target, bypassing all proxies
-                    match direct_connect(&config, &target_host, target_port).await {
-                        Ok((socket, id, upstream)) => {
-                            tracing::info!(
-                                client = %client_addr,
-                                target = %target_host,
-                                "direct degradation policy succeeded"
-                            );
-                            (id, upstream, socket)
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                client = %client_addr,
-                                error = %e,
-                                "direct connection failed"
-                            );
-                            if let Err(err) = send_degradation_error(&mut client).await {
-                                tracing::debug!(error = %err, "Failed to send degradation response");
-                            }
-                            return Err(e);
-                        }
-                    }
+                    return Err(e);
                 }
             }
         }
@@ -533,6 +497,67 @@ async fn send_degradation_error(stream: &mut TcpStream) -> Result<()> {
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Apply the configured degradation policy when no healthy proxy is available.
+///
+/// This unified function handles all degradation policies:
+/// - FailClosed: Immediately reject the connection
+/// - TryAll: Try each proxy in priority order until one works
+/// - UseLast: Try the most recently healthy proxy, fall back to try_all
+/// - Direct: Connect directly to the target (if allowed)
+///
+/// Returns Ok(None) if degradation delay hasn't elapsed yet (within grace period),
+/// signaling the caller should use fail_closed behavior.
+/// Returns Ok(Some(...)) with the connection details if degradation succeeded.
+/// Returns Err if degradation policy could not establish a connection.
+async fn handle_degradation(
+    config: &AppConfig,
+    state: &StateStore,
+    runtime: &RuntimeState,
+    target_host: &str,
+    target_port: u16,
+    retry_config: &RetryConfig,
+) -> Result<Option<(TcpStream, String, UpstreamProxy)>> {
+    // Check if degradation mode is active (delay period has elapsed)
+    if !runtime.is_degraded().await {
+        tracing::debug!(
+            policy = ?config.settings.degradation_policy,
+            delay_secs = config.settings.degradation_delay_secs,
+            "Degradation delay not yet elapsed, using fail_closed behavior"
+        );
+        return Ok(None); // Not yet degraded, caller should use fail_closed
+    }
+
+    tracing::debug!(
+        policy = ?config.settings.degradation_policy,
+        "Applying degradation policy"
+    );
+
+    match config.settings.degradation_policy {
+        DegradationPolicy::FailClosed => {
+            // fail_closed always rejects - return error
+            Err(anyhow!("No healthy proxy available (fail_closed policy)"))
+        }
+
+        DegradationPolicy::TryAll => {
+            let (stream, proxy_id, upstream) =
+                try_all_proxies(config, target_host, target_port, retry_config).await?;
+            Ok(Some((stream, proxy_id, upstream)))
+        }
+
+        DegradationPolicy::UseLast => {
+            let (stream, proxy_id, upstream) =
+                use_last_proxy(config, state, target_host, target_port, retry_config).await?;
+            Ok(Some((stream, proxy_id, upstream)))
+        }
+
+        DegradationPolicy::Direct => {
+            let (stream, proxy_id, upstream) =
+                direct_connect(config, target_host, target_port).await?;
+            Ok(Some((stream, proxy_id, upstream)))
+        }
+    }
 }
 
 /// Attempt to connect through each proxy in priority order (try_all degradation policy).
