@@ -762,9 +762,15 @@ mod tests {
 
     #[test]
     fn test_shell_to_clap_shell() {
-        assert_eq!(Shell::Bash.to_clap_shell(), Some(clap_complete::Shell::Bash));
+        assert_eq!(
+            Shell::Bash.to_clap_shell(),
+            Some(clap_complete::Shell::Bash)
+        );
         assert_eq!(Shell::Zsh.to_clap_shell(), Some(clap_complete::Shell::Zsh));
-        assert_eq!(Shell::Fish.to_clap_shell(), Some(clap_complete::Shell::Fish));
+        assert_eq!(
+            Shell::Fish.to_clap_shell(),
+            Some(clap_complete::Shell::Fish)
+        );
         assert_eq!(
             Shell::PowerShell.to_clap_shell(),
             Some(clap_complete::Shell::PowerShell)

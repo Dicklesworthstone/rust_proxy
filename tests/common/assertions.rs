@@ -28,7 +28,9 @@ pub fn assert_stdout_contains(result: &CommandResult, expected: &str, context: &
     assert!(
         result.stdout.contains(expected),
         "{}: Expected stdout to contain '{}'\nActual stdout: {}",
-        context, expected, result.stdout
+        context,
+        expected,
+        result.stdout
     );
 }
 
@@ -37,7 +39,9 @@ pub fn assert_stderr_contains(result: &CommandResult, expected: &str, context: &
     assert!(
         result.stderr.contains(expected),
         "{}: Expected stderr to contain '{}'\nActual stderr: {}",
-        context, expected, result.stderr
+        context,
+        expected,
+        result.stderr
     );
 }
 
@@ -46,20 +50,26 @@ pub fn assert_stdout_not_contains(result: &CommandResult, unexpected: &str, cont
     assert!(
         !result.stdout.contains(unexpected),
         "{}: Expected stdout to NOT contain '{}'\nActual stdout: {}",
-        context, unexpected, result.stdout
+        context,
+        unexpected,
+        result.stdout
     );
 }
 
 /// Assert JSON field equals expected value
 pub fn assert_json_field_eq(json: &Value, path: &str, expected: &str, context: &str) {
     let actual = json_path_get(json, path);
-    let expected_val: Value = serde_json::from_str(expected)
-        .unwrap_or_else(|_| Value::String(expected.to_string()));
+    let expected_val: Value =
+        serde_json::from_str(expected).unwrap_or_else(|_| Value::String(expected.to_string()));
 
     assert_eq!(
-        actual, Some(&expected_val),
+        actual,
+        Some(&expected_val),
         "{}: JSON path '{}' expected {:?}, got {:?}",
-        context, path, expected, actual
+        context,
+        path,
+        expected,
+        actual
     );
 }
 
@@ -80,7 +90,9 @@ pub fn assert_json_field_is_string(json: &Value, path: &str, context: &str) {
     assert!(
         value.map(|v| v.is_string()).unwrap_or(false),
         "{}: Expected JSON path '{}' to be a string\nActual: {:?}",
-        context, path, value
+        context,
+        path,
+        value
     );
 }
 
@@ -90,7 +102,9 @@ pub fn assert_json_field_is_array(json: &Value, path: &str, context: &str) {
     assert!(
         value.map(|v| v.is_array()).unwrap_or(false),
         "{}: Expected JSON path '{}' to be an array\nActual: {:?}",
-        context, path, value
+        context,
+        path,
+        value
     );
 }
 
@@ -139,7 +153,10 @@ pub fn assert_proxy_exists(json: &Value, proxy_id: &str, context: &str) {
     let proxies = json_path_get(json, "proxies");
     let exists = proxies
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().any(|p| p.get("id").and_then(|i| i.as_str()) == Some(proxy_id)))
+        .map(|arr| {
+            arr.iter()
+                .any(|p| p.get("id").and_then(|i| i.as_str()) == Some(proxy_id))
+        })
         .unwrap_or(false);
 
     // Also check if it's an object with the proxy id as a key
@@ -151,7 +168,9 @@ pub fn assert_proxy_exists(json: &Value, proxy_id: &str, context: &str) {
     assert!(
         exists || exists_as_key,
         "{}: Expected proxy '{}' to exist in proxies list\nProxies: {:?}",
-        context, proxy_id, proxies
+        context,
+        proxy_id,
+        proxies
     );
 }
 
@@ -206,12 +225,7 @@ fn json_path_get<'a>(json: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 /// Assert that two durations are approximately equal (within tolerance)
-pub fn assert_duration_approx(
-    actual_ms: u64,
-    expected_ms: u64,
-    tolerance_ms: u64,
-    context: &str,
-) {
+pub fn assert_duration_approx(actual_ms: u64, expected_ms: u64, tolerance_ms: u64, context: &str) {
     let diff = if actual_ms > expected_ms {
         actual_ms - expected_ms
     } else {
@@ -221,7 +235,10 @@ pub fn assert_duration_approx(
     assert!(
         diff <= tolerance_ms,
         "{}: Expected duration ~{}ms (+/- {}ms), got {}ms",
-        context, expected_ms, tolerance_ms, actual_ms
+        context,
+        expected_ms,
+        tolerance_ms,
+        actual_ms
     );
 }
 
@@ -292,7 +309,10 @@ mod tests {
             json_path_get(&json, "name"),
             Some(&Value::String("test".to_string()))
         );
-        assert_eq!(json_path_get(&json, "nested.value"), Some(&Value::Number(42.into())));
+        assert_eq!(
+            json_path_get(&json, "nested.value"),
+            Some(&Value::Number(42.into()))
+        );
         assert_eq!(json_path_get(&json, "missing"), None);
     }
 

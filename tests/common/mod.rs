@@ -128,7 +128,10 @@ pub struct TestLogger {
 impl TestLogger {
     /// Create a new test logger
     pub fn new(log_path: PathBuf, verbosity: LogVerbosity) -> Self {
-        Self { log_path, verbosity }
+        Self {
+            log_path,
+            verbosity,
+        }
     }
 
     /// Log a test phase
@@ -250,7 +253,10 @@ impl TestHarness {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         // Try release build first
-        let release_path = manifest_dir.join("target").join("release").join("rust_proxy");
+        let release_path = manifest_dir
+            .join("target")
+            .join("release")
+            .join("rust_proxy");
         if release_path.exists() {
             return Ok(release_path);
         }

@@ -425,10 +425,7 @@ mod tests {
 
     #[test]
     fn test_multi_proxy_config_is_valid_toml() {
-        let config = multi_proxy_config(
-            12345,
-            &["http://localhost:8080", "http://localhost:8081"],
-        );
+        let config = multi_proxy_config(12345, &["http://localhost:8080", "http://localhost:8081"]);
         let parsed: Result<toml::Value, _> = toml::from_str(&config);
         assert!(parsed.is_ok(), "Failed to parse: {:?}", parsed.err());
     }
@@ -442,12 +439,8 @@ mod tests {
 
     #[test]
     fn test_failover_config_is_valid_toml() {
-        let config = config_with_failover(
-            12345,
-            "http://localhost:8080",
-            "http://localhost:8081",
-            30,
-        );
+        let config =
+            config_with_failover(12345, "http://localhost:8080", "http://localhost:8081", 30);
         let parsed: Result<toml::Value, _> = toml::from_str(&config);
         assert!(parsed.is_ok(), "Failed to parse: {:?}", parsed.err());
     }
@@ -456,7 +449,10 @@ mod tests {
     fn test_load_balancing_config_is_valid_toml() {
         let config = config_with_load_balancing(
             12345,
-            &[("http://localhost:8080", 100), ("http://localhost:8081", 50)],
+            &[
+                ("http://localhost:8080", 100),
+                ("http://localhost:8081", 50),
+            ],
             "weighted",
         );
         let parsed: Result<toml::Value, _> = toml::from_str(&config);

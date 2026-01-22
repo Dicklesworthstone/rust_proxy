@@ -222,6 +222,17 @@ impl StateStore {
         state.proxies.get(proxy_id).and_then(|s| s.ping_avg_ms)
     }
 
+    /// Get the proxy ID that was most recently healthy (used by UseLast degradation policy)
+    pub async fn get_last_healthy_proxy(&self) -> Option<String> {
+        let state = self.inner.read().await;
+        state
+            .proxies
+            .iter()
+            .filter_map(|(id, stats)| stats.last_healthy.map(|ts| (id.clone(), ts)))
+            .max_by_key(|(_, ts)| *ts)
+            .map(|(id, _)| id)
+    }
+
     pub async fn flush(&self) -> Result<()> {
         let state = self.inner.read().await;
         state.save(&self.path)

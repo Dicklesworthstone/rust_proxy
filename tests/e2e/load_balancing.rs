@@ -61,9 +61,9 @@ dns_refresh_secs = 60
 #[tokio::test]
 async fn test_round_robin_distributes_evenly() {
     // Create 3 mock proxies
-    let mocks: Vec<MockProxy> = futures::future::try_join_all((0..3).map(|_| async {
-        MockProxy::new(0, MockBehavior::Healthy { latency_ms: 10 }).await
-    }))
+    let mocks: Vec<MockProxy> = futures::future::try_join_all(
+        (0..3).map(|_| async { MockProxy::new(0, MockBehavior::Healthy { latency_ms: 10 }).await }),
+    )
     .await
     .expect("Failed to create mock proxies");
 
@@ -149,7 +149,10 @@ fn test_load_balancing_fixtures_valid() {
     let configs = [
         fixtures::config_with_load_balancing(
             12345,
-            &[("http://localhost:8080", 100), ("http://localhost:8081", 100)],
+            &[
+                ("http://localhost:8080", 100),
+                ("http://localhost:8081", 100),
+            ],
             "round_robin",
         ),
         fixtures::config_with_load_balancing(
@@ -193,18 +196,27 @@ async fn test_mock_proxy_logs_requests() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let mut stream = TcpStream::connect(mock.addr).await.expect("Failed to connect");
+    let mut stream = TcpStream::connect(mock.addr)
+        .await
+        .expect("Failed to connect");
     stream
         .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         .await
         .expect("Failed to send request");
 
     let mut buf = vec![0u8; 1024];
-    let n = stream.read(&mut buf).await.expect("Failed to read response");
+    let n = stream
+        .read(&mut buf)
+        .await
+        .expect("Failed to read response");
     let response = String::from_utf8_lossy(&buf[..n]);
 
     // Should get 200 response
-    assert!(response.contains("200"), "Expected 200 response, got: {}", response);
+    assert!(
+        response.contains("200"),
+        "Expected 200 response, got: {}",
+        response
+    );
 
     // Request should be logged
     assert_eq!(mock.request_count(), 1);
@@ -228,7 +240,9 @@ async fn test_mock_proxy_fail_after_threshold() {
 
     // First 2 requests should succeed
     for i in 0..2 {
-        let mut stream = TcpStream::connect(mock.addr).await.expect("Failed to connect");
+        let mut stream = TcpStream::connect(mock.addr)
+            .await
+            .expect("Failed to connect");
         stream
             .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
             .await
@@ -240,7 +254,9 @@ async fn test_mock_proxy_fail_after_threshold() {
     }
 
     // Third request should fail with 502
-    let mut stream = TcpStream::connect(mock.addr).await.expect("Failed to connect");
+    let mut stream = TcpStream::connect(mock.addr)
+        .await
+        .expect("Failed to connect");
     stream
         .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
         .await

@@ -40,12 +40,7 @@ fn test_fixtures_are_valid_toml() {
         fixtures::single_proxy_config(12345, "http://localhost:8080"),
         fixtures::multi_proxy_config(12345, &["http://localhost:8080", "http://localhost:8081"]),
         fixtures::config_with_health_check(12345, "http://localhost:8080", 5, 3),
-        fixtures::config_with_failover(
-            12345,
-            "http://localhost:8080",
-            "http://localhost:8081",
-            30,
-        ),
+        fixtures::config_with_failover(12345, "http://localhost:8080", "http://localhost:8081", 30),
     ];
 
     for (i, config) in configs.iter().enumerate() {

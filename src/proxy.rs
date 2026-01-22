@@ -443,6 +443,32 @@ async fn handle_connection_with_load_balancing(
                         }
                     }
                 }
+                DegradationPolicy::UseLast => {
+                    // Try the most recently healthy proxy, fall back to try_all if it fails
+                    match use_last_proxy(&config, &state, &target_host, target_port, &retry_config)
+                        .await
+                    {
+                        Ok((socket, id, upstream)) => {
+                            tracing::info!(
+                                proxy = %id,
+                                client = %client_addr,
+                                "use_last degradation policy succeeded"
+                            );
+                            (id, upstream, socket)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                client = %client_addr,
+                                error = %e,
+                                "use_last policy exhausted all proxies"
+                            );
+                            if let Err(err) = send_degradation_error(&mut client).await {
+                                tracing::debug!(error = %err, "Failed to send degradation response");
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
                 policy => {
                     tracing::warn!(
                         client = %client_addr,
@@ -503,9 +529,7 @@ async fn try_all_proxies(
     target_port: u16,
     retry_config: &RetryConfig,
 ) -> Result<(TcpStream, String, UpstreamProxy)> {
-    tracing::warn!(
-        "All proxies unhealthy, trying each sequentially (try_all policy)"
-    );
+    tracing::warn!("All proxies unhealthy, trying each sequentially (try_all policy)");
 
     // Sort proxies by priority (lower = higher priority)
     let mut proxies: Vec<_> = config.proxies.iter().collect();
@@ -564,12 +588,103 @@ async fn try_all_proxies(
                     timeout_secs = TRY_ALL_TIMEOUT_PER_PROXY_SECS,
                     "Connection attempt timed out"
                 );
-                last_error = Some(anyhow!("Connection timeout after {}s", TRY_ALL_TIMEOUT_PER_PROXY_SECS));
+                last_error = Some(anyhow!(
+                    "Connection timeout after {}s",
+                    TRY_ALL_TIMEOUT_PER_PROXY_SECS
+                ));
             }
         }
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("No proxies configured")))
+}
+
+/// Attempt to connect through the most recently healthy proxy (use_last degradation policy).
+///
+/// Returns (upstream_socket, proxy_id, upstream) on success, or falls back to try_all
+/// if the last healthy proxy fails.
+async fn use_last_proxy(
+    config: &AppConfig,
+    state: &StateStore,
+    target_host: &str,
+    target_port: u16,
+    retry_config: &RetryConfig,
+) -> Result<(TcpStream, String, UpstreamProxy)> {
+    // Get the most recently healthy proxy
+    let last_healthy_id = state.get_last_healthy_proxy().await;
+
+    let last_healthy_id = match last_healthy_id {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                "No proxy has ever been healthy, falling back to try_all (use_last policy)"
+            );
+            return try_all_proxies(config, target_host, target_port, retry_config).await;
+        }
+    };
+
+    tracing::info!(
+        proxy = %last_healthy_id,
+        "Attempting last healthy proxy (use_last policy)"
+    );
+
+    // Find the proxy config
+    let proxy_cfg = match config.proxies.iter().find(|p| p.id == last_healthy_id) {
+        Some(cfg) => cfg,
+        None => {
+            tracing::warn!(
+                proxy = %last_healthy_id,
+                "Last healthy proxy no longer in config, falling back to try_all (use_last policy)"
+            );
+            return try_all_proxies(config, target_host, target_port, retry_config).await;
+        }
+    };
+
+    // Convert to UpstreamProxy
+    let upstream = match UpstreamProxy::from_config(proxy_cfg) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(
+                proxy = %last_healthy_id,
+                error = %e,
+                "Failed to parse last healthy proxy config, falling back to try_all (use_last policy)"
+            );
+            return try_all_proxies(config, target_host, target_port, retry_config).await;
+        }
+    };
+
+    // Try to connect with timeout
+    let connect_result = tokio::time::timeout(
+        Duration::from_secs(TRY_ALL_TIMEOUT_PER_PROXY_SECS),
+        try_proxy_connect(&upstream, target_host, target_port, retry_config),
+    )
+    .await;
+
+    match connect_result {
+        Ok(Ok(stream)) => {
+            tracing::info!(
+                proxy = %last_healthy_id,
+                "Connection to last healthy proxy succeeded (use_last policy)"
+            );
+            Ok((stream, last_healthy_id, upstream))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                proxy = %last_healthy_id,
+                error = %e,
+                "Last healthy proxy failed, falling back to try_all (use_last policy)"
+            );
+            try_all_proxies(config, target_host, target_port, retry_config).await
+        }
+        Err(_) => {
+            tracing::warn!(
+                proxy = %last_healthy_id,
+                timeout_secs = TRY_ALL_TIMEOUT_PER_PROXY_SECS,
+                "Last healthy proxy timed out, falling back to try_all (use_last policy)"
+            );
+            try_all_proxies(config, target_host, target_port, retry_config).await
+        }
+    }
 }
 
 /// Try to establish a CONNECT tunnel through a single proxy.
