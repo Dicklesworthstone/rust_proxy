@@ -49,6 +49,75 @@ pub enum OutputMode {
     Quiet,
 }
 
+/// TTY state for testable mode detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtyState {
+    /// stdout is a TTY (interactive terminal)
+    Yes,
+    /// stdout is not a TTY (piped or redirected)
+    No,
+}
+
+impl TtyState {
+    /// Detect actual TTY state from stdout.
+    #[must_use]
+    pub fn detect() -> Self {
+        if io::stdout().is_terminal() {
+            Self::Yes
+        } else {
+            Self::No
+        }
+    }
+
+    /// Returns true if this represents a TTY.
+    #[must_use]
+    pub const fn is_tty(&self) -> bool {
+        matches!(self, Self::Yes)
+    }
+}
+
+/// Environment variable lookup trait for testability.
+pub trait EnvLookup {
+    /// Check if an environment variable is set (exists).
+    fn var_exists(&self, key: &str) -> bool;
+}
+
+/// Real environment lookup using std::env.
+pub struct RealEnv;
+
+impl EnvLookup for RealEnv {
+    fn var_exists(&self, key: &str) -> bool {
+        std::env::var(key).is_ok()
+    }
+}
+
+/// Test environment using a HashMap.
+#[cfg(test)]
+pub struct TestEnv {
+    vars: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl TestEnv {
+    pub fn new() -> Self {
+        Self {
+            vars: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn with_var(mut self, key: &str, value: &str) -> Self {
+        self.vars.insert(key.to_string(), value.to_string());
+        self
+    }
+}
+
+#[cfg(test)]
+impl EnvLookup for TestEnv {
+    fn var_exists(&self, key: &str) -> bool {
+        self.vars.contains_key(key)
+    }
+}
+
 impl OutputMode {
     /// Detect the appropriate output mode based on flags and environment.
     ///
@@ -64,6 +133,20 @@ impl OutputMode {
     /// 9. Otherwise → Human
     #[must_use]
     pub fn detect(json_flag: bool, quiet_flag: bool) -> Self {
+        Self::detect_with_env(json_flag, quiet_flag, TtyState::detect(), &RealEnv)
+    }
+
+    /// Detect output mode with explicit TTY state and environment lookup.
+    ///
+    /// This is the core detection logic, made testable by accepting
+    /// the TTY state and environment lookup as parameters.
+    #[must_use]
+    pub fn detect_with_env<E: EnvLookup>(
+        json_flag: bool,
+        quiet_flag: bool,
+        tty_state: TtyState,
+        env: &E,
+    ) -> Self {
         // 1. Explicit --json flag
         if json_flag {
             return Self::Machine;
@@ -75,26 +158,26 @@ impl OutputMode {
         }
 
         // 3. stdout is not a TTY (piped or redirected)
-        if !io::stdout().is_terminal() {
+        if !tty_state.is_tty() {
             return Self::Machine;
         }
 
         // 4-7. CI/agent environment variables
-        if std::env::var("CI").is_ok() {
+        if env.var_exists("CI") {
             return Self::Machine;
         }
-        if std::env::var("GITHUB_ACTIONS").is_ok() {
+        if env.var_exists("GITHUB_ACTIONS") {
             return Self::Machine;
         }
-        if std::env::var("CLAUDE_CODE").is_ok() {
+        if env.var_exists("CLAUDE_CODE") {
             return Self::Machine;
         }
-        if std::env::var("CODEX_CLI").is_ok() {
+        if env.var_exists("CODEX_CLI") {
             return Self::Machine;
         }
 
         // 8. NO_COLOR convention
-        if std::env::var("NO_COLOR").is_ok() {
+        if env.var_exists("NO_COLOR") {
             return Self::Machine;
         }
 
@@ -430,47 +513,324 @@ impl Default for OutputDispatcher {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // TtyState Tests
+    // =========================================================================
+
     #[test]
-    fn test_mode_from_json_flag() {
-        let mode = OutputMode::detect(true, false);
+    fn test_tty_state_is_tty() {
+        assert!(TtyState::Yes.is_tty());
+        assert!(!TtyState::No.is_tty());
+    }
+
+    // =========================================================================
+    // Flag Override Tests
+    // =========================================================================
+
+    #[test]
+    fn test_json_flag_forces_machine_mode() {
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(true, false, TtyState::Yes, &env);
         assert_eq!(mode, OutputMode::Machine);
     }
 
     #[test]
-    fn test_mode_from_quiet_flag() {
-        let mode = OutputMode::detect(false, true);
+    fn test_quiet_flag_forces_quiet_mode() {
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(false, true, TtyState::Yes, &env);
         assert_eq!(mode, OutputMode::Quiet);
     }
 
     #[test]
     fn test_json_takes_precedence_over_quiet() {
-        let mode = OutputMode::detect(true, true);
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(true, true, TtyState::Yes, &env);
         assert_eq!(mode, OutputMode::Machine);
     }
 
     #[test]
-    fn test_mode_is_methods() {
+    fn test_json_flag_overrides_tty() {
+        let env = TestEnv::new();
+        // Even with TTY, --json should force Machine mode
+        let mode = OutputMode::detect_with_env(true, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_quiet_flag_overrides_tty() {
+        let env = TestEnv::new();
+        // Even with TTY, --quiet should force Quiet mode
+        let mode = OutputMode::detect_with_env(false, true, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Quiet);
+    }
+
+    // =========================================================================
+    // TTY Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_human_mode_when_tty() {
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Human);
+    }
+
+    #[test]
+    fn test_machine_mode_when_piped() {
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(false, false, TtyState::No, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_no_tty_forces_machine_before_env_checks() {
+        // Even if no env vars are set, non-TTY should be Machine
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(false, false, TtyState::No, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    // =========================================================================
+    // Environment Variable Tests - CI/Agent Detection
+    // =========================================================================
+
+    #[test]
+    fn test_ci_env_forces_machine() {
+        let env = TestEnv::new().with_var("CI", "true");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_github_actions_env_forces_machine() {
+        let env = TestEnv::new().with_var("GITHUB_ACTIONS", "true");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_claude_code_env_forces_machine() {
+        let env = TestEnv::new().with_var("CLAUDE_CODE", "1");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_codex_cli_env_forces_machine() {
+        let env = TestEnv::new().with_var("CODEX_CLI", "1");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_no_color_env_forces_machine() {
+        let env = TestEnv::new().with_var("NO_COLOR", "1");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    // =========================================================================
+    // Environment Variable Priority Tests
+    // =========================================================================
+
+    #[test]
+    fn test_env_var_only_checked_when_tty() {
+        // With TTY + env var, should be Machine
+        let env = TestEnv::new().with_var("CI", "true");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_multiple_env_vars_still_machine() {
+        // Multiple env vars set - should still be Machine
+        let env = TestEnv::new()
+            .with_var("CI", "true")
+            .with_var("GITHUB_ACTIONS", "true")
+            .with_var("CLAUDE_CODE", "1");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_ci_env_value_irrelevant() {
+        // CI env var with any value should trigger Machine mode
+        let env = TestEnv::new().with_var("CI", "false");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        // The mere presence of CI forces Machine mode (value doesn't matter)
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_no_color_value_irrelevant() {
+        // NO_COLOR with any value (even empty) should force Machine
+        let env = TestEnv::new().with_var("NO_COLOR", "");
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    // =========================================================================
+    // OutputMode is_* Method Tests
+    // =========================================================================
+
+    #[test]
+    fn test_human_mode_is_methods() {
         assert!(OutputMode::Human.is_rich());
         assert!(!OutputMode::Human.is_json());
         assert!(!OutputMode::Human.is_quiet());
+    }
 
+    #[test]
+    fn test_machine_mode_is_methods() {
         assert!(!OutputMode::Machine.is_rich());
         assert!(OutputMode::Machine.is_json());
         assert!(!OutputMode::Machine.is_quiet());
+    }
 
+    #[test]
+    fn test_quiet_mode_is_methods() {
         assert!(!OutputMode::Quiet.is_rich());
         assert!(!OutputMode::Quiet.is_json());
         assert!(OutputMode::Quiet.is_quiet());
     }
 
+    // =========================================================================
+    // OutputDispatcher Construction Tests
+    // =========================================================================
+
     #[test]
-    fn test_dispatcher_from_flags() {
+    fn test_dispatcher_human_mode_has_console() {
+        let dispatcher = OutputDispatcher::new(OutputMode::Human);
+        assert_eq!(dispatcher.mode(), OutputMode::Human);
+        assert!(dispatcher.has_rich());
+    }
+
+    #[test]
+    fn test_dispatcher_machine_mode_no_console() {
+        let dispatcher = OutputDispatcher::new(OutputMode::Machine);
+        assert_eq!(dispatcher.mode(), OutputMode::Machine);
+        assert!(!dispatcher.has_rich());
+    }
+
+    #[test]
+    fn test_dispatcher_quiet_mode_no_console() {
+        let dispatcher = OutputDispatcher::new(OutputMode::Quiet);
+        assert_eq!(dispatcher.mode(), OutputMode::Quiet);
+        assert!(!dispatcher.has_rich());
+    }
+
+    #[test]
+    fn test_dispatcher_from_flags_json() {
         let dispatcher = OutputDispatcher::from_flags(true, false);
         assert_eq!(dispatcher.mode(), OutputMode::Machine);
         assert!(!dispatcher.has_rich());
+    }
 
+    #[test]
+    fn test_dispatcher_from_flags_quiet() {
         let dispatcher = OutputDispatcher::from_flags(false, true);
         assert_eq!(dispatcher.mode(), OutputMode::Quiet);
         assert!(!dispatcher.has_rich());
+    }
+
+    #[test]
+    fn test_dispatcher_default() {
+        // Default should detect mode from environment
+        // In test environment (no TTY), this should be Machine
+        let dispatcher = OutputDispatcher::default();
+        // Note: actual mode depends on test runner TTY state
+        // Just verify it doesn't panic
+        let _ = dispatcher.mode();
+    }
+
+    // =========================================================================
+    // Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn test_human_mode_with_clean_env() {
+        // TTY with no special env vars should be Human
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(false, false, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Human);
+    }
+
+    #[test]
+    fn test_all_flags_false_no_tty_is_machine() {
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(false, false, TtyState::No, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_detection_order_json_before_quiet() {
+        // Verify --json takes precedence over --quiet
+        let env = TestEnv::new();
+        let mode = OutputMode::detect_with_env(true, true, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    #[test]
+    fn test_detection_order_flags_before_tty() {
+        // Verify flags take precedence over TTY state
+        let env = TestEnv::new();
+
+        // --json should override non-TTY being Machine
+        let mode = OutputMode::detect_with_env(true, false, TtyState::No, &env);
+        assert_eq!(mode, OutputMode::Machine);
+
+        // --quiet should work with TTY
+        let mode = OutputMode::detect_with_env(false, true, TtyState::Yes, &env);
+        assert_eq!(mode, OutputMode::Quiet);
+    }
+
+    #[test]
+    fn test_detection_order_tty_before_env() {
+        // Non-TTY should force Machine before env vars are checked
+        let env = TestEnv::new(); // No CI env vars
+        let mode = OutputMode::detect_with_env(false, false, TtyState::No, &env);
+        assert_eq!(mode, OutputMode::Machine);
+    }
+
+    // =========================================================================
+    // TestEnv Tests (meta-tests for test infrastructure)
+    // =========================================================================
+
+    #[test]
+    fn test_test_env_empty() {
+        let env = TestEnv::new();
+        assert!(!env.var_exists("CI"));
+        assert!(!env.var_exists("NONEXISTENT"));
+    }
+
+    #[test]
+    fn test_test_env_with_var() {
+        let env = TestEnv::new().with_var("CI", "true");
+        assert!(env.var_exists("CI"));
+        assert!(!env.var_exists("GITHUB_ACTIONS"));
+    }
+
+    #[test]
+    fn test_test_env_multiple_vars() {
+        let env = TestEnv::new()
+            .with_var("CI", "true")
+            .with_var("GITHUB_ACTIONS", "true")
+            .with_var("CUSTOM", "value");
+        assert!(env.var_exists("CI"));
+        assert!(env.var_exists("GITHUB_ACTIONS"));
+        assert!(env.var_exists("CUSTOM"));
+        assert!(!env.var_exists("NONEXISTENT"));
+    }
+
+    #[test]
+    fn test_test_env_chainable() {
+        // Verify fluent API works
+        let env = TestEnv::new()
+            .with_var("A", "1")
+            .with_var("B", "2")
+            .with_var("C", "3");
+        assert!(env.var_exists("A"));
+        assert!(env.var_exists("B"));
+        assert!(env.var_exists("C"));
     }
 }

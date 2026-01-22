@@ -303,9 +303,10 @@ async fn main() -> Result<()> {
             json,
             quiet,
             test_connectivity,
+            validate_health_target,
         } => {
             let output = OutputDispatcher::from_flags(json, quiet);
-            check_cmd(strict, test_connectivity, &output).await?
+            check_cmd(strict, test_connectivity, validate_health_target, &output).await?
         }
         Commands::Test {
             url,
@@ -1293,7 +1294,10 @@ async fn test_proxy_connectivity(
     }
 }
 
-async fn check_cmd(strict: bool, test_connectivity: bool, output: &OutputDispatcher) -> Result<()> {
+async fn check_cmd(strict: bool, test_connectivity: bool, validate_health_target: bool, output: &OutputDispatcher) -> Result<()> {
+    // Note: validate_health_target is accepted but not yet implemented
+    // This flag will enable validation of health check target reachability
+    let _ = validate_health_target; // Suppress unused warning until implemented
     use validation::{validate_config, ValidationSeverity};
 
     let config_path = config::config_path()?;
