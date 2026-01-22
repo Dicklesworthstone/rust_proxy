@@ -1,3 +1,6 @@
+// Allow dead_code warnings - watcher hooks are staged for future integration.
+#![allow(dead_code)]
+
 //! File system watcher for config hot-reload functionality.
 //!
 //! This module provides the foundational infrastructure for watching
@@ -62,9 +65,12 @@ impl ConfigWatcher {
 
         let config = Config::default().with_poll_interval(poll_interval);
 
-        let mut watcher = RecommendedWatcher::new(move |res| {
-            let _ = tx.send(res);
-        }, config)
+        let mut watcher = RecommendedWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            config,
+        )
         .context("Failed to create file watcher")?;
 
         // Watch the config file's parent directory if the file doesn't exist yet,
@@ -73,9 +79,7 @@ impl ConfigWatcher {
         let watch_path = if config_path.exists() {
             config_path
         } else {
-            config_path
-                .parent()
-                .unwrap_or(Path::new("."))
+            config_path.parent().unwrap_or(Path::new("."))
         };
 
         watcher

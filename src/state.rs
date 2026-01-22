@@ -257,6 +257,10 @@ struct RuntimeStateInner {
     last_switch_at: Option<DateTime<Utc>>,
     /// Recovery detection timestamp (for failback delay)
     recovery_detected_at: Option<DateTime<Utc>>,
+    /// When all proxies first became unhealthy
+    all_unhealthy_since: Option<DateTime<Utc>>,
+    /// Whether degradation policy is currently active
+    degradation_active: bool,
 }
 
 /// Thread-safe runtime state for dynamic proxy management
@@ -275,6 +279,8 @@ impl RuntimeState {
                 failover_at: None,
                 last_switch_at: None,
                 recovery_detected_at: None,
+                all_unhealthy_since: None,
+                degradation_active: false,
             })),
         }
     }
@@ -360,6 +366,59 @@ impl RuntimeState {
         }
     }
 
+    /// Update degradation state based on healthy proxy list and delay.
+    ///
+    /// Returns true if degradation_active changed during this call.
+    pub async fn update_degradation_state(
+        &self,
+        healthy_proxies: &[String],
+        delay_secs: u64,
+    ) -> bool {
+        let mut inner = self.inner.write().await;
+        let now = Utc::now();
+
+        if healthy_proxies.is_empty() {
+            if inner.all_unhealthy_since.is_none() {
+                inner.all_unhealthy_since = Some(now);
+                tracing::warn!("All proxies unhealthy, starting degradation delay");
+            }
+
+            if let Some(since) = inner.all_unhealthy_since {
+                let elapsed = now.signed_duration_since(since).num_seconds();
+                if elapsed >= delay_secs as i64 && !inner.degradation_active {
+                    inner.degradation_active = true;
+                    tracing::warn!(elapsed_secs = elapsed, "Degradation mode activated");
+                    return true;
+                }
+            }
+        } else {
+            if inner.degradation_active {
+                tracing::info!("Degradation mode deactivated, healthy proxy available");
+            }
+            inner.all_unhealthy_since = None;
+            inner.degradation_active = false;
+        }
+
+        false
+    }
+
+    /// Check if degradation policy is currently active.
+    #[allow(dead_code)] // Will be used by status/diagnostics
+    pub async fn is_degraded(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.degradation_active
+    }
+
+    /// Get degradation status for display.
+    #[allow(dead_code)] // Will be used by status/diagnostics
+    pub async fn get_degradation_status(&self) -> Option<DegradationStatus> {
+        let inner = self.inner.read().await;
+        inner.all_unhealthy_since.map(|since| DegradationStatus {
+            unhealthy_since: since,
+            active: inner.degradation_active,
+        })
+    }
+
     /// Check if enough time has passed for failback
     pub async fn failback_delay_passed(&self, delay_secs: u64) -> bool {
         let inner = self.inner.read().await;
@@ -389,6 +448,8 @@ impl RuntimeState {
             is_failed_over: inner.failover_at.is_some(),
             failover_at: inner.failover_at,
             last_switch_at: inner.last_switch_at,
+            degradation_active: inner.degradation_active,
+            all_unhealthy_since: inner.all_unhealthy_since,
         }
     }
 }
@@ -402,4 +463,14 @@ pub struct RuntimeStateSnapshot {
     pub is_failed_over: bool,
     pub failover_at: Option<DateTime<Utc>>,
     pub last_switch_at: Option<DateTime<Utc>>,
+    pub degradation_active: bool,
+    pub all_unhealthy_since: Option<DateTime<Utc>>,
+}
+
+/// Degradation status for display/diagnostics.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Will be used by status/diagnostics
+pub struct DegradationStatus {
+    pub unhealthy_since: DateTime<Utc>,
+    pub active: bool,
 }

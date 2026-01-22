@@ -353,6 +353,12 @@ pub async fn health_check_loop(
             _ = ticker.tick() => {
                 run_health_checks(&config, &state).await;
 
+                // Update degradation state (debounced) based on current health
+                let healthy = state.get_healthy_proxies().await;
+                runtime
+                    .update_degradation_state(&healthy, config.settings.degradation_delay_secs)
+                    .await;
+
                 // Check for failover if enabled
                 if config.settings.auto_failover {
                     if let Some(event) = check_and_perform_failover(&config, &state, &runtime).await {

@@ -29,7 +29,8 @@
 //! ```
 
 use prometheus::{
-    histogram_opts, CounterVec, Encoder, Gauge, GaugeVec, HistogramVec, Opts, Registry, TextEncoder,
+    core::Collector, histogram_opts, CounterVec, Encoder, Gauge, GaugeVec, HistogramVec, Opts,
+    Registry, TextEncoder,
 };
 use std::sync::LazyLock;
 
@@ -301,30 +302,41 @@ pub static DNS_RESOLUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// Returns an error if metric registration fails (e.g., duplicate metric names).
 pub fn init_metrics() -> Result<(), prometheus::Error> {
     // Counters
-    REGISTRY.register(Box::new(REQUESTS_TOTAL.clone()))?;
-    REGISTRY.register(Box::new(BYTES_SENT.clone()))?;
-    REGISTRY.register(Box::new(BYTES_RECEIVED.clone()))?;
-    REGISTRY.register(Box::new(HEALTH_CHECKS.clone()))?;
-    REGISTRY.register(Box::new(FAILOVERS.clone()))?;
-    REGISTRY.register(Box::new(DNS_RESOLUTIONS.clone()))?;
-    REGISTRY.register(Box::new(CONNECTION_RETRIES.clone()))?;
-    REGISTRY.register(Box::new(CONNECTIONS_TOTAL.clone()))?;
+    register_or_ignore(REQUESTS_TOTAL.clone())?;
+    register_or_ignore(BYTES_SENT.clone())?;
+    register_or_ignore(BYTES_RECEIVED.clone())?;
+    register_or_ignore(HEALTH_CHECKS.clone())?;
+    register_or_ignore(FAILOVERS.clone())?;
+    register_or_ignore(DNS_RESOLUTIONS.clone())?;
+    register_or_ignore(CONNECTION_RETRIES.clone())?;
+    register_or_ignore(CONNECTIONS_TOTAL.clone())?;
 
     // Gauges
-    REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone()))?;
-    REGISTRY.register(Box::new(PROXY_HEALTH.clone()))?;
-    REGISTRY.register(Box::new(EFFECTIVE_PROXY.clone()))?;
-    REGISTRY.register(Box::new(IPSET_SIZE.clone()))?;
-    REGISTRY.register(Box::new(TARGETS_COUNT.clone()))?;
-    REGISTRY.register(Box::new(PROXIES_COUNT.clone()))?;
-    REGISTRY.register(Box::new(UPTIME_SECONDS.clone()))?;
+    register_or_ignore(ACTIVE_CONNECTIONS.clone())?;
+    register_or_ignore(PROXY_HEALTH.clone())?;
+    register_or_ignore(EFFECTIVE_PROXY.clone())?;
+    register_or_ignore(IPSET_SIZE.clone())?;
+    register_or_ignore(TARGETS_COUNT.clone())?;
+    register_or_ignore(PROXIES_COUNT.clone())?;
+    register_or_ignore(UPTIME_SECONDS.clone())?;
 
     // Histograms
-    REGISTRY.register(Box::new(CONNECTION_DURATION.clone()))?;
-    REGISTRY.register(Box::new(HEALTH_CHECK_LATENCY.clone()))?;
-    REGISTRY.register(Box::new(DNS_RESOLUTION_LATENCY.clone()))?;
+    register_or_ignore(CONNECTION_DURATION.clone())?;
+    register_or_ignore(HEALTH_CHECK_LATENCY.clone())?;
+    register_or_ignore(DNS_RESOLUTION_LATENCY.clone())?;
 
     Ok(())
+}
+
+fn register_or_ignore<C>(collector: C) -> Result<(), prometheus::Error>
+where
+    C: Collector + 'static,
+{
+    match REGISTRY.register(Box::new(collector)) {
+        Ok(()) => Ok(()),
+        Err(prometheus::Error::AlreadyReg) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Encode all metrics to Prometheus text format.
@@ -435,6 +447,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    static INIT: OnceLock<()> = OnceLock::new();
+    static LABEL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn init_metrics_once() {
+        INIT.get_or_init(|| {
+            init_metrics().expect("metrics init failed");
+        });
+    }
+
+    fn unique_label(prefix: &str) -> String {
+        let id = LABEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{id}")
+    }
 
     #[test]
     fn test_metrics_can_be_created() {
@@ -455,41 +483,57 @@ mod tests {
     }
 
     #[test]
+    fn test_init_metrics_idempotent() {
+        init_metrics().expect("first init should succeed");
+        init_metrics().expect("second init should be idempotent");
+    }
+
+    #[test]
     fn test_counter_increment() {
-        REQUESTS_TOTAL
-            .with_label_values(&["test-proxy", "success"])
-            .inc();
-        let value = REQUESTS_TOTAL
-            .with_label_values(&["test-proxy", "success"])
+        let proxy_id = unique_label("counter");
+        let before = REQUESTS_TOTAL
+            .with_label_values(&[proxy_id.as_str(), "success"])
             .get();
-        assert!(value >= 1.0);
+        record_request_success(&proxy_id);
+        let after = REQUESTS_TOTAL
+            .with_label_values(&[proxy_id.as_str(), "success"])
+            .get();
+        assert!(after >= before + 1.0);
     }
 
     #[test]
     fn test_gauge_set() {
-        PROXY_HEALTH.with_label_values(&["test-proxy"]).set(1.0);
-        let value = PROXY_HEALTH.with_label_values(&["test-proxy"]).get();
-        assert!((value - 1.0).abs() < f64::EPSILON);
+        let proxy_id = unique_label("gauge");
+        PROXY_HEALTH
+            .with_label_values(&[proxy_id.as_str()])
+            .set(0.0);
+        let before = PROXY_HEALTH.with_label_values(&[proxy_id.as_str()]).get();
+        PROXY_HEALTH
+            .with_label_values(&[proxy_id.as_str()])
+            .set(1.0);
+        let after = PROXY_HEALTH.with_label_values(&[proxy_id.as_str()]).get();
+        assert!((before - 0.0).abs() < f64::EPSILON);
+        assert!((after - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_histogram_observe() {
-        CONNECTION_DURATION
-            .with_label_values(&["test-proxy"])
-            .observe(0.5);
-        // Just verify it doesn't panic
+        let proxy_id = unique_label("hist");
+        let histogram = CONNECTION_DURATION.with_label_values(&[proxy_id.as_str()]);
+        let before = histogram.get_sample_count();
+        histogram.observe(0.5);
+        let after = histogram.get_sample_count();
+        assert!(after > before);
     }
 
     #[test]
     fn test_encode_metrics() {
-        // Force some metrics to exist
-        REQUESTS_TOTAL
-            .with_label_values(&["encode-test", "success"])
-            .inc();
+        init_metrics_once();
+        let proxy_id = unique_label("encode");
+        record_request_success(&proxy_id);
 
         let output = encode_metrics();
-        // Output might be empty if registry not initialized, but should not panic
-        assert!(output.is_empty() || output.contains("rust_proxy"));
+        assert!(output.contains("rust_proxy_requests_total"));
     }
 
     #[test]
@@ -505,5 +549,32 @@ mod tests {
         connection_started("helper-test");
         connection_ended("helper-test", 1.5);
         // Just verify they don't panic
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_metric_updates() {
+        init_metrics_once();
+        let proxy_id = unique_label("concurrent");
+        let before = REQUESTS_TOTAL
+            .with_label_values(&[proxy_id.as_str(), "success"])
+            .get();
+
+        let handles: Vec<_> = (0..25)
+            .map(|_| {
+                let proxy_id = proxy_id.clone();
+                tokio::spawn(async move {
+                    record_request_success(&proxy_id);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await.expect("task join failed");
+        }
+
+        let after = REQUESTS_TOTAL
+            .with_label_values(&[proxy_id.as_str(), "success"])
+            .get();
+        assert!(after >= before + 25.0);
     }
 }

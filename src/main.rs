@@ -5,6 +5,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tabled::settings::Style;
@@ -80,6 +81,11 @@ enum Commands {
     Deactivate {
         #[arg(long)]
         keep_rules: bool,
+    },
+    /// Manage systemd service files
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Run transparent proxy daemon (requires sudo)
     Daemon,
@@ -205,6 +211,28 @@ enum TargetCmd {
     List,
 }
 
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Generate systemd service file
+    Generate {
+        /// Output path (default: /tmp/rust_proxy.service)
+        #[arg(long, default_value = "/tmp/rust_proxy.service")]
+        output: PathBuf,
+        /// User to run service as
+        #[arg(long, default_value = "root")]
+        user: String,
+        /// Group to run service as
+        #[arg(long, default_value = "root")]
+        group: String,
+        /// Path to config file (defaults to standard config path)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Apply security hardening in the generated service
+        #[arg(long)]
+        hardened: bool,
+    },
+}
+
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum ProviderArg {
     Anthropic,
@@ -280,6 +308,10 @@ async fn main() -> Result<()> {
         Commands::Deactivate { keep_rules } => {
             let output = OutputDispatcher::from_flags(false, false);
             deactivate_cmd(keep_rules, &output)?
+        }
+        Commands::Service { action } => {
+            let output = OutputDispatcher::from_flags(false, false);
+            service_cmd(action, &output)?
         }
         Commands::Daemon => run_daemon().await?,
         Commands::Status(args) => {
@@ -1294,7 +1326,12 @@ async fn test_proxy_connectivity(
     }
 }
 
-async fn check_cmd(strict: bool, test_connectivity: bool, validate_health_target: bool, output: &OutputDispatcher) -> Result<()> {
+async fn check_cmd(
+    strict: bool,
+    test_connectivity: bool,
+    validate_health_target: bool,
+    output: &OutputDispatcher,
+) -> Result<()> {
     // Note: validate_health_target is accepted but not yet implemented
     // This flag will enable validation of health check target reachability
     let _ = validate_health_target; // Suppress unused warning until implemented
@@ -2383,8 +2420,12 @@ async fn trace_cmd(target: &str, tls: bool, output: &OutputDispatcher) -> Result
     let auth_header = if let (Some(user), Some(pass)) =
         (upstream.username.as_ref(), upstream.password.as_ref())
     {
-        let token = Base64.encode(format!("{user}:{pass}"));
-        format!("Proxy-Authorization: Basic {}\r\n", token)
+        let mut creds = Vec::with_capacity(user.len() + 1 + pass.len());
+        creds.extend_from_slice(user.as_bytes());
+        creds.push(b':');
+        creds.extend_from_slice(pass.as_bytes());
+        let auth_b64 = Base64.encode(creds);
+        format!("Proxy-Authorization: Basic {}\r\n", auth_b64)
     } else {
         String::new()
     };
@@ -2796,6 +2837,54 @@ async fn ping_cmd(
 fn completions_cmd(shell: Shell) {
     let mut cmd = Cli::command();
     generate(shell, &mut cmd, "rust_proxy", &mut std::io::stdout());
+}
+
+fn service_cmd(action: ServiceAction, output: &OutputDispatcher) -> Result<()> {
+    match action {
+        ServiceAction::Generate {
+            output: output_path,
+            user,
+            group,
+            config,
+            hardened,
+        } => service_generate(output_path, user, group, config, hardened, output),
+    }
+}
+
+fn service_generate(
+    output_path: PathBuf,
+    user: String,
+    group: String,
+    config: Option<PathBuf>,
+    hardened: bool,
+    output: &OutputDispatcher,
+) -> Result<()> {
+    let binary_path =
+        std::env::current_exe().context("Failed to resolve current executable path")?;
+    let config_path = match config {
+        Some(path) => path,
+        None => config::config_path()?,
+    };
+
+    let service_content =
+        util::generate_service_file(&binary_path, &config_path, &user, &group, hardened);
+    std::fs::write(&output_path, service_content)
+        .with_context(|| format!("Failed to write {}", output_path.display()))?;
+
+    output.print_plain(&format!(
+        "Generated systemd service file: {}",
+        output_path.display()
+    ));
+    output.print_plain("");
+    output.print_plain("To install:");
+    output.print_plain(&format!(
+        "  sudo cp {} /etc/systemd/system/rust_proxy.service",
+        output_path.display()
+    ));
+    output.print_plain("  sudo systemctl daemon-reload");
+    output.print_plain("  sudo systemctl enable --now rust_proxy");
+
+    Ok(())
 }
 
 async fn run_daemon() -> Result<()> {
