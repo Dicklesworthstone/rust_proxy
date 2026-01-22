@@ -5,6 +5,225 @@ use std::path::Path;
 use std::time::Duration;
 use url::Url;
 
+// =============================================================================
+// Shell Detection
+// =============================================================================
+
+/// Supported shell types for completion installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    /// GNU Bash shell
+    Bash,
+    /// Z shell
+    Zsh,
+    /// Fish shell
+    Fish,
+    /// PowerShell (Windows/cross-platform)
+    PowerShell,
+    /// Elvish shell
+    Elvish,
+    /// Unknown or unsupported shell
+    Unknown,
+}
+
+impl Shell {
+    /// Returns the canonical name of the shell.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+            Self::PowerShell => "powershell",
+            Self::Elvish => "elvish",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Returns a human-readable display name for the shell.
+    #[must_use]
+    pub const fn display_name(&self) -> &'static str {
+        match self {
+            Self::Bash => "Bash",
+            Self::Zsh => "Zsh",
+            Self::Fish => "Fish",
+            Self::PowerShell => "PowerShell",
+            Self::Elvish => "Elvish",
+            Self::Unknown => "Unknown",
+        }
+    }
+
+    /// Returns true if this is a known, supported shell.
+    #[must_use]
+    pub const fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// Convert to clap_complete::Shell if supported.
+    #[must_use]
+    pub fn to_clap_shell(&self) -> Option<clap_complete::Shell> {
+        match self {
+            Self::Bash => Some(clap_complete::Shell::Bash),
+            Self::Zsh => Some(clap_complete::Shell::Zsh),
+            Self::Fish => Some(clap_complete::Shell::Fish),
+            Self::PowerShell => Some(clap_complete::Shell::PowerShell),
+            Self::Elvish => Some(clap_complete::Shell::Elvish),
+            Self::Unknown => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Shell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+/// Detect the user's current shell using multiple fallback methods.
+///
+/// Detection order:
+/// 1. `$SHELL` environment variable (most reliable)
+/// 2. Parent process name on Linux (via `/proc`)
+/// 3. Common shell config files in home directory
+///
+/// Returns `Shell::Unknown` if detection fails rather than guessing.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use rust_proxy::util::detect_shell;
+///
+/// let shell = detect_shell();
+/// if shell.is_known() {
+///     println!("Detected shell: {}", shell.display_name());
+/// } else {
+///     println!("Could not detect shell");
+/// }
+/// ```
+#[must_use]
+pub fn detect_shell() -> Shell {
+    // Method 1: Check $SHELL environment variable (most common and reliable)
+    if let Some(shell) = detect_from_shell_env() {
+        return shell;
+    }
+
+    // Method 2: Check parent process name (Linux only)
+    #[cfg(target_os = "linux")]
+    if let Some(shell) = detect_from_parent_process() {
+        return shell;
+    }
+
+    // Method 3: Check for common shell config files
+    if let Some(shell) = detect_from_config_files() {
+        return shell;
+    }
+
+    Shell::Unknown
+}
+
+/// Detect shell from the $SHELL environment variable.
+fn detect_from_shell_env() -> Option<Shell> {
+    let shell_path = std::env::var("SHELL").ok()?;
+    let shell_path = shell_path.to_lowercase();
+
+    // Check common shell binary names at end of path
+    if shell_path.ends_with("/bash") || shell_path.ends_with("/bash.exe") {
+        return Some(Shell::Bash);
+    }
+    if shell_path.ends_with("/zsh") || shell_path.ends_with("/zsh.exe") {
+        return Some(Shell::Zsh);
+    }
+    if shell_path.ends_with("/fish") || shell_path.ends_with("/fish.exe") {
+        return Some(Shell::Fish);
+    }
+    if shell_path.ends_with("/pwsh")
+        || shell_path.ends_with("/powershell")
+        || shell_path.ends_with("/powershell.exe")
+        || shell_path.ends_with("/pwsh.exe")
+    {
+        return Some(Shell::PowerShell);
+    }
+    if shell_path.ends_with("/elvish") || shell_path.ends_with("/elvish.exe") {
+        return Some(Shell::Elvish);
+    }
+
+    // Also check if the binary name appears in the path (handles unusual paths)
+    let lower = shell_path.to_lowercase();
+    if lower.contains("bash") {
+        return Some(Shell::Bash);
+    }
+    if lower.contains("zsh") {
+        return Some(Shell::Zsh);
+    }
+    if lower.contains("fish") {
+        return Some(Shell::Fish);
+    }
+    if lower.contains("pwsh") || lower.contains("powershell") {
+        return Some(Shell::PowerShell);
+    }
+    if lower.contains("elvish") {
+        return Some(Shell::Elvish);
+    }
+
+    None
+}
+
+/// Detect shell from the parent process name (Linux only).
+#[cfg(target_os = "linux")]
+fn detect_from_parent_process() -> Option<Shell> {
+    // Get parent process ID
+    let ppid = std::os::unix::process::parent_id();
+
+    // Read the process name from /proc/<ppid>/comm
+    let comm_path = format!("/proc/{ppid}/comm");
+    let name = std::fs::read_to_string(comm_path).ok()?;
+    let name = name.trim().to_lowercase();
+
+    match name.as_str() {
+        "bash" => Some(Shell::Bash),
+        "zsh" => Some(Shell::Zsh),
+        "fish" => Some(Shell::Fish),
+        "pwsh" | "powershell" => Some(Shell::PowerShell),
+        "elvish" => Some(Shell::Elvish),
+        _ => None,
+    }
+}
+
+/// Detect shell by checking for common shell config files in home directory.
+fn detect_from_config_files() -> Option<Shell> {
+    let base_dirs = directories::BaseDirs::new()?;
+    let home = base_dirs.home_dir();
+
+    // Check in order of popularity/specificity
+    // Zsh config
+    if home.join(".zshrc").exists() || home.join(".zshenv").exists() {
+        return Some(Shell::Zsh);
+    }
+
+    // Fish config (in .config/fish/)
+    let fish_config = home.join(".config").join("fish").join("config.fish");
+    if fish_config.exists() {
+        return Some(Shell::Fish);
+    }
+
+    // Bash config
+    if home.join(".bashrc").exists() || home.join(".bash_profile").exists() {
+        return Some(Shell::Bash);
+    }
+
+    // Elvish config (in .config/elvish/ or .elvish/)
+    let elvish_config1 = home.join(".config").join("elvish").join("rc.elv");
+    let elvish_config2 = home.join(".elvish").join("rc.elv");
+    if elvish_config1.exists() || elvish_config2.exists() {
+        return Some(Shell::Elvish);
+    }
+
+    // PowerShell profile locations vary, skip for now
+    // (PowerShell users typically know they're using PowerShell)
+
+    None
+}
+
 /// Helper for dry-run mode that provides consistent messaging across commands.
 ///
 /// When dry-run is enabled, actions are printed with "Would: <action>" prefix
@@ -505,5 +724,223 @@ mod tests {
         let service = generate_service_file(binary, config, "root", "root", true);
         assert!(service.contains("ProtectSystem=strict"));
         assert!(service.contains("ReadWritePaths=/etc/rust_proxy"));
+    }
+
+    // =========================================================================
+    // Shell Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_shell_name() {
+        assert_eq!(Shell::Bash.name(), "bash");
+        assert_eq!(Shell::Zsh.name(), "zsh");
+        assert_eq!(Shell::Fish.name(), "fish");
+        assert_eq!(Shell::PowerShell.name(), "powershell");
+        assert_eq!(Shell::Elvish.name(), "elvish");
+        assert_eq!(Shell::Unknown.name(), "unknown");
+    }
+
+    #[test]
+    fn test_shell_display_name() {
+        assert_eq!(Shell::Bash.display_name(), "Bash");
+        assert_eq!(Shell::Zsh.display_name(), "Zsh");
+        assert_eq!(Shell::Fish.display_name(), "Fish");
+        assert_eq!(Shell::PowerShell.display_name(), "PowerShell");
+        assert_eq!(Shell::Elvish.display_name(), "Elvish");
+        assert_eq!(Shell::Unknown.display_name(), "Unknown");
+    }
+
+    #[test]
+    fn test_shell_is_known() {
+        assert!(Shell::Bash.is_known());
+        assert!(Shell::Zsh.is_known());
+        assert!(Shell::Fish.is_known());
+        assert!(Shell::PowerShell.is_known());
+        assert!(Shell::Elvish.is_known());
+        assert!(!Shell::Unknown.is_known());
+    }
+
+    #[test]
+    fn test_shell_to_clap_shell() {
+        assert_eq!(Shell::Bash.to_clap_shell(), Some(clap_complete::Shell::Bash));
+        assert_eq!(Shell::Zsh.to_clap_shell(), Some(clap_complete::Shell::Zsh));
+        assert_eq!(Shell::Fish.to_clap_shell(), Some(clap_complete::Shell::Fish));
+        assert_eq!(
+            Shell::PowerShell.to_clap_shell(),
+            Some(clap_complete::Shell::PowerShell)
+        );
+        assert_eq!(
+            Shell::Elvish.to_clap_shell(),
+            Some(clap_complete::Shell::Elvish)
+        );
+        assert_eq!(Shell::Unknown.to_clap_shell(), None);
+    }
+
+    #[test]
+    fn test_shell_display() {
+        assert_eq!(format!("{}", Shell::Bash), "Bash");
+        assert_eq!(format!("{}", Shell::Zsh), "Zsh");
+        assert_eq!(format!("{}", Shell::Fish), "Fish");
+        assert_eq!(format!("{}", Shell::PowerShell), "PowerShell");
+        assert_eq!(format!("{}", Shell::Elvish), "Elvish");
+        assert_eq!(format!("{}", Shell::Unknown), "Unknown");
+    }
+
+    // Helper to test shell detection with a specific SHELL value
+    // This uses a direct parsing approach to avoid environment variable race conditions
+    fn parse_shell_from_path(path: &str) -> Option<Shell> {
+        let shell_path = path.to_lowercase();
+
+        // Check common shell binary names at end of path
+        if shell_path.ends_with("/bash") || shell_path.ends_with("/bash.exe") {
+            return Some(Shell::Bash);
+        }
+        if shell_path.ends_with("/zsh") || shell_path.ends_with("/zsh.exe") {
+            return Some(Shell::Zsh);
+        }
+        if shell_path.ends_with("/fish") || shell_path.ends_with("/fish.exe") {
+            return Some(Shell::Fish);
+        }
+        if shell_path.ends_with("/pwsh")
+            || shell_path.ends_with("/powershell")
+            || shell_path.ends_with("/powershell.exe")
+            || shell_path.ends_with("/pwsh.exe")
+        {
+            return Some(Shell::PowerShell);
+        }
+        if shell_path.ends_with("/elvish") || shell_path.ends_with("/elvish.exe") {
+            return Some(Shell::Elvish);
+        }
+
+        // Also check if the binary name appears in the path
+        let lower = shell_path.to_lowercase();
+        if lower.contains("bash") {
+            return Some(Shell::Bash);
+        }
+        if lower.contains("zsh") {
+            return Some(Shell::Zsh);
+        }
+        if lower.contains("fish") {
+            return Some(Shell::Fish);
+        }
+        if lower.contains("pwsh") || lower.contains("powershell") {
+            return Some(Shell::PowerShell);
+        }
+        if lower.contains("elvish") {
+            return Some(Shell::Elvish);
+        }
+
+        None
+    }
+
+    #[test]
+    fn test_shell_path_parsing_bash() {
+        // Test various bash path formats
+        assert_eq!(parse_shell_from_path("/bin/bash"), Some(Shell::Bash));
+        assert_eq!(parse_shell_from_path("/usr/bin/bash"), Some(Shell::Bash));
+        assert_eq!(
+            parse_shell_from_path("/usr/local/bin/bash"),
+            Some(Shell::Bash)
+        );
+        assert_eq!(
+            parse_shell_from_path("C:\\Program Files\\bash.exe"),
+            Some(Shell::Bash)
+        );
+    }
+
+    #[test]
+    fn test_shell_path_parsing_zsh() {
+        assert_eq!(parse_shell_from_path("/bin/zsh"), Some(Shell::Zsh));
+        assert_eq!(parse_shell_from_path("/usr/bin/zsh"), Some(Shell::Zsh));
+        assert_eq!(
+            parse_shell_from_path("/opt/homebrew/bin/zsh"),
+            Some(Shell::Zsh)
+        );
+    }
+
+    #[test]
+    fn test_shell_path_parsing_fish() {
+        assert_eq!(parse_shell_from_path("/usr/bin/fish"), Some(Shell::Fish));
+        assert_eq!(
+            parse_shell_from_path("/usr/local/bin/fish"),
+            Some(Shell::Fish)
+        );
+    }
+
+    #[test]
+    fn test_shell_path_parsing_powershell() {
+        assert_eq!(
+            parse_shell_from_path("/usr/bin/pwsh"),
+            Some(Shell::PowerShell)
+        );
+        assert_eq!(
+            parse_shell_from_path("/usr/local/bin/powershell"),
+            Some(Shell::PowerShell)
+        );
+        assert_eq!(
+            parse_shell_from_path("C:\\Windows\\System32\\powershell.exe"),
+            Some(Shell::PowerShell)
+        );
+    }
+
+    #[test]
+    fn test_shell_path_parsing_elvish() {
+        assert_eq!(
+            parse_shell_from_path("/usr/bin/elvish"),
+            Some(Shell::Elvish)
+        );
+        assert_eq!(
+            parse_shell_from_path("/usr/local/bin/elvish"),
+            Some(Shell::Elvish)
+        );
+    }
+
+    #[test]
+    fn test_shell_path_parsing_unknown() {
+        assert_eq!(parse_shell_from_path("/bin/sh"), None);
+        assert_eq!(parse_shell_from_path("/usr/bin/dash"), None);
+        assert_eq!(parse_shell_from_path("/usr/bin/ksh"), None);
+        assert_eq!(parse_shell_from_path("/usr/bin/tcsh"), None);
+    }
+
+    #[test]
+    fn test_shell_path_parsing_case_insensitive() {
+        // Should handle uppercase SHELL values
+        assert_eq!(parse_shell_from_path("/BIN/BASH"), Some(Shell::Bash));
+        assert_eq!(parse_shell_from_path("/usr/BIN/ZSH"), Some(Shell::Zsh));
+        assert_eq!(parse_shell_from_path("/USR/BIN/FISH"), Some(Shell::Fish));
+    }
+
+    #[test]
+    fn test_detect_shell_returns_something() {
+        // This test just ensures detect_shell() runs without panicking.
+        // The actual result depends on the environment.
+        let shell = detect_shell();
+        // Shell should be one of the valid variants
+        let _ = shell.name();
+        let _ = shell.is_known();
+    }
+
+    #[test]
+    fn test_shell_equality() {
+        assert_eq!(Shell::Bash, Shell::Bash);
+        assert_ne!(Shell::Bash, Shell::Zsh);
+        assert_ne!(Shell::Unknown, Shell::Bash);
+    }
+
+    #[test]
+    fn test_shell_clone_and_copy() {
+        let shell = Shell::Bash;
+        let cloned = shell.clone();
+        let copied = shell;
+        assert_eq!(shell, cloned);
+        assert_eq!(shell, copied);
+    }
+
+    #[test]
+    fn test_shell_debug() {
+        // Ensure Debug is implemented correctly
+        let debug_str = format!("{:?}", Shell::Bash);
+        assert!(debug_str.contains("Bash"));
     }
 }
