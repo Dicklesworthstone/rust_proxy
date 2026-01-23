@@ -356,6 +356,10 @@ pub mod styles {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // Theme Singleton & Construction Tests
+    // =========================================================================
+
     #[test]
     fn test_theme_singleton() {
         let t1 = theme();
@@ -365,29 +369,197 @@ mod tests {
     }
 
     #[test]
+    fn test_theme_singleton_consistent_across_calls() {
+        // Multiple calls should always return the same instance
+        for _ in 0..100 {
+            let t = theme();
+            assert!(std::ptr::eq(t, theme()));
+        }
+    }
+
+    #[test]
+    fn test_theme_new_equals_default() {
+        // Theme::new() should produce the same result as Theme::default()
+        let new_theme = Theme::new();
+        let default_theme = Theme::default();
+
+        // Compare via Debug formatting since Color doesn't implement Eq
+        assert_eq!(format!("{:?}", new_theme), format!("{:?}", default_theme));
+    }
+
+    // =========================================================================
+    // Theme Colors Initialization Tests
+    // =========================================================================
+
+    #[test]
     fn test_theme_colors_initialized() {
         let t = theme();
         // All colors should be valid (not default/empty)
-        // We can't easily test Color equality, but we can ensure they're created
-        let _ = &t.success;
-        let _ = &t.warning;
-        let _ = &t.error;
-        let _ = &t.info;
-        let _ = &t.primary;
-        let _ = &t.secondary;
-        let _ = &t.muted;
-        let _ = &t.highlight;
-        let _ = &t.healthy;
-        let _ = &t.degraded;
-        let _ = &t.unhealthy;
-        let _ = &t.unknown;
-        let _ = &t.bytes;
-        let _ = &t.latency;
-        let _ = &t.timestamp;
-        let _ = &t.domain;
-        let _ = &t.ip;
-        let _ = &t.provider;
+        // Verify each field can be accessed and has a Debug representation
+        assert!(!format!("{:?}", t.success).is_empty());
+        assert!(!format!("{:?}", t.warning).is_empty());
+        assert!(!format!("{:?}", t.error).is_empty());
+        assert!(!format!("{:?}", t.info).is_empty());
+        assert!(!format!("{:?}", t.primary).is_empty());
+        assert!(!format!("{:?}", t.secondary).is_empty());
+        assert!(!format!("{:?}", t.muted).is_empty());
+        assert!(!format!("{:?}", t.highlight).is_empty());
+        assert!(!format!("{:?}", t.healthy).is_empty());
+        assert!(!format!("{:?}", t.degraded).is_empty());
+        assert!(!format!("{:?}", t.unhealthy).is_empty());
+        assert!(!format!("{:?}", t.unknown).is_empty());
+        assert!(!format!("{:?}", t.bytes).is_empty());
+        assert!(!format!("{:?}", t.latency).is_empty());
+        assert!(!format!("{:?}", t.timestamp).is_empty());
+        assert!(!format!("{:?}", t.domain).is_empty());
+        assert!(!format!("{:?}", t.ip).is_empty());
+        assert!(!format!("{:?}", t.provider).is_empty());
     }
+
+    #[test]
+    fn test_theme_clone() {
+        let t = theme();
+        let cloned = t.clone();
+
+        // Cloned theme should have the same values
+        assert_eq!(format!("{:?}", t), format!("{:?}", cloned));
+    }
+
+    // =========================================================================
+    // Semantic Color Tests - Traffic Light Semantics
+    // =========================================================================
+
+    /// Helper to check if a color Debug output matches expected ANSI codes
+    fn color_matches_ansi(debug: &str, codes: &[u8]) -> bool {
+        // Color debug format: Color { name: "color(N)", ..., number: Some(N), ... }
+        for code in codes {
+            if debug.contains(&format!("number: Some({})", code))
+                || debug.contains(&format!("color({})", code))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn test_success_color_is_green_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.success);
+        // Green family: ANSI 2 (green) or 10 (bright green)
+        assert!(
+            debug.to_lowercase().contains("green") || color_matches_ansi(&debug, &[2, 10]),
+            "Success color should be green family, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_warning_color_is_yellow_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.warning);
+        // Yellow family: ANSI 3 (yellow) or 11 (bright yellow)
+        assert!(
+            debug.to_lowercase().contains("yellow") || color_matches_ansi(&debug, &[3, 11]),
+            "Warning color should be yellow family, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_error_color_is_red_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.error);
+        // Red family: ANSI 1 (red) or 9 (bright red)
+        assert!(
+            debug.to_lowercase().contains("red") || color_matches_ansi(&debug, &[1, 9]),
+            "Error color should be red family, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_info_color_is_blue_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.info);
+        // Blue family: ANSI 4 (blue) or 12 (bright blue)
+        assert!(
+            debug.to_lowercase().contains("blue") || color_matches_ansi(&debug, &[4, 12]),
+            "Info color should be blue family, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_primary_color_is_cyan_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.primary);
+        // Cyan family: ANSI 6 (cyan) or 14 (bright cyan)
+        assert!(
+            debug.to_lowercase().contains("cyan") || color_matches_ansi(&debug, &[6, 14]),
+            "Primary color should be cyan family, got: {}",
+            debug
+        );
+    }
+
+    // =========================================================================
+    // Health Status Color Tests
+    // =========================================================================
+
+    #[test]
+    fn test_healthy_color_is_bright_green() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.healthy);
+        // Bright green is ANSI 10
+        assert!(
+            debug.to_lowercase().contains("green") || color_matches_ansi(&debug, &[2, 10]),
+            "Healthy color should be bright green, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_degraded_color_is_bright_yellow() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.degraded);
+        // Bright yellow is ANSI 11
+        assert!(
+            debug.to_lowercase().contains("yellow") || color_matches_ansi(&debug, &[3, 11]),
+            "Degraded color should be bright yellow, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_unhealthy_color_is_bright_red() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.unhealthy);
+        // Bright red is ANSI 9
+        assert!(
+            debug.to_lowercase().contains("red") || color_matches_ansi(&debug, &[1, 9]),
+            "Unhealthy color should be bright red, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_unknown_color_is_gray() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.unknown);
+        // Gray is typically bright_black (ANSI 8)
+        assert!(
+            debug.to_lowercase().contains("black")
+                || debug.to_lowercase().contains("gray")
+                || debug.to_lowercase().contains("grey")
+                || color_matches_ansi(&debug, &[8]),
+            "Unknown color should be gray (bright black), got: {}",
+            debug
+        );
+    }
+
+    // =========================================================================
+    // health_color Method Tests
+    // =========================================================================
 
     #[test]
     fn test_health_color_mapping() {
@@ -401,6 +573,103 @@ mod tests {
         let _ = t.health_color("unknown");
         let _ = t.health_color("invalid"); // Should return unknown
     }
+
+    #[test]
+    fn test_health_color_case_insensitivity() {
+        let t = theme();
+
+        // All case variations should produce the same color
+        let healthy_lower = format!("{:?}", t.health_color("healthy"));
+        let healthy_upper = format!("{:?}", t.health_color("HEALTHY"));
+        let healthy_mixed = format!("{:?}", t.health_color("HeAlThY"));
+
+        assert_eq!(healthy_lower, healthy_upper);
+        assert_eq!(healthy_lower, healthy_mixed);
+
+        let degraded_lower = format!("{:?}", t.health_color("degraded"));
+        let degraded_upper = format!("{:?}", t.health_color("DEGRADED"));
+        assert_eq!(degraded_lower, degraded_upper);
+
+        let unhealthy_lower = format!("{:?}", t.health_color("unhealthy"));
+        let unhealthy_upper = format!("{:?}", t.health_color("UNHEALTHY"));
+        assert_eq!(unhealthy_lower, unhealthy_upper);
+    }
+
+    #[test]
+    fn test_health_color_invalid_returns_unknown() {
+        let t = theme();
+
+        // Any unrecognized status should return the unknown color
+        let unknown_color = format!("{:?}", t.health_color("unknown"));
+        let invalid_color = format!("{:?}", t.health_color("invalid"));
+        let random_color = format!("{:?}", t.health_color("random_status"));
+        let empty_color = format!("{:?}", t.health_color(""));
+
+        assert_eq!(unknown_color, invalid_color);
+        assert_eq!(unknown_color, random_color);
+        assert_eq!(unknown_color, empty_color);
+    }
+
+    #[test]
+    fn test_health_color_distinct_values() {
+        let t = theme();
+
+        // Each health status should have a distinct color
+        let healthy = format!("{:?}", t.health_color("healthy"));
+        let degraded = format!("{:?}", t.health_color("degraded"));
+        let unhealthy = format!("{:?}", t.health_color("unhealthy"));
+        let unknown = format!("{:?}", t.health_color("unknown"));
+
+        // All statuses should have different colors
+        assert_ne!(healthy, degraded, "healthy and degraded should differ");
+        assert_ne!(healthy, unhealthy, "healthy and unhealthy should differ");
+        assert_ne!(degraded, unhealthy, "degraded and unhealthy should differ");
+        // Note: unknown color might match muted/timestamp which is OK
+    }
+
+    // =========================================================================
+    // Data Type Color Tests
+    // =========================================================================
+
+    #[test]
+    fn test_bytes_color_is_magenta_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.bytes);
+        // Magenta family: ANSI 5 (magenta) or 13 (bright magenta)
+        assert!(
+            debug.to_lowercase().contains("magenta") || color_matches_ansi(&debug, &[5, 13]),
+            "Bytes color should be magenta family, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_latency_color_is_cyan_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.latency);
+        // Cyan family: ANSI 6 (cyan) or 14 (bright cyan)
+        assert!(
+            debug.to_lowercase().contains("cyan") || color_matches_ansi(&debug, &[6, 14]),
+            "Latency color should be cyan family, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_ip_color_is_yellow_family() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t.ip);
+        // Yellow family: ANSI 3 (yellow) or 11 (bright yellow)
+        assert!(
+            debug.to_lowercase().contains("yellow") || color_matches_ansi(&debug, &[3, 11]),
+            "IP color should be yellow family, got: {}",
+            debug
+        );
+    }
+
+    // =========================================================================
+    // Style Preset Tests - Basic Creation
+    // =========================================================================
 
     #[test]
     fn test_style_presets() {
@@ -429,6 +698,125 @@ mod tests {
         let _ = styles::dimmed();
     }
 
+    // =========================================================================
+    // Style Preset Tests - Expected Properties
+    // =========================================================================
+
+    #[test]
+    fn test_header_style_is_bold() {
+        let style = styles::header();
+        let debug = format!("{:?}", style);
+        // Style should include bold attribute
+        assert!(
+            debug.to_lowercase().contains("bold"),
+            "Header style should be bold, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_success_msg_style_is_bold() {
+        let style = styles::success_msg();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("bold"),
+            "Success message style should be bold, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_error_msg_style_is_bold() {
+        let style = styles::error_msg();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("bold"),
+            "Error message style should be bold, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_warning_msg_style_is_bold() {
+        let style = styles::warning_msg();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("bold"),
+            "Warning message style should be bold, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_dimmed_style_is_dim() {
+        let style = styles::dimmed();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("dim"),
+            "Dimmed style should be dim, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_unknown_style_is_dim() {
+        let style = styles::unknown();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("dim"),
+            "Unknown style should be dim, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_inactive_style_is_dim() {
+        let style = styles::inactive();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("dim"),
+            "Inactive style should be dim, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_emphasis_style_is_bold() {
+        let style = styles::emphasis();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("bold"),
+            "Emphasis style should be bold, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_healthy_style_is_bold() {
+        let style = styles::healthy();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("bold"),
+            "Healthy style should be bold, got: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_unhealthy_style_is_bold() {
+        let style = styles::unhealthy();
+        let debug = format!("{:?}", style);
+        assert!(
+            debug.to_lowercase().contains("bold"),
+            "Unhealthy style should be bold, got: {}",
+            debug
+        );
+    }
+
+    // =========================================================================
+    // styles::health() Function Tests
+    // =========================================================================
+
     #[test]
     fn test_health_style_mapping() {
         // Test the health() function with various inputs
@@ -437,5 +825,159 @@ mod tests {
         let _ = styles::health("unhealthy");
         let _ = styles::health("unknown");
         let _ = styles::health("anything_else");
+    }
+
+    #[test]
+    fn test_health_style_case_insensitive() {
+        // All case variations should work
+        let healthy_lower = format!("{:?}", styles::health("healthy"));
+        let healthy_upper = format!("{:?}", styles::health("HEALTHY"));
+        let healthy_mixed = format!("{:?}", styles::health("Healthy"));
+
+        assert_eq!(healthy_lower, healthy_upper);
+        assert_eq!(healthy_lower, healthy_mixed);
+    }
+
+    #[test]
+    fn test_health_style_returns_unknown_for_invalid() {
+        let unknown_style = format!("{:?}", styles::health("unknown"));
+        let invalid_style = format!("{:?}", styles::health("invalid"));
+        let empty_style = format!("{:?}", styles::health(""));
+
+        assert_eq!(unknown_style, invalid_style);
+        assert_eq!(unknown_style, empty_style);
+    }
+
+    #[test]
+    fn test_health_styles_are_distinct() {
+        let healthy = format!("{:?}", styles::health("healthy"));
+        let degraded = format!("{:?}", styles::health("degraded"));
+        let unhealthy = format!("{:?}", styles::health("unhealthy"));
+
+        // Each status should have a distinct style
+        assert_ne!(healthy, degraded);
+        assert_ne!(healthy, unhealthy);
+        assert_ne!(degraded, unhealthy);
+    }
+
+    // =========================================================================
+    // Style Consistency Tests
+    // =========================================================================
+
+    #[test]
+    fn test_active_and_header_use_same_color() {
+        // Both should use primary color (cyan family: ANSI 6 or 14)
+        let header = format!("{:?}", styles::header());
+        let active = format!("{:?}", styles::active());
+
+        // Both should contain the primary/cyan color
+        assert!(
+            header.to_lowercase().contains("cyan") || color_matches_ansi(&header, &[6, 14]),
+            "Header should use primary (cyan) color"
+        );
+        assert!(
+            active.to_lowercase().contains("cyan") || color_matches_ansi(&active, &[6, 14]),
+            "Active should use primary (cyan) color"
+        );
+    }
+
+    #[test]
+    fn test_muted_and_timestamp_use_same_color() {
+        // Both should use bright_black/gray
+        let t = Theme::default();
+        let muted = format!("{:?}", t.muted);
+        let timestamp = format!("{:?}", t.timestamp);
+
+        assert_eq!(muted, timestamp, "Muted and timestamp should use the same color");
+    }
+
+    // =========================================================================
+    // Color Fallback Tests - Ensure fallbacks work
+    // =========================================================================
+
+    #[test]
+    fn test_color_fallback_mechanism() {
+        // The theme uses Color::parse() with fallback to ANSI codes
+        // This test ensures the fallback mechanism doesn't panic
+        // and produces valid colors even if Color::parse fails
+
+        let t = Theme::default();
+
+        // All fields should be populated regardless of parse success
+        let colors = vec![
+            &t.success,
+            &t.warning,
+            &t.error,
+            &t.info,
+            &t.primary,
+            &t.secondary,
+            &t.muted,
+            &t.highlight,
+            &t.healthy,
+            &t.degraded,
+            &t.unhealthy,
+            &t.unknown,
+            &t.bytes,
+            &t.latency,
+            &t.timestamp,
+            &t.domain,
+            &t.ip,
+            &t.provider,
+        ];
+
+        for color in colors {
+            // Each color should have a non-empty Debug representation
+            let debug = format!("{:?}", color);
+            assert!(!debug.is_empty(), "Color should have non-empty debug output");
+            // Color struct has "number: Some(N)" or "number: None" - we want Some
+            // The format is: Color { name: "color(N)", color_type: Standard, number: Some(N), triplet: None }
+            // We check that there's a valid color number assigned
+            assert!(
+                debug.contains("number: Some("),
+                "Color should have a number assigned: {}",
+                debug
+            );
+        }
+    }
+
+    // =========================================================================
+    // Theme Debug Implementation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_theme_debug_contains_all_fields() {
+        let t = Theme::default();
+        let debug = format!("{:?}", t);
+
+        // Debug output should contain all field names
+        let expected_fields = [
+            "success",
+            "warning",
+            "error",
+            "info",
+            "primary",
+            "secondary",
+            "muted",
+            "highlight",
+            "healthy",
+            "degraded",
+            "unhealthy",
+            "unknown",
+            "bytes",
+            "latency",
+            "timestamp",
+            "domain",
+            "ip",
+            "provider",
+        ];
+
+        for field in expected_fields {
+            assert!(
+                debug.contains(field),
+                "Theme debug should contain field '{}', got: {}",
+                field,
+                debug
+            );
+        }
     }
 }
