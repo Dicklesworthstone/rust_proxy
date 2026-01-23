@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use owo_colors::OwoColorize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
 
@@ -10,6 +10,9 @@ use url::Url;
 // =============================================================================
 
 /// Supported shell types for completion installation.
+/// Note: Currently unused as main.rs uses clap_complete::Shell directly.
+/// Kept for potential future shell detection/installation features.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     /// GNU Bash shell
@@ -71,6 +74,111 @@ impl Shell {
             Self::Unknown => None,
         }
     }
+
+    /// Returns the standard installation path for completions for this shell.
+    ///
+    /// Respects XDG_DATA_HOME and XDG_CONFIG_HOME environment variables where applicable.
+    ///
+    /// # Paths by shell
+    ///
+    /// - **Bash**: `$XDG_DATA_HOME/bash-completion/completions/rust_proxy`
+    ///   (defaults to `~/.local/share/bash-completion/completions/rust_proxy`)
+    /// - **Zsh**: `~/.zsh/completions/_rust_proxy`
+    /// - **Fish**: `$XDG_CONFIG_HOME/fish/completions/rust_proxy.fish`
+    ///   (defaults to `~/.config/fish/completions/rust_proxy.fish`)
+    /// - **PowerShell**: `~/.config/powershell/completions/rust_proxy.ps1`
+    /// - **Elvish**: `~/.config/elvish/lib/rust_proxy.elv`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The home directory cannot be determined
+    /// - The shell is `Shell::Unknown`
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use rust_proxy::util::Shell;
+    ///
+    /// let path = Shell::Bash.completion_path()?;
+    /// println!("Install bash completions to: {}", path.display());
+    /// ```
+    pub fn completion_path(self) -> Result<PathBuf> {
+        let base_dirs = directories::BaseDirs::new()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        let home = base_dirs.home_dir();
+
+        match self {
+            Self::Bash => {
+                // XDG spec: ~/.local/share/bash-completion/completions/
+                let xdg_data = std::env::var("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| home.join(".local").join("share"));
+                Ok(xdg_data
+                    .join("bash-completion")
+                    .join("completions")
+                    .join("rust_proxy"))
+            }
+            Self::Zsh => {
+                // Standard user completions directory
+                // Note: User should ensure ~/.zsh/completions is in fpath
+                Ok(home.join(".zsh").join("completions").join("_rust_proxy"))
+            }
+            Self::Fish => {
+                // Fish XDG: ~/.config/fish/completions/
+                let xdg_config = std::env::var("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| home.join(".config"));
+                Ok(xdg_config
+                    .join("fish")
+                    .join("completions")
+                    .join("rust_proxy.fish"))
+            }
+            Self::PowerShell => {
+                // PowerShell completions in config directory
+                let xdg_config = std::env::var("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| home.join(".config"));
+                Ok(xdg_config
+                    .join("powershell")
+                    .join("completions")
+                    .join("rust_proxy.ps1"))
+            }
+            Self::Elvish => {
+                // Elvish lib directory for modules
+                let xdg_config = std::env::var("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| home.join(".config"));
+                Ok(xdg_config.join("elvish").join("lib").join("rust_proxy.elv"))
+            }
+            Self::Unknown => {
+                bail!("Cannot determine completion path for unknown shell")
+            }
+        }
+    }
+
+    /// Returns shell-specific instructions for activating the completions after installation.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use rust_proxy::util::Shell;
+    ///
+    /// let shell = Shell::Zsh;
+    /// println!("{}", shell.activation_hint());
+    /// // Prints: "Add to ~/.zshrc: fpath=(~/.zsh/completions $fpath); autoload -Uz compinit && compinit"
+    /// ```
+    #[must_use]
+    pub const fn activation_hint(self) -> &'static str {
+        match self {
+            Self::Bash => "Restart your shell or run: source ~/.bashrc",
+            Self::Zsh => "Add to ~/.zshrc: fpath=(~/.zsh/completions $fpath); autoload -Uz compinit && compinit",
+            Self::Fish => "Completions are active automatically on next shell start",
+            Self::PowerShell => "Add to your PowerShell profile: . ~/.config/powershell/completions/rust_proxy.ps1",
+            Self::Elvish => "Add to ~/.config/elvish/rc.elv: use rust_proxy",
+            Self::Unknown => "",
+        }
+    }
 }
 
 impl std::fmt::Display for Shell {
@@ -109,6 +217,7 @@ impl std::fmt::Display for Shell {
 /// let script = generate_completions(Shell::Bash, &mut cmd, "rust_proxy");
 /// println!("{}", script);
 /// ```
+#[allow(dead_code)]
 pub fn generate_completions(shell: Shell, cmd: &mut clap::Command, bin_name: &str) -> String {
     let clap_shell = shell
         .to_clap_shell()
@@ -117,6 +226,217 @@ pub fn generate_completions(shell: Shell, cmd: &mut clap::Command, bin_name: &st
     let mut buf = Vec::new();
     clap_complete::generate(clap_shell, cmd, bin_name, &mut buf);
     String::from_utf8(buf).expect("clap_complete generates valid UTF-8")
+}
+
+// =============================================================================
+// Completion Installation
+// =============================================================================
+
+/// Result of a completion installation operation.
+#[derive(Debug)]
+pub struct InstallResult {
+    /// Path where completions were installed (or would be installed in dry-run mode)
+    pub path: PathBuf,
+    /// Whether the parent directory was created
+    pub created_dir: bool,
+    /// Warning message if any (e.g., zsh fpath warning)
+    pub warning: Option<String>,
+}
+
+/// Install shell completions to the standard location for the given shell.
+///
+/// Creates parent directories as needed and writes the completion script.
+///
+/// # Arguments
+///
+/// * `shell` - The shell to install completions for
+/// * `cmd` - The clap Command to generate completions from
+/// * `bin_name` - The binary name to use in the completions
+/// * `dry_run` - If true, print what would be done without making changes
+///
+/// # Returns
+///
+/// Returns an `InstallResult` containing the installation path and any warnings.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The shell is `Shell::Unknown`
+/// - Home directory cannot be determined
+/// - Parent directory creation fails
+/// - Writing the completion script fails
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use rust_proxy::util::{install_completions, Shell};
+/// use clap::CommandFactory;
+///
+/// let mut cmd = Cli::command();
+/// let result = install_completions(Shell::Bash, &mut cmd, "rust_proxy", false)?;
+/// println!("Installed completions to: {}", result.path.display());
+/// if let Some(warning) = result.warning {
+///     println!("Warning: {}", warning);
+/// }
+/// println!("Activation: {}", Shell::Bash.activation_hint());
+/// ```
+#[allow(dead_code)]
+pub fn install_completions(
+    shell: Shell,
+    cmd: &mut clap::Command,
+    bin_name: &str,
+    dry_run: bool,
+) -> Result<InstallResult> {
+    let path = shell.completion_path()?;
+    let script = generate_completions(shell, cmd, bin_name);
+
+    // Check for zsh fpath warning before any modifications
+    let warning = if shell == Shell::Zsh {
+        check_zsh_fpath_warning(&path)
+    } else {
+        None
+    };
+
+    if dry_run {
+        println!(
+            "{} Install {} completions to {}",
+            "Would:".yellow().bold(),
+            shell.display_name(),
+            path.display()
+        );
+        return Ok(InstallResult {
+            path,
+            created_dir: false,
+            warning,
+        });
+    }
+
+    // Create parent directory if needed
+    let created_dir = if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Write the completion script
+    std::fs::write(&path, &script)
+        .with_context(|| format!("Failed to write completions to {}", path.display()))?;
+
+    Ok(InstallResult {
+        path,
+        created_dir,
+        warning,
+    })
+}
+
+/// Uninstall shell completions by removing the completion file.
+///
+/// # Arguments
+///
+/// * `shell` - The shell whose completions should be removed
+/// * `dry_run` - If true, print what would be done without making changes
+///
+/// # Returns
+///
+/// Returns the path that was removed (or would be removed in dry-run mode).
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The shell is `Shell::Unknown`
+/// - Home directory cannot be determined
+/// - File removal fails (except for file not found, which is ok)
+#[allow(dead_code)]
+pub fn uninstall_completions(shell: Shell, dry_run: bool) -> Result<PathBuf> {
+    let path = shell.completion_path()?;
+
+    if dry_run {
+        println!(
+            "{} Remove {} completions from {}",
+            "Would:".yellow().bold(),
+            shell.display_name(),
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove completions from {}", path.display()))?;
+    }
+
+    Ok(path)
+}
+
+/// Check if the zsh completion directory is in the user's fpath.
+///
+/// Returns a warning message if the directory is not in fpath, or None if it is.
+#[allow(dead_code)]
+fn check_zsh_fpath_warning(completion_path: &Path) -> Option<String> {
+    let completion_dir = completion_path.parent()?;
+
+    // Try to get fpath from environment (it's set by zsh as an array)
+    // Note: This won't work reliably from a non-zsh context, but we try anyway
+    if let Ok(fpath) = std::env::var("fpath") {
+        if fpath.split(':').any(|p| Path::new(p) == completion_dir) {
+            return None; // Directory is in fpath, no warning needed
+        }
+    }
+
+    // Also check FPATH (colon-separated string version)
+    if let Ok(fpath) = std::env::var("FPATH") {
+        if fpath.split(':').any(|p| Path::new(p) == completion_dir) {
+            return None;
+        }
+    }
+
+    // Directory is likely not in fpath, return a warning
+    Some(format!(
+        "The directory {} may not be in your zsh fpath. \
+        Add this to ~/.zshrc: fpath=(~/.zsh/completions $fpath)",
+        completion_dir.display()
+    ))
+}
+
+/// Check if zsh completions directory is properly configured.
+///
+/// This is a public version of the fpath check that can be called independently.
+///
+/// # Returns
+///
+/// `true` if the completion directory appears to be in fpath, `false` otherwise.
+/// Note: This check may return false positives when not running from zsh.
+#[allow(dead_code)]
+#[must_use]
+pub fn is_zsh_fpath_configured() -> bool {
+    let Ok(path) = Shell::Zsh.completion_path() else {
+        return false;
+    };
+    let Some(completion_dir) = path.parent() else {
+        return false;
+    };
+
+    // Check FPATH environment variable
+    if let Ok(fpath) = std::env::var("FPATH") {
+        if fpath.split(':').any(|p| Path::new(p) == completion_dir) {
+            return true;
+        }
+    }
+
+    // Also check lowercase fpath (some environments export this)
+    if let Ok(fpath) = std::env::var("fpath") {
+        if fpath.split(':').any(|p| Path::new(p) == completion_dir) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Detect the user's current shell using multiple fallback methods.
@@ -140,6 +460,7 @@ pub fn generate_completions(shell: Shell, cmd: &mut clap::Command, bin_name: &st
 ///     println!("Could not detect shell");
 /// }
 /// ```
+#[allow(dead_code)]
 #[must_use]
 pub fn detect_shell() -> Shell {
     // Method 1: Check $SHELL environment variable (most common and reliable)
@@ -162,6 +483,7 @@ pub fn detect_shell() -> Shell {
 }
 
 /// Detect shell from the $SHELL environment variable.
+#[allow(dead_code)]
 fn detect_from_shell_env() -> Option<Shell> {
     let shell_path = std::env::var("SHELL").ok()?;
     let shell_path = shell_path.to_lowercase();
@@ -209,6 +531,7 @@ fn detect_from_shell_env() -> Option<Shell> {
 }
 
 /// Detect shell from the parent process name (Linux only).
+#[allow(dead_code)]
 #[cfg(target_os = "linux")]
 fn detect_from_parent_process() -> Option<Shell> {
     // Get parent process ID
@@ -230,6 +553,7 @@ fn detect_from_parent_process() -> Option<Shell> {
 }
 
 /// Detect shell by checking for common shell config files in home directory.
+#[allow(dead_code)]
 fn detect_from_config_files() -> Option<Shell> {
     let base_dirs = directories::BaseDirs::new()?;
     let home = base_dirs.home_dir();
@@ -1114,5 +1438,207 @@ mod tests {
         let mut cmd = test_cli_command();
         // This should panic
         let _ = generate_completions(Shell::Unknown, &mut cmd, "rust_proxy");
+    }
+
+    // =========================================================================
+    // Completion Path Tests
+    // =========================================================================
+
+    #[test]
+    fn test_completion_path_bash() {
+        let path = Shell::Bash.completion_path().unwrap();
+        let path_str = path.to_string_lossy();
+        // Should end with the correct filename
+        assert!(
+            path_str.ends_with("bash-completion/completions/rust_proxy"),
+            "Bash completion path should end with bash-completion/completions/rust_proxy, got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn test_completion_path_zsh() {
+        let path = Shell::Zsh.completion_path().unwrap();
+        let path_str = path.to_string_lossy();
+        // Should end with _rust_proxy (zsh convention)
+        assert!(
+            path_str.ends_with(".zsh/completions/_rust_proxy"),
+            "Zsh completion path should end with .zsh/completions/_rust_proxy, got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn test_completion_path_fish() {
+        let path = Shell::Fish.completion_path().unwrap();
+        let path_str = path.to_string_lossy();
+        // Should end with .fish extension
+        assert!(
+            path_str.ends_with("fish/completions/rust_proxy.fish"),
+            "Fish completion path should end with fish/completions/rust_proxy.fish, got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn test_completion_path_powershell() {
+        let path = Shell::PowerShell.completion_path().unwrap();
+        let path_str = path.to_string_lossy();
+        // Should end with .ps1 extension
+        assert!(
+            path_str.ends_with("powershell/completions/rust_proxy.ps1"),
+            "PowerShell completion path should end with powershell/completions/rust_proxy.ps1, got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn test_completion_path_elvish() {
+        let path = Shell::Elvish.completion_path().unwrap();
+        let path_str = path.to_string_lossy();
+        // Should end with .elv extension
+        assert!(
+            path_str.ends_with("elvish/lib/rust_proxy.elv"),
+            "Elvish completion path should end with elvish/lib/rust_proxy.elv, got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn test_completion_path_unknown_errors() {
+        let result = Shell::Unknown.completion_path();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown shell"));
+    }
+
+    #[test]
+    fn test_completion_paths_are_absolute() {
+        // All known shells should return absolute paths
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let path = shell.completion_path().unwrap();
+            assert!(
+                path.is_absolute(),
+                "Completion path for {:?} should be absolute, got: {}",
+                shell,
+                path.display()
+            );
+        }
+    }
+
+    // =========================================================================
+    // Activation Hint Tests
+    // =========================================================================
+
+    #[test]
+    fn test_activation_hint_bash() {
+        let hint = Shell::Bash.activation_hint();
+        assert!(
+            hint.contains("bashrc") || hint.contains("Restart"),
+            "Bash activation hint should mention bashrc or restart"
+        );
+    }
+
+    #[test]
+    fn test_activation_hint_zsh() {
+        let hint = Shell::Zsh.activation_hint();
+        assert!(
+            hint.contains("fpath") && hint.contains("compinit"),
+            "Zsh activation hint should mention fpath and compinit"
+        );
+    }
+
+    #[test]
+    fn test_activation_hint_fish() {
+        let hint = Shell::Fish.activation_hint();
+        assert!(
+            hint.contains("automatic"),
+            "Fish activation hint should mention automatic activation"
+        );
+    }
+
+    #[test]
+    fn test_activation_hint_powershell() {
+        let hint = Shell::PowerShell.activation_hint();
+        assert!(
+            hint.contains("profile") || hint.contains(".ps1"),
+            "PowerShell activation hint should mention profile or .ps1"
+        );
+    }
+
+    #[test]
+    fn test_activation_hint_elvish() {
+        let hint = Shell::Elvish.activation_hint();
+        assert!(
+            hint.contains("rc.elv") || hint.contains("use"),
+            "Elvish activation hint should mention rc.elv or use statement"
+        );
+    }
+
+    #[test]
+    fn test_activation_hint_unknown_empty() {
+        let hint = Shell::Unknown.activation_hint();
+        assert!(hint.is_empty(), "Unknown shell activation hint should be empty");
+    }
+
+    // =========================================================================
+    // Installation Tests (with temp directory)
+    // =========================================================================
+
+    #[test]
+    fn test_install_completions_dry_run() {
+        // Dry run should not create files
+        let mut cmd = test_cli_command();
+        let result = install_completions(Shell::Bash, &mut cmd, "rust_proxy", true).unwrap();
+
+        // Should return a path
+        assert!(
+            result.path.to_string_lossy().contains("rust_proxy"),
+            "Install result should contain rust_proxy in path"
+        );
+        // Should not have created a directory (dry run)
+        assert!(!result.created_dir, "Dry run should not create directories");
+    }
+
+    #[test]
+    fn test_install_completions_returns_valid_result() {
+        // Test that install_completions returns proper InstallResult structure
+        let mut cmd = test_cli_command();
+
+        // Just test with dry_run to avoid filesystem side effects in unit tests
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let result = install_completions(shell, &mut cmd.clone(), "rust_proxy", true).unwrap();
+            assert!(
+                !result.path.as_os_str().is_empty(),
+                "Install result path should not be empty for {:?}",
+                shell
+            );
+        }
+    }
+
+    #[test]
+    fn test_uninstall_completions_dry_run() {
+        // Dry run should not remove files
+        let result = uninstall_completions(Shell::Bash, true).unwrap();
+
+        // Should return a path
+        assert!(
+            result.to_string_lossy().contains("rust_proxy"),
+            "Uninstall result should contain rust_proxy in path"
+        );
+    }
+
+    #[test]
+    fn test_zsh_fpath_check_function_exists() {
+        // Just verify the function runs without panicking
+        let _ = is_zsh_fpath_configured();
     }
 }

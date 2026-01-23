@@ -112,6 +112,15 @@ impl StateStore {
         })
     }
 
+    /// Create an in-memory StateStore for testing (no file persistence)
+    #[cfg(test)]
+    pub fn new_for_testing() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(State::default())),
+            path: PathBuf::from("/tmp/test-state.json"),
+        }
+    }
+
     pub async fn record_activated(&self, proxy_id: &str, at: DateTime<Utc>) {
         let mut state = self.inner.write().await;
         let stats = state.proxies.entry(proxy_id.to_string()).or_default();
@@ -484,4 +493,224 @@ pub struct RuntimeStateSnapshot {
 pub struct DegradationStatus {
     pub unhealthy_since: DateTime<Utc>,
     pub active: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RuntimeState degradation tracking tests
+
+    #[tokio::test]
+    async fn test_runtime_state_initial_not_degraded() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+        assert!(!state.is_degraded().await);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_degradation_delay_debounces() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+        let delay_secs = 2;
+
+        // All proxies become unhealthy - should not immediately degrade
+        let healthy: Vec<String> = vec![];
+        let changed = state.update_degradation_state(&healthy, delay_secs).await;
+        assert!(!changed); // Not yet degraded
+        assert!(!state.is_degraded().await);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_degradation_activates_after_delay() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+        let delay_secs = 0; // Zero delay means immediate activation
+
+        // With zero delay, degradation should activate immediately
+        let healthy: Vec<String> = vec![];
+        let _changed = state.update_degradation_state(&healthy, delay_secs).await;
+        assert!(state.is_degraded().await);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_recovery_resets_degradation() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // First, trigger degradation with zero delay
+        let empty: Vec<String> = vec![];
+        state.update_degradation_state(&empty, 0).await;
+        assert!(state.is_degraded().await);
+
+        // Now a proxy becomes healthy - should reset
+        let healthy = vec!["proxy-a".to_string()];
+        state.update_degradation_state(&healthy, 0).await;
+        assert!(!state.is_degraded().await);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_degradation_status_tracking() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Initially no degradation status
+        assert!(state.get_degradation_status().await.is_none());
+
+        // After all unhealthy, should have status
+        let empty: Vec<String> = vec![];
+        state.update_degradation_state(&empty, 5).await;
+        let status = state.get_degradation_status().await;
+        assert!(status.is_some());
+        let status = status.unwrap();
+        assert!(!status.active); // Not yet active (delay not elapsed)
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_failover_tracking() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Initially not failed over
+        assert!(!state.is_failed_over().await);
+        assert_eq!(
+            state.get_effective_proxy().await,
+            Some("proxy-a".to_string())
+        );
+
+        // Perform failover
+        state.failover_to("proxy-b").await;
+        assert!(state.is_failed_over().await);
+        assert_eq!(
+            state.get_effective_proxy().await,
+            Some("proxy-b".to_string())
+        );
+        assert_eq!(
+            state.get_original_proxy().await,
+            Some("proxy-a".to_string())
+        );
+
+        // Perform failback
+        state.failback().await;
+        assert!(!state.is_failed_over().await);
+        assert_eq!(
+            state.get_effective_proxy().await,
+            Some("proxy-a".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_failback_delay() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Initially failback delay has not passed (no recovery detected)
+        assert!(!state.failback_delay_passed(5).await);
+
+        // Record recovery
+        state.record_recovery_detected().await;
+
+        // With 0 delay, should pass immediately
+        assert!(state.failback_delay_passed(0).await);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_recovery_detection_cleared() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Record recovery
+        state.record_recovery_detected().await;
+        assert!(state.failback_delay_passed(0).await);
+
+        // Clear recovery (proxy failed again)
+        state.clear_recovery_detected().await;
+        assert!(!state.failback_delay_passed(0).await);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_state_snapshot() {
+        let state = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Get initial snapshot
+        let snapshot = state.get_status_snapshot().await;
+        assert_eq!(snapshot.effective_proxy, Some("proxy-a".to_string()));
+        assert_eq!(snapshot.original_proxy, Some("proxy-a".to_string()));
+        assert!(!snapshot.is_failed_over);
+        assert!(!snapshot.degradation_active);
+        assert!(snapshot.all_unhealthy_since.is_none());
+    }
+
+    // StateStore tests
+
+    #[tokio::test]
+    async fn test_state_store_last_healthy_proxy() {
+        let store = StateStore::new_for_testing();
+
+        // Initially no last healthy proxy
+        assert!(store.get_last_healthy_proxy().await.is_none());
+
+        // Record a health check success
+        store
+            .record_health_check("proxy-a", true, Some(50.0), None, 3)
+            .await;
+
+        // Now should have last healthy proxy
+        assert_eq!(
+            store.get_last_healthy_proxy().await,
+            Some("proxy-a".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_store_health_status_tracking() {
+        let store = StateStore::new_for_testing();
+
+        // Initially unknown status
+        assert_eq!(
+            store.get_health_status("proxy-a").await,
+            HealthStatus::Unknown
+        );
+
+        // Record success - should become healthy
+        store
+            .record_health_check("proxy-a", true, Some(50.0), None, 3)
+            .await;
+        assert_eq!(
+            store.get_health_status("proxy-a").await,
+            HealthStatus::Healthy
+        );
+
+        // Record failures - after threshold should become unhealthy
+        for _ in 0..3 {
+            store
+                .record_health_check("proxy-a", false, None, Some("timeout".to_string()), 3)
+                .await;
+        }
+        assert_eq!(
+            store.get_health_status("proxy-a").await,
+            HealthStatus::Unhealthy
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_store_healthy_proxies_list() {
+        let store = StateStore::new_for_testing();
+
+        // No healthy proxies initially
+        assert!(store.get_healthy_proxies().await.is_empty());
+
+        // Add some healthy proxies
+        store
+            .record_health_check("proxy-a", true, Some(50.0), None, 3)
+            .await;
+        store
+            .record_health_check("proxy-b", true, Some(60.0), None, 3)
+            .await;
+
+        let healthy = store.get_healthy_proxies().await;
+        assert_eq!(healthy.len(), 2);
+        assert!(healthy.contains(&"proxy-a".to_string()));
+        assert!(healthy.contains(&"proxy-b".to_string()));
+    }
+
+    #[test]
+    fn test_health_status_display() {
+        assert_eq!(format!("{}", HealthStatus::Unknown), "unknown");
+        assert_eq!(format!("{}", HealthStatus::Healthy), "healthy");
+        assert_eq!(format!("{}", HealthStatus::Degraded), "degraded");
+        assert_eq!(format!("{}", HealthStatus::Unhealthy), "unhealthy");
+    }
 }

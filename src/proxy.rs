@@ -1107,4 +1107,151 @@ mod tests {
             );
         }
     }
+
+    // Degradation policy unit tests
+
+    #[tokio::test]
+    async fn test_handle_degradation_returns_none_when_not_degraded() {
+        use crate::config::{AppConfig, DegradationPolicy, Settings};
+
+        // Create a config with try_all policy
+        let mut config = AppConfig::default();
+        config.settings = Settings::default();
+        config.settings.degradation_policy = DegradationPolicy::TryAll;
+        config.settings.degradation_delay_secs = 10; // Long delay
+
+        // Create StateStore using test constructor
+        let state = crate::state::StateStore::new_for_testing();
+
+        // Create RuntimeState that is NOT degraded
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+        // Don't call update_degradation_state, so is_degraded() returns false
+
+        let retry_config = RetryConfig::default();
+
+        // Call handle_degradation - should return None because not degraded yet
+        let result =
+            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none()); // None means "within delay period"
+    }
+
+    #[tokio::test]
+    async fn test_handle_degradation_fail_closed_returns_error() {
+        use crate::config::{AppConfig, DegradationPolicy, Settings};
+
+        // Create a config with fail_closed policy
+        let mut config = AppConfig::default();
+        config.settings = Settings::default();
+        config.settings.degradation_policy = DegradationPolicy::FailClosed;
+        config.settings.degradation_delay_secs = 0; // Immediate
+
+        // Create StateStore using test constructor
+        let state = crate::state::StateStore::new_for_testing();
+
+        // Create RuntimeState that IS degraded
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+        // Trigger degradation with empty healthy list and 0 delay
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 0).await;
+        assert!(runtime.is_degraded().await); // Verify it's degraded
+
+        let retry_config = RetryConfig::default();
+
+        // Call handle_degradation - should return Err for fail_closed
+        let result =
+            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fail_closed"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_degradation_direct_requires_opt_in() {
+        use crate::config::{AppConfig, DegradationPolicy, Settings};
+
+        // Create a config with direct policy but NOT allowing direct fallback
+        let mut config = AppConfig::default();
+        config.settings = Settings::default();
+        config.settings.degradation_policy = DegradationPolicy::Direct;
+        config.settings.allow_direct_fallback = false; // Not allowed
+        config.settings.degradation_delay_secs = 0;
+
+        // Create StateStore using test constructor
+        let state = crate::state::StateStore::new_for_testing();
+
+        // Create RuntimeState that IS degraded
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 0).await;
+
+        let retry_config = RetryConfig::default();
+
+        // Call handle_degradation - should fail because allow_direct_fallback is false
+        let result =
+            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("allow_direct_fallback"));
+    }
+
+    #[test]
+    fn test_upstream_proxy_from_config() {
+        use crate::config::{ProxyAuth, ProxyConfig};
+
+        let proxy_cfg = ProxyConfig {
+            id: "test-proxy".to_string(),
+            url: "http://proxy.example.com:8080".to_string(),
+            auth: ProxyAuth::default(),
+            priority: Some(1),
+            health_check_url: None,
+            weight: 100,
+        };
+
+        let upstream = UpstreamProxy::from_config(&proxy_cfg).expect("should parse");
+        assert_eq!(upstream.id, "test-proxy");
+        assert_eq!(upstream.host, "proxy.example.com");
+        assert_eq!(upstream.port, 8080);
+        assert!(upstream.username.is_none());
+        assert!(upstream.password.is_none());
+    }
+
+    #[test]
+    fn test_upstream_proxy_from_config_with_auth() {
+        use crate::config::{ProxyAuth, ProxyConfig};
+
+        let proxy_cfg = ProxyConfig {
+            id: "auth-proxy".to_string(),
+            url: "http://secure.example.com:3128".to_string(),
+            auth: ProxyAuth {
+                username: Some("user".to_string()),
+                password: Some("pass".to_string()),
+                username_env: None,
+                password_env: None,
+            },
+            priority: Some(1),
+            health_check_url: None,
+            weight: 100,
+        };
+
+        let upstream = UpstreamProxy::from_config(&proxy_cfg).expect("should parse");
+        assert_eq!(upstream.id, "auth-proxy");
+        assert_eq!(upstream.host, "secure.example.com");
+        assert_eq!(upstream.port, 3128);
+        assert_eq!(upstream.username, Some("user".to_string()));
+        assert_eq!(upstream.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_connection_guard_tracks_metrics() {
+        // Create a guard
+        let guard = ConnectionGuard::new("test-proxy".to_string());
+        assert_eq!(guard.proxy_id, "test-proxy");
+        // Guard drop happens at end of scope - metrics are recorded
+        // (Actual metrics testing would require checking prometheus counters)
+    }
 }

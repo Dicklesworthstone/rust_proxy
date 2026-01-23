@@ -35,10 +35,31 @@ pub fn ensure_ipset(ipset_name: &str) -> Result<()> {
 }
 
 pub fn sync_ipset(ipset_name: &str, ips: &HashSet<String>) -> Result<()> {
-    run("ipset", &["flush", ipset_name])?;
+    // Atomically update the ipset by creating a temp set, swapping, and destroying the old one.
+    // This prevents a window where the set is empty (after flush) which would leak traffic.
+    let temp_name = format!("{}_tmp", ipset_name);
+
+    // 1. Create temporary set (must match the type of the main set)
+    run(
+        "ipset",
+        &["create", &temp_name, "hash:net", "family", "inet", "-exist"],
+    )?;
+
+    // 2. Flush the temp set to ensure it's clean
+    run("ipset", &["flush", &temp_name])?;
+
+    // 3. Populate the temp set
     for ip in ips {
-        run("ipset", &["add", ipset_name, ip, "-exist"])?;
+        run("ipset", &["add", &temp_name, ip, "-exist"])?;
     }
+
+    // 4. Swap the main set with the temp set
+    // This is atomic: the main set name now refers to the new content
+    run("ipset", &["swap", ipset_name, &temp_name])?;
+
+    // 5. Destroy the temporary set (which now holds the old content)
+    run("ipset", &["destroy", &temp_name])?;
+
     Ok(())
 }
 
