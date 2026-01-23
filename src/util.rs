@@ -1508,10 +1508,7 @@ mod tests {
     fn test_completion_path_unknown_errors() {
         let result = Shell::Unknown.completion_path();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unknown shell"));
+        assert!(result.unwrap_err().to_string().contains("unknown shell"));
     }
 
     #[test]
@@ -1586,7 +1583,10 @@ mod tests {
     #[test]
     fn test_activation_hint_unknown_empty() {
         let hint = Shell::Unknown.activation_hint();
-        assert!(hint.is_empty(), "Unknown shell activation hint should be empty");
+        assert!(
+            hint.is_empty(),
+            "Unknown shell activation hint should be empty"
+        );
     }
 
     // =========================================================================

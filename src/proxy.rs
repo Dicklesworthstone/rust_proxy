@@ -1458,7 +1458,7 @@ mod tests {
         assert!(status.is_some());
         let status = status.unwrap();
         assert!(!status.active); // Not yet active (delay not elapsed)
-        // unhealthy_since is a DateTime, not Option - if we have DegradationStatus, tracking has started
+                                 // unhealthy_since is a DateTime, not Option - if we have DegradationStatus, tracking has started
         let _ = status.unhealthy_since; // Verify it's accessible (tracking started)
     }
 

@@ -489,7 +489,13 @@ mod tests {
             .await;
         for _ in 0..3 {
             state
-                .record_health_check("proxy-b", false, None, Some("connection refused".to_string()), 3)
+                .record_health_check(
+                    "proxy-b",
+                    false,
+                    None,
+                    Some("connection refused".to_string()),
+                    3,
+                )
                 .await;
         }
 
@@ -515,7 +521,13 @@ mod tests {
         // Both proxies unhealthy
         for _ in 0..3 {
             state
-                .record_health_check("proxy-a", false, None, Some("connection refused".to_string()), 3)
+                .record_health_check(
+                    "proxy-a",
+                    false,
+                    None,
+                    Some("connection refused".to_string()),
+                    3,
+                )
                 .await;
             state
                 .record_health_check("proxy-b", false, None, Some("timeout".to_string()), 3)
@@ -664,10 +676,7 @@ mod tests {
 
         // Single proxy should always be selected regardless of strategy
         for _ in 0..5 {
-            assert_eq!(
-                balancer.select_single(&refs),
-                Some("only-one".to_string())
-            );
+            assert_eq!(balancer.select_single(&refs), Some("only-one".to_string()));
             assert_eq!(
                 balancer.select_round_robin(&refs),
                 Some("only-one".to_string())

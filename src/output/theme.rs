@@ -888,7 +888,10 @@ mod tests {
         let muted = format!("{:?}", t.muted);
         let timestamp = format!("{:?}", t.timestamp);
 
-        assert_eq!(muted, timestamp, "Muted and timestamp should use the same color");
+        assert_eq!(
+            muted, timestamp,
+            "Muted and timestamp should use the same color"
+        );
     }
 
     // =========================================================================
@@ -928,7 +931,10 @@ mod tests {
         for color in colors {
             // Each color should have a non-empty Debug representation
             let debug = format!("{:?}", color);
-            assert!(!debug.is_empty(), "Color should have non-empty debug output");
+            assert!(
+                !debug.is_empty(),
+                "Color should have non-empty debug output"
+            );
             // Color struct has "number: Some(N)" or "number: None" - we want Some
             // The format is: Color { name: "color(N)", color_type: Standard, number: Some(N), triplet: None }
             // We check that there's a valid color number assigned
