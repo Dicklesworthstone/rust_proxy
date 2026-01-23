@@ -489,7 +489,7 @@ mod tests {
             .await;
         for _ in 0..3 {
             state
-                .record_health_check("proxy-b", false, None, Some("connection refused"), 3)
+                .record_health_check("proxy-b", false, None, Some("connection refused".to_string()), 3)
                 .await;
         }
 
@@ -515,10 +515,10 @@ mod tests {
         // Both proxies unhealthy
         for _ in 0..3 {
             state
-                .record_health_check("proxy-a", false, None, Some("connection refused"), 3)
+                .record_health_check("proxy-a", false, None, Some("connection refused".to_string()), 3)
                 .await;
             state
-                .record_health_check("proxy-b", false, None, Some("timeout"), 3)
+                .record_health_check("proxy-b", false, None, Some("timeout".to_string()), 3)
                 .await;
         }
 
@@ -563,7 +563,7 @@ mod tests {
             .await;
         for _ in 0..3 {
             state
-                .record_health_check("proxy-b", false, None, Some("refused"), 3)
+                .record_health_check("proxy-b", false, None, Some("refused".to_string()), 3)
                 .await;
         }
         state

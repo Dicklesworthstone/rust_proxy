@@ -1254,4 +1254,220 @@ mod tests {
         // Guard drop happens at end of scope - metrics are recorded
         // (Actual metrics testing would require checking prometheus counters)
     }
+
+    // Additional degradation policy unit tests
+
+    #[tokio::test]
+    async fn test_handle_degradation_try_all_with_no_proxies() {
+        use crate::config::{AppConfig, DegradationPolicy, Settings};
+
+        // Create a config with try_all policy but NO proxies configured
+        let mut config = AppConfig::default();
+        config.settings = Settings::default();
+        config.settings.degradation_policy = DegradationPolicy::TryAll;
+        config.settings.degradation_delay_secs = 0;
+        config.proxies = vec![]; // No proxies
+
+        let state = crate::state::StateStore::new_for_testing();
+
+        let runtime = RuntimeState::new(None);
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 0).await;
+        assert!(runtime.is_degraded().await);
+
+        let retry_config = RetryConfig::default();
+
+        // Call handle_degradation - should fail since no proxies to try
+        let result =
+            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No proxies"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_degradation_use_last_with_no_history() {
+        use crate::config::{AppConfig, DegradationPolicy, ProxyAuth, ProxyConfig, Settings};
+
+        // Create a config with use_last policy
+        let mut config = AppConfig::default();
+        config.settings = Settings::default();
+        config.settings.degradation_policy = DegradationPolicy::UseLast;
+        config.settings.degradation_delay_secs = 0;
+
+        // Add proxies to config
+        config.proxies = vec![
+            ProxyConfig {
+                id: "proxy-a".to_string(),
+                url: "http://proxy-a.invalid:8080".to_string(), // Non-routable for test
+                auth: ProxyAuth::default(),
+                priority: Some(1),
+                health_check_url: None,
+                weight: 100,
+            },
+            ProxyConfig {
+                id: "proxy-b".to_string(),
+                url: "http://proxy-b.invalid:8080".to_string(),
+                auth: ProxyAuth::default(),
+                priority: Some(2),
+                health_check_url: None,
+                weight: 100,
+            },
+        ];
+
+        // StateStore with NO last_healthy_proxy recorded
+        let state = crate::state::StateStore::new_for_testing();
+        // Don't record any health checks, so get_last_healthy_proxy returns None
+
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 0).await;
+
+        let retry_config = RetryConfig::default();
+
+        // Call handle_degradation - use_last should fail since no proxy was ever healthy
+        // It will try try_all as fallback, which will fail on connection attempt
+        let result =
+            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+
+        // Should fail because we can't connect to the invalid proxies
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_degradation_zero_delay_activates_immediately() {
+        use crate::config::{AppConfig, DegradationPolicy, Settings};
+
+        // Create a config with fail_closed policy and ZERO delay
+        let mut config = AppConfig::default();
+        config.settings = Settings::default();
+        config.settings.degradation_policy = DegradationPolicy::FailClosed;
+        config.settings.degradation_delay_secs = 0; // Immediate activation
+
+        let state = crate::state::StateStore::new_for_testing();
+
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // With zero delay, update_degradation_state should immediately activate
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 0).await;
+
+        // Verify degradation is active
+        assert!(runtime.is_degraded().await);
+
+        let retry_config = RetryConfig::default();
+
+        // Should immediately apply fail_closed (return error)
+        let result =
+            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fail_closed"));
+    }
+
+    #[tokio::test]
+    async fn test_degradation_policy_routing() {
+        use crate::config::DegradationPolicy;
+
+        // Test that each policy variant is distinct and recognized
+        let policies = [
+            DegradationPolicy::FailClosed,
+            DegradationPolicy::TryAll,
+            DegradationPolicy::UseLast,
+            DegradationPolicy::Direct,
+        ];
+
+        for policy in policies {
+            match policy {
+                DegradationPolicy::FailClosed => {
+                    assert_eq!(format!("{:?}", policy), "FailClosed");
+                }
+                DegradationPolicy::TryAll => {
+                    assert_eq!(format!("{:?}", policy), "TryAll");
+                }
+                DegradationPolicy::UseLast => {
+                    assert_eq!(format!("{:?}", policy), "UseLast");
+                }
+                DegradationPolicy::Direct => {
+                    assert_eq!(format!("{:?}", policy), "Direct");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_degradation_respects_delay_before_activation() {
+        use crate::config::{AppConfig, DegradationPolicy, Settings};
+
+        // Create a config with a non-zero delay
+        let mut config = AppConfig::default();
+        config.settings = Settings::default();
+        config.settings.degradation_policy = DegradationPolicy::FailClosed;
+        config.settings.degradation_delay_secs = 60; // Long delay
+
+        let state = crate::state::StateStore::new_for_testing();
+
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Mark all unhealthy but delay hasn't elapsed
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 60).await;
+
+        // Should NOT be degraded yet
+        assert!(!runtime.is_degraded().await);
+
+        let retry_config = RetryConfig::default();
+
+        // handle_degradation should return Ok(None) indicating within delay period
+        let result =
+            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none()); // None = within delay period
+    }
+
+    #[tokio::test]
+    async fn test_degradation_recovery_clears_degraded_state() {
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Trigger degradation
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 0).await;
+        assert!(runtime.is_degraded().await);
+
+        // Recovery - a proxy becomes healthy
+        let healthy = vec!["proxy-a".to_string()];
+        runtime.update_degradation_state(&healthy, 0).await;
+
+        // Should no longer be degraded
+        assert!(!runtime.is_degraded().await);
+    }
+
+    #[tokio::test]
+    async fn test_degradation_status_tracking() {
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+
+        // Initially no degradation status
+        let status = runtime.get_degradation_status().await;
+        assert!(status.is_none());
+
+        // After all unhealthy with delay, should have status but not active
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 60).await;
+        let status = runtime.get_degradation_status().await;
+        assert!(status.is_some());
+        let status = status.unwrap();
+        assert!(!status.active); // Not yet active (delay not elapsed)
+        // unhealthy_since is a DateTime, not Option - if we have DegradationStatus, tracking has started
+        let _ = status.unhealthy_since; // Verify it's accessible (tracking started)
+    }
+
+    #[test]
+    fn test_retry_config_default_values() {
+        let config = RetryConfig::default();
+
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.initial_backoff_ms, 100);
+        assert_eq!(config.max_backoff_ms, 5000);
+    }
 }
