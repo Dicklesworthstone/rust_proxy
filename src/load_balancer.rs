@@ -422,4 +422,260 @@ mod tests {
         // Should return 0.0 when total is 0, not panic
         assert_eq!(stats.percentage("any"), 0.0);
     }
+
+    #[tokio::test]
+    async fn test_least_latency_selects_fastest() {
+        use crate::state::StateStore;
+
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        // Set up latencies: proxy-b has lowest latency
+        state
+            .record_health_check("proxy-a", true, Some(100.0), None, 3)
+            .await;
+        state
+            .record_health_check("proxy-b", true, Some(50.0), None, 3)
+            .await;
+        state
+            .record_health_check("proxy-c", true, Some(150.0), None, 3)
+            .await;
+
+        let proxies = [
+            make_proxy("proxy-a", None, 100),
+            make_proxy("proxy-b", None, 100),
+            make_proxy("proxy-c", None, 100),
+        ];
+        let refs: Vec<_> = proxies.iter().collect();
+
+        let selected = balancer.select_least_latency(&refs, &state).await;
+        assert_eq!(selected, Some("proxy-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_least_latency_unknown_latency_treated_as_max() {
+        use crate::state::StateStore;
+
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        // Only proxy-a has known latency
+        state
+            .record_health_check("proxy-a", true, Some(100.0), None, 3)
+            .await;
+        // proxy-b has no latency recorded
+
+        let proxies = [
+            make_proxy("proxy-a", None, 100),
+            make_proxy("proxy-b", None, 100),
+        ];
+        let refs: Vec<_> = proxies.iter().collect();
+
+        // proxy-a should be selected since proxy-b has no latency data (treated as MAX)
+        let selected = balancer.select_least_latency(&refs, &state).await;
+        assert_eq!(selected, Some("proxy-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_select_proxy_filters_unhealthy() {
+        use crate::state::StateStore;
+
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        // proxy-a is healthy, proxy-b is unhealthy (3 failures)
+        state
+            .record_health_check("proxy-a", true, Some(100.0), None, 3)
+            .await;
+        for _ in 0..3 {
+            state
+                .record_health_check("proxy-b", false, None, Some("connection refused"), 3)
+                .await;
+        }
+
+        let proxies = [
+            make_proxy("proxy-a", None, 100),
+            make_proxy("proxy-b", Some(1), 100), // Higher priority but unhealthy
+        ];
+
+        // With Single strategy, should select proxy-a since proxy-b is unhealthy
+        let selected = balancer
+            .select_proxy(LoadBalanceStrategy::Single, &proxies, &state)
+            .await;
+        assert_eq!(selected, Some("proxy-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_select_proxy_returns_none_when_all_unhealthy() {
+        use crate::state::StateStore;
+
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        // Both proxies unhealthy
+        for _ in 0..3 {
+            state
+                .record_health_check("proxy-a", false, None, Some("connection refused"), 3)
+                .await;
+            state
+                .record_health_check("proxy-b", false, None, Some("timeout"), 3)
+                .await;
+        }
+
+        let proxies = [
+            make_proxy("proxy-a", None, 100),
+            make_proxy("proxy-b", None, 100),
+        ];
+
+        let selected = balancer
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .await;
+        assert_eq!(selected, None);
+    }
+
+    #[tokio::test]
+    async fn test_select_proxy_includes_unknown_status() {
+        use crate::state::StateStore;
+
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        // No health checks recorded - status is Unknown
+        let proxies = [make_proxy("proxy-a", None, 100)];
+
+        // Unknown status should be treated as eligible (select_proxy includes it)
+        let selected = balancer
+            .select_proxy(LoadBalanceStrategy::Single, &proxies, &state)
+            .await;
+        assert_eq!(selected, Some("proxy-a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_skips_unhealthy() {
+        use crate::state::StateStore;
+
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        // proxy-a and proxy-c healthy, proxy-b unhealthy
+        state
+            .record_health_check("proxy-a", true, Some(50.0), None, 3)
+            .await;
+        for _ in 0..3 {
+            state
+                .record_health_check("proxy-b", false, None, Some("refused"), 3)
+                .await;
+        }
+        state
+            .record_health_check("proxy-c", true, Some(50.0), None, 3)
+            .await;
+
+        let proxies = [
+            make_proxy("proxy-a", None, 100),
+            make_proxy("proxy-b", None, 100),
+            make_proxy("proxy-c", None, 100),
+        ];
+
+        // Round robin should only cycle through proxy-a and proxy-c
+        let s1 = balancer
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .await;
+        let s2 = balancer
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .await;
+        let s3 = balancer
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .await;
+
+        assert_eq!(s1, Some("proxy-a".to_string()));
+        assert_eq!(s2, Some("proxy-c".to_string()));
+        assert_eq!(s3, Some("proxy-a".to_string())); // cycles back
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_round_robin() {
+        use crate::state::StateStore;
+        use std::sync::Arc;
+
+        let balancer = Arc::new(LoadBalancer::new());
+        let state = Arc::new(StateStore::new_for_testing());
+
+        // Set up 3 healthy proxies
+        for id in ["proxy-a", "proxy-b", "proxy-c"] {
+            state
+                .record_health_check(id, true, Some(50.0), None, 3)
+                .await;
+        }
+
+        let proxies = Arc::new([
+            make_proxy("proxy-a", None, 100),
+            make_proxy("proxy-b", None, 100),
+            make_proxy("proxy-c", None, 100),
+        ]);
+
+        // Spawn 99 concurrent selections (divisible by 3 for even distribution check)
+        let handles: Vec<_> = (0..99)
+            .map(|_| {
+                let balancer = balancer.clone();
+                let state = state.clone();
+                let proxies = proxies.clone();
+                tokio::spawn(async move {
+                    balancer
+                        .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies[..], &state)
+                        .await
+                })
+            })
+            .collect();
+
+        let results: Vec<String> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok().flatten())
+            .collect();
+
+        // All results should be valid proxy IDs
+        assert_eq!(results.len(), 99);
+        for r in &results {
+            assert!(
+                r == "proxy-a" || r == "proxy-b" || r == "proxy-c",
+                "Unexpected proxy: {}",
+                r
+            );
+        }
+
+        // Each proxy should be selected approximately equally (33 times each)
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for r in &results {
+            *counts.entry(r.as_str()).or_insert(0) += 1;
+        }
+
+        // With 99 selections across 3 proxies, each should get exactly 33
+        // (deterministic round-robin)
+        assert_eq!(counts.get("proxy-a"), Some(&33));
+        assert_eq!(counts.get("proxy-b"), Some(&33));
+        assert_eq!(counts.get("proxy-c"), Some(&33));
+    }
+
+    #[test]
+    fn test_single_proxy_always_selected() {
+        let balancer = LoadBalancer::new();
+        let proxies = [make_proxy("only-one", None, 100)];
+        let refs: Vec<_> = proxies.iter().collect();
+
+        // Single proxy should always be selected regardless of strategy
+        for _ in 0..5 {
+            assert_eq!(
+                balancer.select_single(&refs),
+                Some("only-one".to_string())
+            );
+            assert_eq!(
+                balancer.select_round_robin(&refs),
+                Some("only-one".to_string())
+            );
+            assert_eq!(
+                balancer.select_weighted(&refs),
+                Some("only-one".to_string())
+            );
+        }
+    }
 }
