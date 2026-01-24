@@ -2,10 +2,6 @@
 //!
 //! Tests the fundamental CLI commands without daemon functionality.
 
-mod common {
-    pub use crate::common::*;
-}
-
 use crate::common::assertions::*;
 use crate::common::fixtures;
 use crate::common::mock_proxy::{MockBehavior, MockProxy};

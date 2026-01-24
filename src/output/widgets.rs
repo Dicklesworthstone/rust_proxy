@@ -1221,7 +1221,7 @@ mod tests {
 
     #[test]
     fn test_tree_items_build_valid_tree() {
-        let items = vec![
+        let items = [
             tree_item("Root", false),
             tree_item_nested("Child1", false, 1),
             tree_item_nested("Child2", true, 1),

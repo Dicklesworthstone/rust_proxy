@@ -31,6 +31,7 @@ pub fn allocate_port() -> u16 {
 
 /// Result of running a CLI command
 #[derive(Debug)]
+#[expect(dead_code)]
 pub struct CommandResult {
     pub stdout: String,
     pub stderr: String,
@@ -38,6 +39,7 @@ pub struct CommandResult {
     pub success: bool,
 }
 
+#[expect(dead_code)]
 impl CommandResult {
     /// Check if stdout contains a string
     pub fn stdout_contains(&self, s: &str) -> bool {
@@ -241,7 +243,7 @@ impl TestHarness {
 
     /// Create a test harness with custom configuration
     pub async fn with_config(config: &str) -> Result<Self> {
-        let mut harness = Self::new().await?;
+        let harness = Self::new().await?;
         std::fs::write(&harness.config_path, config)?;
         Ok(harness)
     }

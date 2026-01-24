@@ -1172,11 +1172,15 @@ mod tests {
         use crate::config::{AppConfig, DegradationPolicy, Settings};
 
         // Create a config with direct policy but NOT allowing direct fallback
-        let mut config = AppConfig::default();
-        config.settings = Settings::default();
-        config.settings.degradation_policy = DegradationPolicy::Direct;
-        config.settings.allow_direct_fallback = false; // Not allowed
-        config.settings.degradation_delay_secs = 0;
+        let config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::Direct,
+                allow_direct_fallback: false, // Not allowed
+                degradation_delay_secs: 0,
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
 
         // Create StateStore using test constructor
         let state = crate::state::StateStore::new_for_testing();
@@ -1262,11 +1266,15 @@ mod tests {
         use crate::config::{AppConfig, DegradationPolicy, Settings};
 
         // Create a config with try_all policy but NO proxies configured
-        let mut config = AppConfig::default();
-        config.settings = Settings::default();
-        config.settings.degradation_policy = DegradationPolicy::TryAll;
-        config.settings.degradation_delay_secs = 0;
-        config.proxies = vec![]; // No proxies
+        let config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::TryAll,
+                degradation_delay_secs: 0,
+                ..Settings::default()
+            },
+            proxies: vec![], // No proxies
+            ..AppConfig::default()
+        };
 
         let state = crate::state::StateStore::new_for_testing();
 
@@ -1290,30 +1298,32 @@ mod tests {
         use crate::config::{AppConfig, DegradationPolicy, ProxyAuth, ProxyConfig, Settings};
 
         // Create a config with use_last policy
-        let mut config = AppConfig::default();
-        config.settings = Settings::default();
-        config.settings.degradation_policy = DegradationPolicy::UseLast;
-        config.settings.degradation_delay_secs = 0;
-
-        // Add proxies to config
-        config.proxies = vec![
-            ProxyConfig {
-                id: "proxy-a".to_string(),
-                url: "http://proxy-a.invalid:8080".to_string(), // Non-routable for test
-                auth: ProxyAuth::default(),
-                priority: Some(1),
-                health_check_url: None,
-                weight: 100,
+        let config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::UseLast,
+                degradation_delay_secs: 0,
+                ..Settings::default()
             },
-            ProxyConfig {
-                id: "proxy-b".to_string(),
-                url: "http://proxy-b.invalid:8080".to_string(),
-                auth: ProxyAuth::default(),
-                priority: Some(2),
-                health_check_url: None,
-                weight: 100,
-            },
-        ];
+            proxies: vec![
+                ProxyConfig {
+                    id: "proxy-a".to_string(),
+                    url: "http://proxy-a.invalid:8080".to_string(), // Non-routable for test
+                    auth: ProxyAuth::default(),
+                    priority: Some(1),
+                    health_check_url: None,
+                    weight: 100,
+                },
+                ProxyConfig {
+                    id: "proxy-b".to_string(),
+                    url: "http://proxy-b.invalid:8080".to_string(),
+                    auth: ProxyAuth::default(),
+                    priority: Some(2),
+                    health_check_url: None,
+                    weight: 100,
+                },
+            ],
+            ..AppConfig::default()
+        };
 
         // StateStore with NO last_healthy_proxy recorded
         let state = crate::state::StateStore::new_for_testing();
@@ -1339,10 +1349,14 @@ mod tests {
         use crate::config::{AppConfig, DegradationPolicy, Settings};
 
         // Create a config with fail_closed policy and ZERO delay
-        let mut config = AppConfig::default();
-        config.settings = Settings::default();
-        config.settings.degradation_policy = DegradationPolicy::FailClosed;
-        config.settings.degradation_delay_secs = 0; // Immediate activation
+        let config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::FailClosed,
+                degradation_delay_secs: 0, // Immediate activation
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
 
         let state = crate::state::StateStore::new_for_testing();
 
@@ -1400,10 +1414,14 @@ mod tests {
         use crate::config::{AppConfig, DegradationPolicy, Settings};
 
         // Create a config with a non-zero delay
-        let mut config = AppConfig::default();
-        config.settings = Settings::default();
-        config.settings.degradation_policy = DegradationPolicy::FailClosed;
-        config.settings.degradation_delay_secs = 60; // Long delay
+        let config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::FailClosed,
+                degradation_delay_secs: 60, // Long delay
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
 
         let state = crate::state::StateStore::new_for_testing();
 

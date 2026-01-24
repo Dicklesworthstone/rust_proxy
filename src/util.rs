@@ -13,6 +13,7 @@ use url::Url;
 /// Note: Currently unused as main.rs uses clap_complete::Shell directly.
 /// Kept for potential future shell detection/installation features.
 #[allow(dead_code)]
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     /// GNU Bash shell
@@ -29,6 +30,7 @@ pub enum Shell {
     Unknown,
 }
 
+#[allow(dead_code)]
 impl Shell {
     /// Returns the canonical name of the shell.
     #[must_use]
@@ -234,6 +236,7 @@ pub fn generate_completions(shell: Shell, cmd: &mut clap::Command, bin_name: &st
 
 /// Result of a completion installation operation.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct InstallResult {
     /// Path where completions were installed (or would be installed in dry-run mode)
     pub path: PathBuf,
@@ -1301,7 +1304,7 @@ mod tests {
     #[test]
     fn test_shell_clone_and_copy() {
         let shell = Shell::Bash;
-        let cloned = shell.clone();
+        let cloned = shell; // Shell is Copy, no need for .clone()
         let copied = shell;
         assert_eq!(shell, cloned);
         assert_eq!(shell, copied);
