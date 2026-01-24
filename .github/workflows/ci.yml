@@ -13,6 +13,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Clone rich_rust dependency
+        run: |
+          cd ..
+          git clone https://github.com/Dicklesworthstone/rich_rust.git rich_rust || true
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
