@@ -37,7 +37,6 @@ use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
-use toon_rust;
 
 /// Output mode determines how content is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,7 +914,7 @@ mod tests {
             .expect("toon output should serialize");
         let decoded = toon_rust::try_decode(&output, None).expect("toon decode failed");
         let expected = serde_json::to_value(&sample).expect("json encode failed");
-        assert_eq!(decoded, expected);
+        assert_eq!(decoded, expected.into());
     }
 
     // =========================================================================
