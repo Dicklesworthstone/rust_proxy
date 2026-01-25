@@ -2,6 +2,8 @@
 //!
 //! Provides configuration templates and test data generators.
 
+#![expect(dead_code)]
+
 /// Generate a minimal configuration for testing
 pub fn minimal_config(listen_port: u16) -> String {
     format!(

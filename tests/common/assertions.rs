@@ -2,6 +2,8 @@
 //!
 //! Provides domain-specific assertions that produce clear error messages.
 
+#![expect(dead_code)]
+
 use crate::common::CommandResult;
 use serde_json::Value;
 
@@ -226,11 +228,7 @@ fn json_path_get<'a>(json: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// Assert that two durations are approximately equal (within tolerance)
 pub fn assert_duration_approx(actual_ms: u64, expected_ms: u64, tolerance_ms: u64, context: &str) {
-    let diff = if actual_ms > expected_ms {
-        actual_ms - expected_ms
-    } else {
-        expected_ms - actual_ms
-    };
+    let diff = actual_ms.abs_diff(expected_ms);
 
     assert!(
         diff <= tolerance_ms,

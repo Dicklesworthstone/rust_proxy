@@ -31,7 +31,6 @@ pub fn allocate_port() -> u16 {
 
 /// Result of running a CLI command
 #[derive(Debug)]
-#[expect(dead_code)]
 pub struct CommandResult {
     pub stdout: String,
     pub stderr: String,
@@ -114,6 +113,7 @@ impl Drop for DaemonHandle {
 
 /// Test logging verbosity
 #[derive(Debug, Clone, Copy, Default)]
+#[expect(dead_code)]
 pub enum LogVerbosity {
     #[default]
     Normal,
@@ -127,6 +127,7 @@ pub struct TestLogger {
     verbosity: LogVerbosity,
 }
 
+#[expect(dead_code)]
 impl TestLogger {
     /// Create a new test logger
     pub fn new(log_path: PathBuf, verbosity: LogVerbosity) -> Self {
@@ -188,12 +189,14 @@ impl TestLogger {
 /// Main test harness for E2E tests
 pub struct TestHarness {
     /// Temporary directory for test artifacts
+    #[allow(dead_code)]
     pub temp_dir: TempDir,
     /// Test configuration file path
     pub config_path: PathBuf,
     /// State directory path
     pub state_dir: PathBuf,
     /// Path to the rust_proxy binary
+    #[allow(dead_code)]
     binary_path: PathBuf,
     /// Mock proxy servers
     pub mock_proxies: Vec<MockProxy>,
@@ -202,9 +205,11 @@ pub struct TestHarness {
     /// Test logger
     logger: TestLogger,
     /// Listen port for the transparent proxy
+    #[allow(dead_code)]
     listen_port: u16,
 }
 
+#[expect(dead_code)]
 impl TestHarness {
     /// Create a new test harness with default configuration
     pub async fn new() -> Result<Self> {
@@ -376,7 +381,7 @@ impl TestHarness {
 
     /// Check if daemon is currently running
     pub fn daemon_is_running(&self) -> bool {
-        self.daemon.as_ref().map_or(false, |d| d.is_running())
+        self.daemon.as_ref().is_some_and(|d| d.is_running())
     }
 
     /// Convert process output to CommandResult

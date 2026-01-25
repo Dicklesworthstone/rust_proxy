@@ -19,6 +19,7 @@ use tokio::time::sleep;
 
 /// Error types that can be simulated
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum MockError {
     /// Connection refused
     ConnectionRefused,
@@ -49,6 +50,7 @@ impl std::fmt::Display for MockError {
 
 /// Configurable behavior for mock proxy
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum MockBehavior {
     /// Always succeed with configurable latency
     Healthy { latency_ms: u64 },
@@ -79,6 +81,7 @@ pub enum MockResponse {
 
 /// A request received by the mock proxy
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MockRequest {
     /// Request line (e.g., "CONNECT example.com:443 HTTP/1.1")
     pub request_line: String,
@@ -91,6 +94,7 @@ pub struct MockRequest {
 }
 
 /// Mock proxy server
+#[expect(dead_code)]
 pub struct MockProxy {
     /// Port the mock is listening on
     pub port: u16,
@@ -327,6 +331,7 @@ impl MockProxy {
     }
 
     /// Change the mock's behavior
+    #[expect(dead_code)]
     pub fn set_behavior(&self, behavior: MockBehavior) {
         let mut b = self.behavior.lock().unwrap();
         *b = behavior;
@@ -335,6 +340,7 @@ impl MockProxy {
     }
 
     /// Get the request log
+    #[expect(dead_code)]
     pub fn get_requests(&self) -> Vec<MockRequest> {
         let reqs = self.requests.lock().unwrap();
         reqs.iter().cloned().collect()
@@ -347,17 +353,20 @@ impl MockProxy {
     }
 
     /// Clear the request log
+    #[expect(dead_code)]
     pub fn clear_requests(&self) {
         let mut reqs = self.requests.lock().unwrap();
         reqs.clear();
     }
 
     /// Get number of successful responses sent
+    #[expect(dead_code)]
     pub fn success_count(&self) -> u32 {
         self.success_count.load(Ordering::SeqCst)
     }
 
     /// Reset success count
+    #[expect(dead_code)]
     pub fn reset_success_count(&self) {
         self.success_count.store(0, Ordering::SeqCst);
     }
