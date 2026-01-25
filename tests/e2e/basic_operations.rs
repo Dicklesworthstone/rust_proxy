@@ -67,3 +67,31 @@ fn test_assertion_json_path() {
     assert_json_field_is_array(&json, "nested.array", "nested.array should be array");
     assert_json_array_len(&json, "nested.array", 3, "array should have 3 elements");
 }
+
+/// Test TOON output round-trip for list output
+#[tokio::test]
+async fn test_list_toon_roundtrip() {
+    let harness = TestHarness::new().await.expect("Failed to create harness");
+
+    let json_result = harness.run_command(&["list", "--format", "json"]);
+    assert!(
+        json_result.success,
+        "list --format json failed: {}",
+        json_result.stderr
+    );
+
+    let toon_result = harness.run_command(&["list", "--format", "toon"]);
+    assert!(
+        toon_result.success,
+        "list --format toon failed: {}",
+        toon_result.stderr
+    );
+
+    let decoded =
+        toon_rust::try_decode(&toon_result.stdout, None).expect("Failed to decode TOON output");
+    let expected: serde_json::Value =
+        serde_json::from_str(&json_result.stdout).expect("Failed to parse JSON output");
+    assert_eq!(decoded, expected.into());
+
+    harness.cleanup().await;
+}
