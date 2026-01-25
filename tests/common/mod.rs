@@ -256,6 +256,13 @@ impl TestHarness {
     /// Find the rust_proxy binary
     fn find_binary() -> Result<PathBuf> {
         // First try the cargo-provided env var for the test binary location
+        if let Ok(path) = std::env::var("CARGO_BIN_EXE_rust_proxy") {
+            let candidate = PathBuf::from(path);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+
         // During `cargo test`, binaries are in target/{profile}/deps or target/{profile}
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
