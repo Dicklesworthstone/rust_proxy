@@ -1115,9 +1115,13 @@ mod tests {
         use crate::config::{AppConfig, DegradationPolicy, Settings};
 
         // Create a config with try_all policy
-        let mut config = AppConfig::default();
-        config.settings = Settings::default();
-        config.settings.degradation_policy = DegradationPolicy::TryAll;
+        let mut config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::TryAll,
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
         config.settings.degradation_delay_secs = 10; // Long delay
 
         // Create StateStore using test constructor
@@ -1142,9 +1146,13 @@ mod tests {
         use crate::config::{AppConfig, DegradationPolicy, Settings};
 
         // Create a config with fail_closed policy
-        let mut config = AppConfig::default();
-        config.settings = Settings::default();
-        config.settings.degradation_policy = DegradationPolicy::FailClosed;
+        let mut config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::FailClosed,
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
         config.settings.degradation_delay_secs = 0; // Immediate
 
         // Create StateStore using test constructor

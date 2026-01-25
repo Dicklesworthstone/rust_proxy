@@ -618,7 +618,7 @@ mod tests {
         let healthy = format!("{:?}", t.health_color("healthy"));
         let degraded = format!("{:?}", t.health_color("degraded"));
         let unhealthy = format!("{:?}", t.health_color("unhealthy"));
-        let unknown = format!("{:?}", t.health_color("unknown"));
+        let _unknown = format!("{:?}", t.health_color("unknown"));
 
         // All statuses should have different colors
         assert_ne!(healthy, degraded, "healthy and degraded should differ");

@@ -31,7 +31,7 @@ async fn test_mock_proxy_creation() {
 /// Test that config fixtures generate valid TOML
 #[test]
 fn test_fixtures_are_valid_toml() {
-    let configs = vec![
+    let configs = [
         fixtures::minimal_config(12345),
         fixtures::single_proxy_config(12345, "http://localhost:8080"),
         fixtures::multi_proxy_config(12345, &["http://localhost:8080", "http://localhost:8081"]),

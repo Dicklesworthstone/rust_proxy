@@ -1415,7 +1415,7 @@ mod tests {
 
     #[test]
     fn test_completions_are_valid_utf8() {
-        let mut cmd = test_cli_command();
+        let cmd = test_cli_command();
 
         // All shell completions should produce valid UTF-8
         for shell in [
@@ -1614,7 +1614,7 @@ mod tests {
     #[test]
     fn test_install_completions_returns_valid_result() {
         // Test that install_completions returns proper InstallResult structure
-        let mut cmd = test_cli_command();
+        let cmd = test_cli_command();
 
         // Just test with dry_run to avoid filesystem side effects in unit tests
         for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
