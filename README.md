@@ -214,6 +214,7 @@ Show proxy stats table.
 ```bash
 rust_proxy list
 rust_proxy list --json
+rust_proxy list --format toon
 ```
 
 ### `rust_proxy status`
@@ -222,6 +223,17 @@ Show active proxy + rule status.
 ```bash
 rust_proxy status
 rust_proxy status --json
+rust_proxy status --format toon
+```
+
+### Output formats
+Machine output supports JSON or TOON.
+
+```bash
+rust_proxy list --format json
+rust_proxy list --format toon
+RUST_PROXY_OUTPUT_FORMAT=toon rust_proxy status --json
+TOON_DEFAULT_FORMAT=toon rust_proxy list --json
 ```
 
 ### `rust_proxy diagnose`

@@ -29,6 +29,7 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
+toon_rust = { path = "../toon_rust" }
 
 # Rich terminal output (Python rich port)
 rich_rust = { path = "../rich_rust" }

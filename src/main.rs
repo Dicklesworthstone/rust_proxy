@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
@@ -35,7 +35,7 @@ mod watcher;
 
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
 use load_balancer::LoadBalancer;
-use output::OutputDispatcher;
+use output::{OutputDispatcher, OutputFormat};
 use proxy::RetryConfig;
 use state::{HealthStatus, RuntimeState, State, StateStore};
 
@@ -95,9 +95,12 @@ enum Commands {
     Diagnose,
     /// Comprehensive health check for rust_proxy
     Doctor {
-        /// Output results as JSON
+        /// Output results in machine format (JSON/TOON)
         #[arg(long)]
         json: bool,
+        /// Machine output format (json or toon)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormatArg>,
         /// Only output errors (no success messages)
         #[arg(long)]
         quiet: bool,
@@ -110,9 +113,12 @@ enum Commands {
         /// Treat warnings as errors (exit code 2)
         #[arg(long)]
         strict: bool,
-        /// Output validation results as JSON
+        /// Output validation results in machine format (JSON/TOON)
         #[arg(long)]
         json: bool,
+        /// Machine output format (json or toon)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormatArg>,
         /// Only output errors (no success messages)
         #[arg(long)]
         quiet: bool,
@@ -127,9 +133,12 @@ enum Commands {
     Test {
         /// URL or domain to test (e.g., https://api.openai.com/v1/chat, api.openai.com)
         url: String,
-        /// Output results as JSON
+        /// Output results in machine format (JSON/TOON)
         #[arg(long)]
         json: bool,
+        /// Machine output format (json or toon)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormatArg>,
         /// Show detailed routing decision process
         #[arg(short, long)]
         verbose: bool,
@@ -141,9 +150,12 @@ enum Commands {
     Trace {
         /// URL or domain to trace (e.g., https://api.openai.com, api.openai.com:443)
         target: String,
-        /// Output results as JSON
+        /// Output results in machine format (JSON/TOON)
         #[arg(long)]
         json: bool,
+        /// Machine output format (json or toon)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormatArg>,
         /// Attempt TLS handshake after CONNECT
         #[arg(long)]
         tls: bool,
@@ -152,9 +164,12 @@ enum Commands {
     Ping {
         /// Proxy ID to ping (defaults to active proxy)
         proxy_id: Option<String>,
-        /// Output results as JSON
+        /// Output results in machine format (JSON/TOON)
         #[arg(long)]
         json: bool,
+        /// Machine output format (json or toon)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormatArg>,
         /// Number of pings to send
         #[arg(long, default_value = "3")]
         count: u32,
@@ -174,6 +189,24 @@ enum Commands {
 struct OutputArgs {
     #[arg(long)]
     json: bool,
+    /// Machine output format (json or toon)
+    #[arg(long, value_enum)]
+    format: Option<OutputFormatArg>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormatArg {
+    Json,
+    Toon,
+}
+
+impl From<OutputFormatArg> for OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Json => OutputFormat::Json,
+            OutputFormatArg::Toon => OutputFormat::Toon,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -286,80 +319,91 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { force } => {
-            let output = OutputDispatcher::from_flags(false, false);
+            let output = OutputDispatcher::from_flags(false, false, None);
             init_config(force, &output)?
         }
         Commands::Proxy { command } => {
-            let output = OutputDispatcher::from_flags(false, false);
+            let output = OutputDispatcher::from_flags(false, false, None);
             proxy_cmd(command, &output)?
         }
         Commands::Targets { command } => {
-            let output = OutputDispatcher::from_flags(false, false);
+            let output = OutputDispatcher::from_flags(false, false, None);
             targets_cmd(command, &output)?
         }
         Commands::List(args) => {
-            let output = OutputDispatcher::from_flags(args.json, false);
+            let output =
+                OutputDispatcher::from_flags(args.json, false, args.format.map(Into::into));
             list_cmd(&output)?
         }
         Commands::Activate { id, select, run } => {
-            let output = OutputDispatcher::from_flags(false, false);
+            let output = OutputDispatcher::from_flags(false, false, None);
             activate_cmd(id, select, run, &output).await?
         }
         Commands::Deactivate { keep_rules } => {
-            let output = OutputDispatcher::from_flags(false, false);
+            let output = OutputDispatcher::from_flags(false, false, None);
             deactivate_cmd(keep_rules, &output)?
         }
         Commands::Service { action } => {
-            let output = OutputDispatcher::from_flags(false, false);
+            let output = OutputDispatcher::from_flags(false, false, None);
             service_cmd(action, &output)?
         }
         Commands::Daemon => run_daemon().await?,
         Commands::Status(args) => {
-            let output = OutputDispatcher::from_flags(args.json, false);
+            let output =
+                OutputDispatcher::from_flags(args.json, false, args.format.map(Into::into));
             status_cmd(&output)?
         }
         Commands::Diagnose => {
-            let output = OutputDispatcher::from_flags(false, false);
+            let output = OutputDispatcher::from_flags(false, false, None);
             diagnose_cmd(&output)?
         }
         Commands::Doctor {
             json,
+            format,
             quiet,
             offline,
         } => {
-            let output = OutputDispatcher::from_flags(json, quiet);
+            let output = OutputDispatcher::from_flags(json, quiet, format.map(Into::into));
             doctor_cmd(&output, offline).await?
         }
         Commands::Check {
             strict,
             json,
+            format,
             quiet,
             test_connectivity,
             validate_health_target,
         } => {
-            let output = OutputDispatcher::from_flags(json, quiet);
+            let output = OutputDispatcher::from_flags(json, quiet, format.map(Into::into));
             check_cmd(strict, test_connectivity, validate_health_target, &output).await?
         }
         Commands::Test {
             url,
             json,
+            format,
             verbose,
             no_dns,
         } => {
-            let output = OutputDispatcher::from_flags(json, false);
+            let output = OutputDispatcher::from_flags(json, false, format.map(Into::into));
             test_cmd(&url, verbose, no_dns, &output).await?
         }
-        Commands::Trace { target, json, tls } => {
-            let output = OutputDispatcher::from_flags(json, false);
+        Commands::Trace {
+            target,
+            json,
+            format,
+            tls,
+        } => {
+            let output = OutputDispatcher::from_flags(json, false, format.map(Into::into));
             trace_cmd(&target, tls, &output).await?
         }
         Commands::Ping {
             proxy_id,
             json,
+            format,
             count,
             interval_ms,
         } => {
-            let output = OutputDispatcher::from_flags(json, false);
+            let output = OutputDispatcher::from_flags(json, false, format.map(Into::into));
             ping_cmd(proxy_id, count, interval_ms, &output).await?
         }
         Commands::Completions { shell } => completions_cmd(shell),
@@ -1986,7 +2030,7 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
 
     // Output
     if output.mode().is_json() {
-        output_test_json(&decision)?;
+        output_test_json(&decision, output)?;
     } else {
         output_test_standard(&decision, verbose);
     }
@@ -1994,8 +2038,8 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
     Ok(())
 }
 
-fn output_test_json(decision: &RoutingDecision) -> Result<()> {
-    let output = serde_json::json!({
+fn output_test_json(decision: &RoutingDecision, output: &OutputDispatcher) -> Result<()> {
+    let payload = serde_json::json!({
         "input": decision.input,
         "domain": decision.domain,
         "resolved_ips": decision.resolved_ips,
@@ -2021,7 +2065,7 @@ fn output_test_json(decision: &RoutingDecision) -> Result<()> {
         "daemon_running": decision.daemon_running,
         "suggestions": build_suggestions(decision)
     });
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    output.print_json(&payload);
     Ok(())
 }
 

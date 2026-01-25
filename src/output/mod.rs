@@ -22,7 +22,7 @@
 //! use rust_proxy::output::{OutputDispatcher, OutputMode};
 //!
 //! // From CLI flags
-//! let output = OutputDispatcher::from_flags(args.json, args.quiet);
+//! let output = OutputDispatcher::from_flags(args.json, args.quiet, args.format);
 //!
 //! // Print based on mode
 //! output.print_rich("[bold green]Success![/]");
@@ -37,16 +37,76 @@ use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
+use toon_rust;
 
 /// Output mode determines how content is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     /// Interactive terminal - show rich output with colors and formatting.
     Human,
-    /// JSON flag or piped output - show plain text or JSON only.
+    /// JSON/TOON flag or piped output - show plain text or machine output only.
     Machine,
     /// Minimal output for scripting - only essential messages.
     Quiet,
+}
+
+/// Machine output format for structured responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// JSON output (pretty-printed for human readability).
+    #[default]
+    Json,
+    /// Token-Optimized Object Notation (TOON).
+    Toon,
+}
+
+impl OutputFormat {
+    /// Parse from CLI or environment values.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "toon" => Some(Self::Toon),
+            _ => None,
+        }
+    }
+
+    /// Resolve output format from flags and environment.
+    #[must_use]
+    pub fn detect(format_flag: Option<Self>) -> Self {
+        Self::detect_with_env(format_flag, &RealEnv)
+    }
+
+    /// Resolve output format with explicit environment lookup.
+    #[must_use]
+    pub fn detect_with_env<E: EnvLookup>(format_flag: Option<Self>, env: &E) -> Self {
+        if let Some(flag) = format_flag {
+            return flag;
+        }
+
+        if let Some(value) = env.var_value("RUST_PROXY_OUTPUT_FORMAT") {
+            if let Some(parsed) = Self::parse(&value) {
+                return parsed;
+            }
+        }
+
+        if let Some(value) = env.var_value("TOON_DEFAULT_FORMAT") {
+            if let Some(parsed) = Self::parse(&value) {
+                return parsed;
+            }
+        }
+
+        Self::Json
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Json => write!(f, "json"),
+            OutputFormat::Toon => write!(f, "toon"),
+        }
+    }
 }
 
 /// TTY state for testable mode detection.
@@ -80,6 +140,8 @@ impl TtyState {
 pub trait EnvLookup {
     /// Check if an environment variable is set (exists).
     fn var_exists(&self, key: &str) -> bool;
+    /// Return the environment variable value if present.
+    fn var_value(&self, key: &str) -> Option<String>;
 }
 
 /// Real environment lookup using std::env.
@@ -88,6 +150,10 @@ pub struct RealEnv;
 impl EnvLookup for RealEnv {
     fn var_exists(&self, key: &str) -> bool {
         std::env::var(key).is_ok()
+    }
+
+    fn var_value(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
     }
 }
 
@@ -116,13 +182,17 @@ impl EnvLookup for TestEnv {
     fn var_exists(&self, key: &str) -> bool {
         self.vars.contains_key(key)
     }
+
+    fn var_value(&self, key: &str) -> Option<String> {
+        self.vars.get(key).cloned()
+    }
 }
 
 impl OutputMode {
     /// Detect the appropriate output mode based on flags and environment.
     ///
     /// Detection order (first match wins):
-    /// 1. `--json` flag → Machine
+    /// 1. Machine output flag (`--json` or `--format`) → Machine
     /// 2. `--quiet` flag → Quiet
     /// 3. stdout is not a TTY → Machine
     /// 4. CI env var is set → Machine
@@ -147,7 +217,7 @@ impl OutputMode {
         tty_state: TtyState,
         env: &E,
     ) -> Self {
-        // 1. Explicit --json flag
+        // 1. Explicit machine output flag (--json or --format)
         if json_flag {
             return Self::Machine;
         }
@@ -191,7 +261,7 @@ impl OutputMode {
         matches!(self, Self::Human)
     }
 
-    /// Returns true if this mode should output JSON.
+    /// Returns true if this mode should output machine format (JSON/TOON).
     #[must_use]
     pub const fn is_json(&self) -> bool {
         matches!(self, Self::Machine)
@@ -213,7 +283,7 @@ impl OutputMode {
 /// # Example
 ///
 /// ```rust,ignore
-/// let output = OutputDispatcher::from_flags(false, false);
+/// let output = OutputDispatcher::from_flags(false, false, None);
 ///
 /// // Human mode: shows rich formatting
 /// output.print_rich("[bold]Hello[/] World");
@@ -223,6 +293,7 @@ impl OutputMode {
 /// ```
 pub struct OutputDispatcher {
     mode: OutputMode,
+    format: OutputFormat,
     /// Console is only created for Human mode to save resources.
     console: Option<Console>,
 }
@@ -230,28 +301,41 @@ pub struct OutputDispatcher {
 impl OutputDispatcher {
     /// Create a new dispatcher with the given mode.
     #[must_use]
-    pub fn new(mode: OutputMode) -> Self {
+    pub fn new(mode: OutputMode, format: OutputFormat) -> Self {
         let console = if mode.is_rich() {
             Some(Console::new())
         } else {
             None
         };
 
-        Self { mode, console }
+        Self {
+            mode,
+            format,
+            console,
+        }
     }
 
     /// Create a dispatcher by detecting mode from CLI flags.
     ///
     /// This is the primary constructor for CLI commands.
     #[must_use]
-    pub fn from_flags(json: bool, quiet: bool) -> Self {
-        Self::new(OutputMode::detect(json, quiet))
+    pub fn from_flags(json: bool, quiet: bool, format_flag: Option<OutputFormat>) -> Self {
+        let force_machine = json || format_flag.is_some();
+        let mode = OutputMode::detect(force_machine, quiet);
+        let format = OutputFormat::detect(format_flag);
+        Self::new(mode, format)
     }
 
     /// Get the current output mode.
     #[must_use]
     pub const fn mode(&self) -> OutputMode {
         self.mode
+    }
+
+    /// Get the current machine output format.
+    #[must_use]
+    pub const fn format(&self) -> OutputFormat {
+        self.format
     }
 
     /// Print text with rich markup formatting.
@@ -286,28 +370,45 @@ impl OutputDispatcher {
         eprintln!("{text}");
     }
 
-    /// Print a value as JSON.
+    /// Print a value as JSON/TOON.
     ///
-    /// In Machine mode, serializes to JSON and prints. In Human mode,
-    /// this is a no-op (use `print_rich` or `print_renderable` instead).
+    /// In Machine mode, serializes to the configured machine format and prints.
+    /// In Human mode, this is a no-op (use `print_rich` or `print_renderable` instead).
     pub fn print_json<T: Serialize>(&self, value: &T) {
         if !self.mode.is_json() {
             return;
         }
-        if let Ok(json) = serde_json::to_string_pretty(value) {
-            println!("{json}");
+        if let Some(output) = self.encode_machine(value, true) {
+            println!("{output}");
         }
     }
 
-    /// Print a value as JSON (compact format).
+    /// Print a value as JSON/TOON (compact format for JSON).
     ///
-    /// In Machine mode, serializes to compact JSON and prints.
+    /// In Machine mode, serializes to compact JSON or TOON and prints.
     pub fn print_json_compact<T: Serialize>(&self, value: &T) {
         if !self.mode.is_json() {
             return;
         }
-        if let Ok(json) = serde_json::to_string(value) {
-            println!("{json}");
+        if let Some(output) = self.encode_machine(value, false) {
+            println!("{output}");
+        }
+    }
+
+    fn encode_machine<T: Serialize>(&self, value: &T, pretty: bool) -> Option<String> {
+        match self.format {
+            OutputFormat::Json => {
+                let json = if pretty {
+                    serde_json::to_string_pretty(value)
+                } else {
+                    serde_json::to_string(value)
+                };
+                json.ok()
+            }
+            OutputFormat::Toon => {
+                let json_value = serde_json::to_value(value).ok()?;
+                Some(toon_rust::encode(json_value, None))
+            }
         }
     }
 
@@ -431,7 +532,7 @@ impl OutputDispatcher {
                 }
             }
             OutputMode::Machine => {
-                // JSON format for machine consumption
+                // Machine format for structured consumption
                 let mut error_obj = serde_json::json!({
                     "error": true,
                     "title": title,
@@ -446,8 +547,8 @@ impl OutputDispatcher {
                     error_obj["suggestions"] = serde_json::json!(suggestions);
                 }
 
-                if let Ok(json) = serde_json::to_string_pretty(&error_obj) {
-                    eprintln!("{json}");
+                if let Some(output) = self.encode_machine(&error_obj, true) {
+                    eprintln!("{output}");
                 }
             }
             OutputMode::Quiet => {
@@ -492,8 +593,8 @@ impl OutputDispatcher {
                     warning_obj["suggestions"] = serde_json::json!(suggestions);
                 }
 
-                if let Ok(json) = serde_json::to_string_pretty(&warning_obj) {
-                    println!("{json}");
+                if let Some(output) = self.encode_machine(&warning_obj, true) {
+                    println!("{output}");
                 }
             }
             OutputMode::Quiet => {
@@ -505,7 +606,7 @@ impl OutputDispatcher {
 
 impl Default for OutputDispatcher {
     fn default() -> Self {
-        Self::from_flags(false, false)
+        Self::from_flags(false, false, None)
     }
 }
 
@@ -695,40 +796,90 @@ mod tests {
     }
 
     // =========================================================================
+    // OutputFormat Tests
+    // =========================================================================
+
+    #[test]
+    fn test_output_format_parse() {
+        assert_eq!(OutputFormat::parse("json"), Some(OutputFormat::Json));
+        assert_eq!(OutputFormat::parse("toon"), Some(OutputFormat::Toon));
+        assert_eq!(OutputFormat::parse("  TOON "), Some(OutputFormat::Toon));
+        assert_eq!(OutputFormat::parse("unknown"), None);
+    }
+
+    #[test]
+    fn test_output_format_flag_precedence() {
+        let env = TestEnv::new().with_var("RUST_PROXY_OUTPUT_FORMAT", "toon");
+        let format = OutputFormat::detect_with_env(Some(OutputFormat::Json), &env);
+        assert_eq!(format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_output_format_env_precedence() {
+        let env = TestEnv::new()
+            .with_var("RUST_PROXY_OUTPUT_FORMAT", "toon")
+            .with_var("TOON_DEFAULT_FORMAT", "json");
+        let format = OutputFormat::detect_with_env(None, &env);
+        assert_eq!(format, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn test_output_format_env_fallback() {
+        let env = TestEnv::new().with_var("TOON_DEFAULT_FORMAT", "toon");
+        let format = OutputFormat::detect_with_env(None, &env);
+        assert_eq!(format, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn test_output_format_invalid_env_defaults_json() {
+        let env = TestEnv::new().with_var("RUST_PROXY_OUTPUT_FORMAT", "bogus");
+        let format = OutputFormat::detect_with_env(None, &env);
+        assert_eq!(format, OutputFormat::Json);
+    }
+
+    // =========================================================================
     // OutputDispatcher Construction Tests
     // =========================================================================
 
     #[test]
     fn test_dispatcher_human_mode_has_console() {
-        let dispatcher = OutputDispatcher::new(OutputMode::Human);
+        let dispatcher = OutputDispatcher::new(OutputMode::Human, OutputFormat::Json);
         assert_eq!(dispatcher.mode(), OutputMode::Human);
         assert!(dispatcher.has_rich());
     }
 
     #[test]
     fn test_dispatcher_machine_mode_no_console() {
-        let dispatcher = OutputDispatcher::new(OutputMode::Machine);
+        let dispatcher = OutputDispatcher::new(OutputMode::Machine, OutputFormat::Json);
         assert_eq!(dispatcher.mode(), OutputMode::Machine);
         assert!(!dispatcher.has_rich());
     }
 
     #[test]
     fn test_dispatcher_quiet_mode_no_console() {
-        let dispatcher = OutputDispatcher::new(OutputMode::Quiet);
+        let dispatcher = OutputDispatcher::new(OutputMode::Quiet, OutputFormat::Json);
         assert_eq!(dispatcher.mode(), OutputMode::Quiet);
         assert!(!dispatcher.has_rich());
     }
 
     #[test]
     fn test_dispatcher_from_flags_json() {
-        let dispatcher = OutputDispatcher::from_flags(true, false);
+        let dispatcher = OutputDispatcher::from_flags(true, false, None);
         assert_eq!(dispatcher.mode(), OutputMode::Machine);
         assert!(!dispatcher.has_rich());
     }
 
     #[test]
+    fn test_dispatcher_from_flags_format_forces_machine() {
+        let dispatcher = OutputDispatcher::from_flags(false, false, Some(OutputFormat::Toon));
+        assert_eq!(dispatcher.mode(), OutputMode::Machine);
+        assert_eq!(dispatcher.format(), OutputFormat::Toon);
+        assert!(!dispatcher.has_rich());
+    }
+
+    #[test]
     fn test_dispatcher_from_flags_quiet() {
-        let dispatcher = OutputDispatcher::from_flags(false, true);
+        let dispatcher = OutputDispatcher::from_flags(false, true, None);
         assert_eq!(dispatcher.mode(), OutputMode::Quiet);
         assert!(!dispatcher.has_rich());
     }
@@ -741,6 +892,30 @@ mod tests {
         // Note: actual mode depends on test runner TTY state
         // Just verify it doesn't panic
         let _ = dispatcher.mode();
+    }
+
+    #[test]
+    fn test_encode_machine_toon_roundtrip() {
+        #[derive(Serialize)]
+        struct Sample {
+            id: String,
+            enabled: bool,
+            ports: Vec<u16>,
+        }
+
+        let sample = Sample {
+            id: "proxy-1".to_string(),
+            enabled: true,
+            ports: vec![80, 443],
+        };
+
+        let dispatcher = OutputDispatcher::new(OutputMode::Machine, OutputFormat::Toon);
+        let output = dispatcher
+            .encode_machine(&sample, true)
+            .expect("toon output should serialize");
+        let decoded = toon_rust::try_decode(&output, None).expect("toon decode failed");
+        let expected = serde_json::to_value(&sample).expect("json encode failed");
+        assert_eq!(decoded, expected);
     }
 
     // =========================================================================
