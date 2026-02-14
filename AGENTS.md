@@ -4,7 +4,7 @@
 
 ---
 
-## RULE 0 - THE FUNDAMENTAL OVERRIDE PEROGATIVE
+## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
 
 If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
 
@@ -27,6 +27,23 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options (`git status`, `git diff`, `git stash`, copying to backups) before ever considering a destructive command.
 4. **Mandatory explicit plan:** Even after explicit user authorization, restate the command verbatim, list exactly what will be affected, and wait for a confirmation that your understanding is correct. Only then may you execute it—if anything remains ambiguous, refuse and escalate.
 5. **Document the confirmation:** When running any approved destructive command, record (in the session notes / final response) the exact user text that authorized it, the command actually run, and the execution time. If that record is absent, the operation did not happen.
+
+---
+
+## Git Branch: ONLY Use `main`, NEVER `master`
+
+**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
+
+- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
+- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
+- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
+  ```bash
+  git push origin main:master
+  ```
+
+**If you see `master` referenced anywhere:**
+1. Update it to `main`
+2. Ensure `master` is synchronized: `git push origin main:master`
 
 ---
 
@@ -93,27 +110,16 @@ We are early-stage and prioritize correctness, safety, and simplicity over compa
 
 ---
 
-## Output Style
-
-The CLI supports both human-readable and machine-friendly output. When editing output:
-
-- **Human default:** Keep messages concise and actionable.
-- **`--json` flags:** Preserve stable field names/structure for scripting.
-- **Errors:** Use clear, specific failure reasons; avoid noisy stack traces.
-- **Logging:** Use `tracing` for daemon/runtime messages; prefer `info`/`warn` over `debug` by default.
-
----
-
 ## Compiler Checks (CRITICAL)
 
 **After any substantive code changes, you MUST verify no errors were introduced:**
 
 ```bash
-# Check for compiler errors and warnings
-cargo check --all-targets
+# Check for compiler errors and warnings (workspace-wide)
+cargo check --workspace --all-targets
 
 # Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
 cargo fmt --check
@@ -125,46 +131,59 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ## Testing
 
-There are no dedicated tests in this repo yet. If you add tests, use the standard Cargo flow:
+### Testing Policy
+
+There are no dedicated tests in this repo yet. If you add tests, use the standard Cargo flow and cover:
+- Happy path
+- Edge cases (empty input, max values, boundary conditions)
+- Error conditions
+
+### Unit Tests
 
 ```bash
 # Run all tests
-cargo test
+cargo test --workspace
 
 # Run with output
-cargo test -- --nocapture
+cargo test --workspace -- --nocapture
 ```
+
+### Test Categories
+
+| Area | Focus |
+|------|-------|
+| `config` | Config parsing, defaults, provider inference, serialization round-trips |
+| `proxy` | Transparent proxy connect handling, upstream tunneling, auth encoding |
+| `iptables` | ipset/iptables rule generation, cleanup logic |
+| `dns` | Domain-to-IPv4 resolution, timeout behavior |
+| `ip_ranges` | Provider range fetching, IPv4 parsing, merge logic |
+| `state` | Stats tracking, periodic flush, timestamp handling |
 
 ---
 
 ## Third-Party Library Usage
 
-If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and mid-2025 best practices.
+If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and current best practices.
 
 ---
 
 ## rust_proxy — This Project
 
-**rust_proxy** is a machine-wide, targeted transparent proxy for specific domains. It resolves domains to IPv4 addresses, loads them into `ipset`, and applies `iptables` NAT rules so matching traffic is redirected to a local proxy that tunnels via an upstream HTTP proxy.
+**This is the project you're working on.** **rust_proxy** is a machine-wide, targeted transparent proxy for specific domains. It resolves domains to IPv4 addresses, loads them into `ipset`, and applies `iptables` NAT rules so matching traffic is redirected to a local proxy that tunnels via an upstream HTTP proxy.
 
-### Architecture (High Level)
+### What It Does
+
+Provides a transparent, machine-wide proxy for targeted domains. The daemon resolves target domains to IPs, manages `ipset`/`iptables` NAT rules, and runs a local transparent proxy that tunnels matching traffic through an upstream HTTP CONNECT proxy.
+
+### Architecture
 
 ```
-CLI → Config/State → Daemon
-            ↓           ↓
+CLI --> Config/State --> Daemon
+            |               |
         Targets     ipset/iptables
-            ↓           ↓
-        DNS + IP ranges → Transparent proxy → Upstream HTTP proxy (CONNECT)
+            |               |
+        DNS + IP ranges --> Transparent proxy --> Upstream HTTP proxy (CONNECT)
 ```
-
-### Key Workflows
-
-- **init:** writes a default config if missing.
-- **proxy add/remove/list:** manages upstream proxy definitions and optional auth/env credentials.
-- **targets add/remove/list:** manages domain targets, with provider tagging for display and range toggles.
-- **activate:** sets active proxy + updates activation stats; `--select` uses an interactive picker.
-- **daemon:** requires root; loads `ipset`, applies `iptables` rules, resolves DNS, merges optional AWS/Cloudflare/Google IPv4 ranges, starts refresh + ping loops, and runs the transparent proxy.
-- **deactivate:** clears active proxy and optionally removes firewall/ipset state.
 
 ### Key Files
 
@@ -179,11 +198,39 @@ CLI → Config/State → Daemon
 | `src/ip_ranges.rs` | Provider IPv4 range fetchers |
 | `src/util.rs` | Formatting + proxy URL parsing helpers |
 
+### Key Workflows
+
+- **init:** writes a default config if missing.
+- **proxy add/remove/list:** manages upstream proxy definitions and optional auth/env credentials.
+- **targets add/remove/list:** manages domain targets, with provider tagging for display and range toggles.
+- **activate:** sets active proxy + updates activation stats; `--select` uses an interactive picker.
+- **daemon:** requires root; loads `ipset`, applies `iptables` rules, resolves DNS, merges optional AWS/Cloudflare/Google IPv4 ranges, starts refresh + ping loops, and runs the transparent proxy.
+- **deactivate:** clears active proxy and optionally removes firewall/ipset state.
+
+### Output Style
+
+The CLI supports both human-readable and machine-friendly output:
+
+- **Human default:** Keep messages concise and actionable.
+- **`--json` flags:** Preserve stable field names/structure for scripting.
+- **Errors:** Use clear, specific failure reasons; avoid noisy stack traces.
+- **Logging:** Use `tracing` for daemon/runtime messages; prefer `info`/`warn` over `debug` by default.
+
 ### Operational Safety Notes
 
 - The daemon changes NAT OUTPUT rules. Be cautious when running over SSH; keep a local console available.
 - IPv6 destinations are not supported; only IPv4 entries go into `ipset`.
 - `iptables` is used directly (not `nft`); ensure the host uses iptables legacy/compat.
+
+### Key Design Decisions
+
+- **Transparent proxy via iptables NAT** — no per-app proxy config needed; machine-wide coverage
+- **ipset for efficient IP matching** — O(1) lookup vs linear iptables rule chains
+- **Provider IP range merging** — optional AWS/Cloudflare/Google range feeds for CDN-backed domains
+- **Domain-centric targeting** — users specify domains, not IPs; DNS resolution + range feeds handle the rest
+- **Unsafe code for SO_ORIGINAL_DST** — minimal unsafe block for retrieving original destination from redirected sockets
+- **Credential flexibility** — proxy auth via inline URL, config field, or environment variable
+- **Tokio async runtime** — daemon loop, DNS refresh, ping health checks, and proxy IO all use tokio
 
 ---
 
@@ -238,9 +285,9 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 
 ## Beads (br) — Dependency-Aware Issue Tracking
 
-Beads provides a lightweight, dependency-aware issue database and CLI (`br` from beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
+Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
-**Note:** `br` (beads_rust) is non-invasive and never executes git commands. You must manually run `git add .beads/` and `git commit` after `br sync --flush-only`.
+**Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
 
 ### Conventions
 
@@ -269,7 +316,8 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` from
 
 5. **Complete and release:**
    ```bash
-   br close br-123 --reason "Completed"
+   br close 123 --reason "Completed"
+   br sync --flush-only  # Export to JSONL (no git operations)
    ```
    ```
    release_file_reservations(project_key, agent_name, paths=["src/**"])
@@ -393,21 +441,21 @@ ubs .                                   # Whole project (ignores target/, Cargo.
 ### Output Format
 
 ```
-⚠️  Category (N errors)
-    file.rs:42:5 – Issue description
-    💡 Suggested fix
+Warning  Category (N errors)
+    file.rs:42:5 - Issue description
+    Suggested fix
 Exit code: 1
 ```
 
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
+Parse: `file:line:col` -> location | fix suggestion -> how to fix | Exit 0/1 -> pass/fail
 
 ### Fix Workflow
 
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
+1. Read finding -> category + fix suggestion
+2. Navigate `file:line:col` -> view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
+5. Re-run `ubs <file>` -> exit 0
 6. Commit
 
 ### Bug Severity
@@ -415,6 +463,33 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - **Critical (always fix):** Memory safety, use-after-free, data races, SQL injection
 - **Important (production):** Unwrap panics, resource leaks, overflow checks
 - **Contextual (judgment):** TODO/FIXME, println! debugging
+
+---
+
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor                    # Health check
+rch workers probe --all       # Test connectivity to all 8 workers
+rch status                    # Overview of current state
+rch queue                     # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
 
@@ -433,8 +508,8 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ### Rule of Thumb
 
-- Need correctness or **applying changes** → `ast-grep`
-- Need raw speed or **hunting text** → `rg`
+- Need correctness or **applying changes** -> `ast-grep`
+- Need raw speed or **hunting text** -> `rg`
 - Often combine: `rg` to shortlist files, then `ast-grep` to match/modify
 
 ### Rust Examples
@@ -467,8 +542,8 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 | Scenario | Tool | Why |
 |----------|------|-----|
-| "How is pattern matching implemented?" | `warp_grep` | Exploratory; don't know where to start |
-| "Where is the quick reject filter?" | `warp_grep` | Need to understand architecture |
+| "How is the transparent proxy implemented?" | `warp_grep` | Exploratory; don't know where to start |
+| "Where is the ipset rule generation?" | `warp_grep` | Need to understand architecture |
 | "Find all uses of `Regex::new`" | `ripgrep` | Targeted literal search |
 | "Find files with `println!`" | `ripgrep` | Simple pattern |
 | "Replace all `unwrap()` with `expect()`" | `ast-grep` | Structural refactor |
@@ -477,8 +552,8 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 ```
 mcp__morph-mcp__warp_grep(
-  repoPath: "/path/to/dcg",
-  query: "How does the safe pattern whitelist work?"
+  repoPath: "/data/projects/rust_proxy",
+  query: "How does the transparent proxy intercept and tunnel traffic?"
 )
 ```
 
@@ -486,9 +561,9 @@ Returns structured results with file paths, line ranges, and extracted code snip
 
 ### Anti-Patterns
 
-- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
-- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
-- **Don't** use `ripgrep` for codemods → risks collateral edits
+- **Don't** use `warp_grep` to find a specific function name -> use `ripgrep`
+- **Don't** use `ripgrep` to understand "how does X work" -> wastes time with manual reads
+- **Don't** use `ripgrep` for codemods -> risks collateral edits
 
 <!-- bv-agent-instructions-v1 -->
 
@@ -496,9 +571,9 @@ Returns structured results with file paths, line ranges, and extracted code snip
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
-**Note:** `br` (beads_rust) is non-invasive and never executes git commands. You must manually run `git add .beads/` and `git commit` after `br sync --flush-only`.
+**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
 
 ### Essential Commands
 
@@ -512,9 +587,9 @@ br list --status=open # All open issues
 br show <id>          # Full issue details with dependencies
 br create --title="..." --type=task --priority=2
 br update <id> --status=in_progress
-br close <id> --reason="Completed"
+br close <id> --reason "Completed"
 br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export to JSONL (no git ops)
+br sync --flush-only  # Export to JSONL (NO git operations)
 ```
 
 ### Workflow Pattern
@@ -523,7 +598,7 @@ br sync --flush-only  # Export to JSONL (no git ops)
 2. **Claim**: Use `br update <id> --status=in_progress`
 3. **Work**: Implement the task
 4. **Complete**: Use `br close <id>`
-5. **Sync**: Run `br sync --flush-only` then manually commit `.beads/`
+5. **Sync**: Run `br sync --flush-only` then manually commit
 
 ### Key Concepts
 
@@ -539,48 +614,33 @@ br sync --flush-only  # Export to JSONL (no git ops)
 ```bash
 git status              # Check what changed
 git add <files>         # Stage code changes
-br sync --flush-only    # Export beads to JSONL (no git ops)
+br sync --flush-only    # Export beads to JSONL
 git add .beads/         # Stage beads changes
-git commit -m "..."     # Commit everything
+git commit -m "..."     # Commit everything together
 git push                # Push to remote
 ```
 
 ### Best Practices
 
 - Check `br ready` at session start to find available work
-- Update status as you work (in_progress → closed)
+- Update status as you work (in_progress -> closed)
 - Create new issues with `br create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
-- Always `br sync --flush-only` + manual git commit before ending session
+- Always `br sync --flush-only && git add .beads/` before ending session
 
 <!-- end-bv-agent-instructions -->
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below.
 
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only    # Export beads to JSONL (no git ops)
-   git add .beads/         # Stage beads changes
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+4. **Sync beads** - `br sync --flush-only` to export to JSONL
+5. **Hand off** - Provide context for next session
 
 
 ---
@@ -598,10 +658,10 @@ Next steps (pick one)
 
 1. Decide how to handle the unrelated modified files above so we can resume cleanly.
 2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
-3. If you want a full suite run later, fix conformance/clippy blockers and re‑run cargo test --all.
+3. If you want a full suite run later, fix conformance/clippy blockers and re-run cargo test --all.
 ```
 
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into think YOU made the changes and simply don't recall it for some reason.
+NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
 
 ---
 
