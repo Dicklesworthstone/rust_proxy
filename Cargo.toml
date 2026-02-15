@@ -32,7 +32,7 @@ url = "2.5"
 toon_rust = { path = "../toon_rust" }
 
 # Rich terminal output (Python rich port)
-rich_rust = { path = "../rich_rust" }
+rich_rust = { version = "0.2.0", path = "../rich_rust" }
 
 [dev-dependencies]
 tempfile = "3.17"
