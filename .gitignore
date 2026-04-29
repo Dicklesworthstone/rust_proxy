@@ -2,6 +2,7 @@
 
 # bv (beads viewer) local config and caches
 .bv/
+.beads/.write.lock
 a.out
 
 # Ephemeral/temporary files (agent workflow artifacts)
