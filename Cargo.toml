@@ -29,10 +29,10 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
-toon_rust = { package = "tru", path = "../toon_rust" }
+toon_rust = { package = "tru", version = "0.2.3" }
 
 # Rich terminal output (Python rich port)
-rich_rust = { version = "0.2.0", path = "../rich_rust" }
+rich_rust = "0.2.1"
 
 [dev-dependencies]
 tempfile = "3.17"
