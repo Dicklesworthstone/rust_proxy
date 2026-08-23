@@ -35,6 +35,24 @@ impl DnsResolutionReport {
         }
         ips
     }
+
+    /// Fraction of attempted domains that produced at least one address.
+    ///
+    /// Returns 0.0 when no domains were attempted (nothing can succeed).
+    pub fn success_ratio(&self) -> f64 {
+        if self.total_domains == 0 {
+            return 0.0;
+        }
+        self.resolved.len() as f64 / self.total_domains as f64
+    }
+
+    /// True when at least one domain was attempted and none resolved.
+    ///
+    /// Callers use this to distinguish "everything failed" (act on it, e.g.
+    /// refuse startup or keep a stale ipset) from an empty input list.
+    pub fn total_failure(&self) -> bool {
+        self.total_domains > 0 && self.resolved.is_empty()
+    }
 }
 
 /// Resolve a single domain to its IP addresses
@@ -209,6 +227,55 @@ mod tests {
         assert_eq!(ipv4s.len(), 2);
         assert!(ipv4s.contains("93.184.216.34"));
         assert!(ipv4s.contains("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_success_ratio_and_total_failure() {
+        // Change B helpers: classify resolution outcomes without network I/O.
+        let v4 = || vec![IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))];
+
+        // Partial success: half the domains resolved.
+        let partial = DnsResolutionReport {
+            resolved: vec![("a.com".to_string(), v4())],
+            failed: vec![("b.com".to_string(), "NXDOMAIN".to_string())],
+            total_domains: 2,
+            elapsed: Duration::from_millis(1),
+        };
+        assert_eq!(partial.success_ratio(), 0.5);
+        assert!(!partial.total_failure());
+
+        // Total failure: domains were attempted but none resolved. The old
+        // daemon path consumed resolve_ipv4 (an Ok-only wrapper), so there
+        // was NO way to detect this case -- it just saw an empty IP set and
+        // warned while starting anyway.
+        let total = DnsResolutionReport {
+            resolved: vec![],
+            failed: vec![("a.com".to_string(), "SERVFAIL".to_string())],
+            total_domains: 1,
+            elapsed: Duration::from_millis(1),
+        };
+        assert!(total.total_failure());
+        assert_eq!(total.success_ratio(), 0.0);
+
+        // Nothing attempted: neither a failure nor a meaningful ratio.
+        let empty = DnsResolutionReport {
+            resolved: vec![],
+            failed: vec![],
+            total_domains: 0,
+            elapsed: Duration::from_millis(1),
+        };
+        assert!(!empty.total_failure());
+        assert_eq!(empty.success_ratio(), 0.0);
+
+        // Full success.
+        let full = DnsResolutionReport {
+            resolved: vec![("a.com".to_string(), v4()), ("b.com".to_string(), v4())],
+            failed: vec![],
+            total_domains: 2,
+            elapsed: Duration::from_millis(1),
+        };
+        assert_eq!(full.success_ratio(), 1.0);
+        assert!(!full.total_failure());
     }
 
     #[tokio::test]

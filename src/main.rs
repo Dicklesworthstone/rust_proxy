@@ -2323,11 +2323,16 @@ async fn trace_cmd(target: &str, tls: bool, output: &OutputDispatcher) -> Result
     let selection_start = Instant::now();
     let state = StateStore::load().await?;
     let load_balancer = LoadBalancer::new();
+    // trace runs outside the daemon, so there is no live RuntimeState with
+    // health-loop failover history; seed one from config so the configured
+    // active proxy steers Single-strategy selection like daemon startup does.
+    let runtime = RuntimeState::new(config.active_proxy.clone());
     let selected_proxy = load_balancer
         .select_proxy(
             config.settings.load_balance_strategy,
             &config.proxies,
             &state,
+            runtime.get_effective_proxy().await.as_deref(),
         )
         .await;
     let selection_duration = selection_start.elapsed();
@@ -3077,7 +3082,41 @@ async fn run_daemon() -> Result<()> {
     upstream_hosts.sort();
     upstream_hosts.dedup();
 
-    let upstream_excludes = dns::resolve_ipv4(&upstream_hosts).await?;
+    // Fail closed on total upstream DNS failure. resolve_ipv4 is an Ok-only
+    // wrapper, so the old code could never propagate a resolution failure: a
+    // total outage degraded into an empty exclude set plus a warning, and the
+    // daemon started with NO upstream excludes -- every upstream connection
+    // was then redirected back into this proxy (self-redirect loop).
+    let upstream_report = dns::resolve_parallel(&upstream_hosts).await;
+    if upstream_report.total_failure() {
+        bail!(
+            "DNS resolution failed for ALL {} upstream proxy host(s): {}. \
+             Refusing to start: iptables would get no upstream excludes and \
+             upstream traffic would be redirected back into this proxy \
+             (self-redirect loop). Fix name resolution, then retry.",
+            upstream_report.failed.len(),
+            upstream_report
+                .failed
+                .iter()
+                .map(|(h, _)| h.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !upstream_report.failed.is_empty() {
+        tracing::warn!(
+            success_ratio = format!("{:.2}", upstream_report.success_ratio()),
+            "Partial DNS failure resolving upstream proxy host(s)"
+        );
+        for (host, err) in &upstream_report.failed {
+            tracing::warn!(
+                host = %host,
+                error = %err,
+                "Upstream host unresolved; its traffic may be redirected"
+            );
+        }
+    }
+    let upstream_excludes = upstream_report.ipv4_addresses();
     if upstream_excludes.is_empty() {
         tracing::warn!(
             "No IPv4 addresses found for upstream proxies. Upstream traffic may be redirected."
@@ -3115,7 +3154,9 @@ async fn run_daemon() -> Result<()> {
     let ipset_name = config.settings.ipset_name.clone();
     let refresh_secs = config.settings.dns_refresh_secs;
     let refresh_task = tokio::spawn(async move {
-        let mut seen: HashSet<String> = HashSet::new();
+        // Seed the previous-set tracker with what was just synced at startup
+        // so even the first refresh keeps the stale ipset on total failure.
+        let mut seen: HashSet<String> = initial_targets.clone();
         loop {
             tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
             match refresh_target_entries(
@@ -3127,7 +3168,27 @@ async fn run_daemon() -> Result<()> {
             .await
             {
                 Ok(entries) => {
-                    if let Err(err) = iptables::sync_ipset(&ipset_name, &entries) {
+                    // Fail-open hazard: refresh_target_entries collapses every
+                    // DNS outcome into a bare entry set (resolve_ipv4 is an
+                    // Ok-only wrapper), so a total resolver outage surfaces as
+                    // an EMPTY entry set. Syncing that would wipe the live
+                    // ipset and silently unroute every target until DNS
+                    // recovers. When the fresh set is empty but the previous
+                    // one was not, re-probe with the report-aware API and keep
+                    // the stale ipset for this cycle on total failure.
+                    let total_failure = entries.is_empty() && !seen.is_empty() && {
+                        let domains: Vec<String> = refresh_targets
+                            .iter()
+                            .map(|t| t.domain().to_string())
+                            .collect();
+                        dns::resolve_parallel(&domains).await.total_failure()
+                    };
+                    if total_failure {
+                        tracing::warn!(
+                            kept = seen.len(),
+                            "Total DNS failure while refreshing targets; keeping stale ipset rather than emptying it"
+                        );
+                    } else if let Err(err) = iptables::sync_ipset(&ipset_name, &entries) {
                         tracing::warn!("ipset sync failed: {err}");
                     } else if seen != entries {
                         tracing::info!("ipset refreshed: {} targets", entries.len());

@@ -297,6 +297,8 @@ async fn handle_connection_with_load_balancing(
             config.settings.load_balance_strategy,
             &config.proxies,
             &state,
+            // Steer Single-strategy routing from the live failover state.
+            runtime.get_effective_proxy().await.as_deref(),
         )
         .await;
 

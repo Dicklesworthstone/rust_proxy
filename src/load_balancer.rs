@@ -110,6 +110,8 @@ impl LoadBalancer {
     /// * `strategy` - The load balancing strategy to use
     /// * `proxies` - List of configured proxies
     /// * `state` - State store for health status and latency data
+    /// * `preferred` - Preferred proxy ID hint (from RuntimeState.effective_proxy);
+    ///   only honored by the Single strategy
     ///
     /// # Example
     ///
@@ -119,6 +121,7 @@ impl LoadBalancer {
     ///     LoadBalanceStrategy::RoundRobin,
     ///     &config.proxies,
     ///     &state,
+    ///     None,
     /// ).await;
     /// ```
     pub async fn select_proxy(
@@ -126,6 +129,7 @@ impl LoadBalancer {
         strategy: LoadBalanceStrategy,
         proxies: &[ProxyConfig],
         state: &StateStore,
+        preferred: Option<&str>,
     ) -> Option<String> {
         // Collect healthy proxies with their data
         let mut healthy = Vec::with_capacity(proxies.len());
@@ -142,7 +146,7 @@ impl LoadBalancer {
         }
 
         let selected = match strategy {
-            LoadBalanceStrategy::Single => self.select_single(&healthy),
+            LoadBalanceStrategy::Single => self.select_single(preferred, &healthy),
             LoadBalanceStrategy::RoundRobin => self.select_round_robin(&healthy),
             LoadBalanceStrategy::LeastLatency => self.select_least_latency(&healthy, state).await,
             LoadBalanceStrategy::Weighted => self.select_weighted(&healthy),
@@ -156,11 +160,21 @@ impl LoadBalancer {
         selected
     }
 
-    /// Select the highest-priority healthy proxy (Single strategy).
+    /// Select the preferred healthy proxy if present (Single strategy).
     ///
-    /// Lower priority number = higher priority. Proxies without explicit
-    /// priority default to 100.
-    fn select_single(&self, healthy: &[&ProxyConfig]) -> Option<String> {
+    /// `preferred` comes from RuntimeState.effective_proxy so manual activate
+    /// and health-loop failover/failback steer routing; non-Single strategies
+    /// deliberately ignore it.
+    ///
+    /// When no preference is given (or the preferred proxy is not among the
+    /// healthy set), falls back to the legacy rule: lowest priority number
+    /// wins; proxies without explicit priority default to 100.
+    fn select_single(&self, preferred: Option<&str>, healthy: &[&ProxyConfig]) -> Option<String> {
+        if let Some(id) = preferred {
+            if healthy.iter().any(|p| p.id == id) {
+                return Some(id.to_string());
+            }
+        }
         healthy
             .iter()
             .min_by_key(|p| p.priority.unwrap_or(100))
@@ -287,7 +301,7 @@ mod tests {
         ];
         let refs: Vec<_> = proxies.iter().collect();
 
-        let selected = balancer.select_single(&refs);
+        let selected = balancer.select_single(None, &refs);
         assert_eq!(selected, Some("high-priority".to_string()));
     }
 
@@ -301,7 +315,7 @@ mod tests {
         ];
         let refs: Vec<_> = proxies.iter().collect();
 
-        let selected = balancer.select_single(&refs);
+        let selected = balancer.select_single(None, &refs);
         assert_eq!(selected, Some("explicit-priority".to_string()));
     }
 
@@ -382,7 +396,7 @@ mod tests {
         let balancer = LoadBalancer::new();
         let refs: Vec<&ProxyConfig> = vec![];
 
-        assert_eq!(balancer.select_single(&refs), None);
+        assert_eq!(balancer.select_single(None, &refs), None);
         assert_eq!(balancer.select_round_robin(&refs), None);
         assert_eq!(balancer.select_weighted(&refs), None);
     }
@@ -506,7 +520,7 @@ mod tests {
 
         // With Single strategy, should select proxy-a since proxy-b is unhealthy
         let selected = balancer
-            .select_proxy(LoadBalanceStrategy::Single, &proxies, &state)
+            .select_proxy(LoadBalanceStrategy::Single, &proxies, &state, None)
             .await;
         assert_eq!(selected, Some("proxy-a".to_string()));
     }
@@ -540,7 +554,7 @@ mod tests {
         ];
 
         let selected = balancer
-            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state, None)
             .await;
         assert_eq!(selected, None);
     }
@@ -557,7 +571,7 @@ mod tests {
 
         // Unknown status should be treated as eligible (select_proxy includes it)
         let selected = balancer
-            .select_proxy(LoadBalanceStrategy::Single, &proxies, &state)
+            .select_proxy(LoadBalanceStrategy::Single, &proxies, &state, None)
             .await;
         assert_eq!(selected, Some("proxy-a".to_string()));
     }
@@ -590,13 +604,13 @@ mod tests {
 
         // Round robin should only cycle through proxy-a and proxy-c
         let s1 = balancer
-            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state, None)
             .await;
         let s2 = balancer
-            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state, None)
             .await;
         let s3 = balancer
-            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state)
+            .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state, None)
             .await;
 
         assert_eq!(s1, Some("proxy-a".to_string()));
@@ -633,7 +647,7 @@ mod tests {
                 let proxies = proxies.clone();
                 tokio::spawn(async move {
                     balancer
-                        .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies[..], &state)
+                        .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies[..], &state, None)
                         .await
                 })
             })
@@ -676,7 +690,10 @@ mod tests {
 
         // Single proxy should always be selected regardless of strategy
         for _ in 0..5 {
-            assert_eq!(balancer.select_single(&refs), Some("only-one".to_string()));
+            assert_eq!(
+                balancer.select_single(None, &refs),
+                Some("only-one".to_string())
+            );
             assert_eq!(
                 balancer.select_round_robin(&refs),
                 Some("only-one".to_string())
@@ -686,5 +703,190 @@ mod tests {
                 Some("only-one".to_string())
             );
         }
+    }
+
+    #[test]
+    fn test_select_single_preferred_healthy_wins_over_priority() {
+        // Change A(a): the effective-proxy preference must beat static
+        // priority when the preferred proxy is healthy. Old code had no
+        // preferred parameter at all, so priority 1 always won and manual
+        // activate / health-loop failover could never steer routing.
+        let balancer = LoadBalancer::new();
+
+        let proxies = [
+            make_proxy("high-priority", Some(1), 100),
+            make_proxy("preferred", Some(200), 100),
+        ];
+        let refs: Vec<_> = proxies.iter().collect();
+
+        assert_eq!(
+            balancer.select_single(Some("preferred"), &refs),
+            Some("preferred".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_single_ignores_unhealthy_preferred() {
+        // Change A(b): a preferred ID absent from the healthy set must be
+        // ignored. Planted negative: an implementation that returned
+        // `preferred` regardless of health would yield "dead" here and fail.
+        let balancer = LoadBalancer::new();
+
+        let proxies = [
+            make_proxy("high-priority", Some(1), 100),
+            make_proxy("backup", Some(50), 100),
+        ];
+        let refs: Vec<_> = proxies.iter().collect();
+
+        assert_eq!(
+            balancer.select_single(Some("dead"), &refs),
+            Some("high-priority".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_proxy_preferred_unhealthy_falls_back_to_priority() {
+        use crate::state::StateStore;
+
+        // End-to-end through select_proxy: the preferred proxy is marked
+        // unhealthy by health checks, so it is filtered out before Single
+        // selection and the next-priority healthy peer is used. Planted
+        // negative: selecting the unhealthy-but-preferred proxy fails this.
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        state
+            .record_health_check("healthy", true, Some(50.0), None, 3)
+            .await;
+        for _ in 0..3 {
+            state
+                .record_health_check(
+                    "preferred",
+                    false,
+                    None,
+                    Some("connection refused".to_string()),
+                    3,
+                )
+                .await;
+        }
+
+        let proxies = [
+            make_proxy("healthy", Some(10), 100),
+            make_proxy("preferred", Some(1), 100), // best priority but unhealthy
+        ];
+
+        let selected = balancer
+            .select_proxy(
+                LoadBalanceStrategy::Single,
+                &proxies,
+                &state,
+                Some("preferred"),
+            )
+            .await;
+        assert_eq!(selected, Some("healthy".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_select_proxy_preferred_healthy_wins_end_to_end() {
+        use crate::state::StateStore;
+
+        // Failover scenario: the health loop failed traffic over to a proxy
+        // with worse static priority; while it is healthy it must keep
+        // winning. Old code always reverted to priority 1 immediately.
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        state
+            .record_health_check("primary", true, Some(50.0), None, 3)
+            .await;
+        state
+            .record_health_check("failover", true, Some(50.0), None, 3)
+            .await;
+
+        let proxies = [
+            make_proxy("primary", Some(1), 100),
+            make_proxy("failover", Some(2), 100),
+        ];
+
+        let selected = balancer
+            .select_proxy(
+                LoadBalanceStrategy::Single,
+                &proxies,
+                &state,
+                Some("failover"),
+            )
+            .await;
+        assert_eq!(selected, Some("failover".to_string()));
+    }
+
+    #[test]
+    fn test_select_single_none_preserves_priority_tiebreak() {
+        // Change A(c): passing None must reproduce the legacy behavior
+        // exactly, including first-encountered-wins on equal priority.
+        let balancer = LoadBalancer::new();
+
+        let proxies = [
+            make_proxy("first", Some(100), 100),
+            make_proxy("second", Some(100), 100),
+            make_proxy("third", None, 100),
+        ];
+        let refs: Vec<_> = proxies.iter().collect();
+
+        assert_eq!(
+            balancer.select_single(None, &refs),
+            Some("first".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_ignores_preferred() {
+        use crate::state::StateStore;
+
+        // Change A(d): non-Single strategies deliberately ignore the
+        // preference hint, so RoundRobin distribution stays even even when a
+        // preference exists. A naive shared-path implementation of the hint
+        // would pin every selection onto "proxy-b" and fail this cycle.
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+
+        for id in ["proxy-a", "proxy-b"] {
+            state
+                .record_health_check(id, true, Some(50.0), None, 3)
+                .await;
+        }
+
+        let proxies = [
+            make_proxy("proxy-a", None, 100),
+            make_proxy("proxy-b", None, 100),
+        ];
+
+        let s1 = balancer
+            .select_proxy(
+                LoadBalanceStrategy::RoundRobin,
+                &proxies,
+                &state,
+                Some("proxy-b"),
+            )
+            .await;
+        let s2 = balancer
+            .select_proxy(
+                LoadBalanceStrategy::RoundRobin,
+                &proxies,
+                &state,
+                Some("proxy-b"),
+            )
+            .await;
+        let s3 = balancer
+            .select_proxy(
+                LoadBalanceStrategy::RoundRobin,
+                &proxies,
+                &state,
+                Some("proxy-b"),
+            )
+            .await;
+
+        assert_eq!(s1, Some("proxy-a".to_string()));
+        assert_eq!(s2, Some("proxy-b".to_string()));
+        assert_eq!(s3, Some("proxy-a".to_string()));
     }
 }
