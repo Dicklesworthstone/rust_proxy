@@ -10,3 +10,6 @@ mod basic_operations;
 
 #[path = "e2e/load_balancing.rs"]
 mod load_balancing;
+
+#[path = "e2e/daemon_path.rs"]
+mod daemon_path;

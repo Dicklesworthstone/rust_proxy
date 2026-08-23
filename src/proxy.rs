@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -288,7 +288,7 @@ async fn handle_connection_with_load_balancing(
             return Err(anyhow!("IPv6 destinations are not supported"));
         }
     };
-    let target_host = target.ip().to_string();
+    let target_host = original_dst_connect_host(*target.ip());
     let target_port = target.port();
 
     // Select proxy using load balancer
@@ -908,7 +908,7 @@ async fn handle_connection(
         SocketAddr::V4(v4) => v4,
         _ => return Err(anyhow!("IPv6 destinations are not supported")),
     };
-    let target_host = target.ip().to_string();
+    let target_host = original_dst_connect_host(*target.ip());
     let target_port = target.port();
 
     let mut upstream_socket =
@@ -1019,7 +1019,62 @@ async fn connect_with_retry(host: &str, port: u16, config: &RetryConfig) -> Resu
     ))
 }
 
+/// Runtime-gated test mode flag, resolved once per process so the production
+/// hot path never touches the environment.
+static TEST_MODE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("RUST_PROXY_TEST_MODE").as_deref() == Ok("1"));
+
+/// Hostname captured from `RUST_PROXY_TEST_ORIGINAL_DST` when the seam value is
+/// a DNS name rather than a literal IP. A `SocketAddr` cannot carry a hostname,
+/// so the connection plumbing gets a placeholder IP while the upstream CONNECT
+/// request line uses this name. Only ever set under RUST_PROXY_TEST_MODE.
+static TEST_ORIGINAL_DST_HOST: OnceLock<String> = OnceLock::new();
+
+/// Parse the `RUST_PROXY_TEST_ORIGINAL_DST` seam value ("host:port") into a
+/// placeholder IPv4 socket address. Returns `None` unless the operator opted
+/// into RUST_PROXY_TEST_MODE, leaving production behavior untouched.
+fn test_original_dst_fallback() -> Option<SocketAddr> {
+    if !*TEST_MODE_ENABLED {
+        return None;
+    }
+    let raw = std::env::var("RUST_PROXY_TEST_ORIGINAL_DST").ok()?;
+    let (host, port) = raw.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    tracing::debug!(
+        host,
+        port,
+        "SO_ORIGINAL_DST replaced by RUST_PROXY_TEST_ORIGINAL_DST seam value"
+    );
+    match host.parse::<Ipv4Addr>() {
+        Ok(ip) => Some(SocketAddr::V4(SocketAddrV4::new(ip, port))),
+        Err(_) => {
+            let _ = TEST_ORIGINAL_DST_HOST.set(host.to_string());
+            Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)))
+        }
+    }
+}
+
+/// Host placed in the upstream CONNECT request line for the given original
+/// destination IP: the injected seam hostname when the test-mode fallback
+/// captured one, otherwise the IP string exactly as before the seam existed.
+fn original_dst_connect_host(target_ip: Ipv4Addr) -> String {
+    match TEST_ORIGINAL_DST_HOST.get() {
+        Some(host) => host.clone(),
+        None => target_ip.to_string(),
+    }
+}
+
 fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
+    // Runtime-gated test seam: when the operator opts into RUST_PROXY_TEST_MODE
+    // with RUST_PROXY_TEST_ORIGINAL_DST set, the injected destination replaces
+    // the SO_ORIGINAL_DST lookup. It is probed first because some kernels
+    // return a spurious success (the socket's own address) instead of failing
+    // on connections that never traversed iptables REDIRECT. With the envs
+    // unset this is a no-op and production behavior is byte-identical.
+    if let Some(addr) = test_original_dst_fallback() {
+        return Ok(addr);
+    }
+
     let fd = stream.as_raw_fd();
     unsafe {
         let mut addr: libc::sockaddr_in = std::mem::zeroed();

@@ -62,6 +62,9 @@ pub enum MockBehavior {
     Flaky { failure_rate: f64 },
     /// Custom sequence of responses
     Sequence { responses: Vec<MockResponse> },
+    /// Establish the tunnel (200) and then echo every tunneled byte back to
+    /// the client, so a caller can prove end-to-end byte-exact relay.
+    TunnelEcho,
 }
 
 impl Default for MockBehavior {
@@ -241,6 +244,10 @@ impl MockProxy {
         }
 
         // Determine response based on behavior
+        let tunnel_echo = {
+            let behavior = behavior.lock().unwrap();
+            matches!(&*behavior, MockBehavior::TunnelEcho)
+        };
         let response = {
             let behavior = behavior.lock().unwrap();
             Self::determine_response(&behavior, &success_count)
@@ -256,6 +263,18 @@ impl MockProxy {
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
                 success_count.fetch_add(1, Ordering::SeqCst);
+                if tunnel_echo {
+                    // Tunnel established: echo every subsequent byte back to
+                    // the client until it closes, proving byte-exact relay.
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        socket.write_all(&buf[..n]).await?;
+                    }
+                }
             }
             MockResponse::Error(error) => {
                 Self::send_error(&mut socket, &error).await?;
@@ -287,6 +306,7 @@ impl MockProxy {
                     MockResponse::Success { latency_ms: 0 }
                 }
             }
+            MockBehavior::TunnelEcho => MockResponse::Success { latency_ms: 0 },
             MockBehavior::Sequence { responses } => {
                 let idx = success_count.load(Ordering::SeqCst) as usize;
                 responses
@@ -340,7 +360,6 @@ impl MockProxy {
     }
 
     /// Get the request log
-    #[expect(dead_code)]
     pub fn get_requests(&self) -> Vec<MockRequest> {
         let reqs = self.requests.lock().unwrap();
         reqs.iter().cloned().collect()

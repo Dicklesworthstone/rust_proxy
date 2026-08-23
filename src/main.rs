@@ -3031,7 +3031,14 @@ fn service_generate(
 }
 
 async fn run_daemon() -> Result<()> {
-    iptables::require_root()?;
+    // Runtime-gated test mode: the production binary behaves identically unless
+    // the operator explicitly opts in via RUST_PROXY_TEST_MODE=1.
+    let test_mode = std::env::var("RUST_PROXY_TEST_MODE").as_deref() == Ok("1");
+    if !test_mode {
+        iptables::require_root()?;
+    } else {
+        tracing::info!("test mode: skipping root privilege requirement");
+    }
     let config = AppConfig::load()?;
 
     // Initialize metrics registry (safe to call even if already initialized)
@@ -3134,89 +3141,101 @@ async fn run_daemon() -> Result<()> {
 
     // Create runtime state for dynamic proxy management
     let runtime_state = RuntimeState::new(config.active_proxy.clone());
+    let mut initial_targets: HashSet<String> = HashSet::new();
+    if test_mode {
+        tracing::info!("test mode: skipping firewall mutations (ipset/iptables)");
+    } else {
+        iptables::ensure_ipset(&config.settings.ipset_name)?;
 
-    iptables::ensure_ipset(&config.settings.ipset_name)?;
-
-    let initial_targets = build_target_entries(&config).await?;
-    iptables::sync_ipset(&config.settings.ipset_name, &initial_targets)?;
-    iptables::apply_rules(
-        &config.settings.chain_name,
-        &config.settings.ipset_name,
-        config.settings.listen_port,
-        None,
-        &upstream_excludes,
-    )?;
-
+        initial_targets = build_target_entries(&config).await?;
+        iptables::sync_ipset(&config.settings.ipset_name, &initial_targets)?;
+        iptables::apply_rules(
+            &config.settings.chain_name,
+            &config.settings.ipset_name,
+            config.settings.listen_port,
+            None,
+            &upstream_excludes,
+        )?;
+    }
     let refresh_targets = config.targets.clone();
     let include_aws = config.settings.include_aws_ip_ranges;
     let include_cloudflare = config.settings.include_cloudflare_ip_ranges;
     let include_google = config.settings.include_google_ip_ranges;
     let ipset_name = config.settings.ipset_name.clone();
     let refresh_secs = config.settings.dns_refresh_secs;
-    let refresh_task = tokio::spawn(async move {
-        // Seed the previous-set tracker with what was just synced at startup
-        // so even the first refresh keeps the stale ipset on total failure.
-        let mut seen: HashSet<String> = initial_targets.clone();
-        loop {
-            tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
-            match refresh_target_entries(
-                &refresh_targets,
-                include_aws,
-                include_cloudflare,
-                include_google,
-            )
-            .await
-            {
-                Ok(entries) => {
-                    // Fail-open hazard: refresh_target_entries collapses every
-                    // DNS outcome into a bare entry set (resolve_ipv4 is an
-                    // Ok-only wrapper), so a total resolver outage surfaces as
-                    // an EMPTY entry set. Syncing that would wipe the live
-                    // ipset and silently unroute every target until DNS
-                    // recovers. When the fresh set is empty but the previous
-                    // one was not, re-probe with the report-aware API and keep
-                    // the stale ipset for this cycle on total failure.
-                    let total_failure = entries.is_empty() && !seen.is_empty() && {
-                        let domains: Vec<String> = refresh_targets
-                            .iter()
-                            .map(|t| t.domain().to_string())
-                            .collect();
-                        dns::resolve_parallel(&domains).await.total_failure()
-                    };
-                    if total_failure {
-                        tracing::warn!(
+    let refresh_task = if test_mode {
+        tracing::info!("test mode: skipping DNS/ipset refresh task");
+        None
+    } else {
+        Some(tokio::spawn(async move {
+            // so even the first refresh keeps the stale ipset on total failure.
+            let mut seen: HashSet<String> = initial_targets.clone();
+            loop {
+                tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
+                match refresh_target_entries(
+                    &refresh_targets,
+                    include_aws,
+                    include_cloudflare,
+                    include_google,
+                )
+                .await
+                {
+                    Ok(entries) => {
+                        // Fail-open hazard: refresh_target_entries collapses every
+                        // DNS outcome into a bare entry set (resolve_ipv4 is an
+                        // Ok-only wrapper), so a total resolver outage surfaces as
+                        // an EMPTY entry set. Syncing that would wipe the live
+                        // ipset and silently unroute every target until DNS
+                        // recovers. When the fresh set is empty but the previous
+                        // one was not, re-probe with the report-aware API and keep
+                        // the stale ipset for this cycle on total failure.
+                        let total_failure = entries.is_empty() && !seen.is_empty() && {
+                            let domains: Vec<String> = refresh_targets
+                                .iter()
+                                .map(|t| t.domain().to_string())
+                                .collect();
+                            dns::resolve_parallel(&domains).await.total_failure()
+                        };
+                        if total_failure {
+                            tracing::warn!(
                             kept = seen.len(),
                             "Total DNS failure while refreshing targets; keeping stale ipset rather than emptying it"
                         );
-                    } else if let Err(err) = iptables::sync_ipset(&ipset_name, &entries) {
-                        tracing::warn!("ipset sync failed: {err}");
-                    } else if seen != entries {
-                        tracing::info!("ipset refreshed: {} targets", entries.len());
-                        seen = entries;
+                        } else if let Err(err) = iptables::sync_ipset(&ipset_name, &entries) {
+                            tracing::warn!("ipset sync failed: {err}");
+                        } else if seen != entries {
+                            tracing::info!("ipset refreshed: {} targets", entries.len());
+                            seen = entries;
+                        }
                     }
+                    Err(err) => tracing::warn!("target refresh failed: {err}"),
                 }
-                Err(err) => tracing::warn!("target refresh failed: {err}"),
             }
-        }
-    });
+        }))
+    };
 
     let ping_proxies = config.proxies.clone();
     let ping_interval = config.settings.ping_interval_secs;
     let ping_timeout = config.settings.ping_timeout_ms;
     let state_clone = state.clone();
-    let ping_task = tokio::spawn(async move {
-        loop {
-            for proxy in &ping_proxies {
-                if let Ok(endpoint) = util::parse_proxy_url(&proxy.url) {
-                    match ping_proxy(&endpoint.host, endpoint.port, ping_timeout).await {
-                        Ok(ms) => state_clone.record_ping(&proxy.id, ms).await,
-                        Err(err) => tracing::warn!("ping failed for {}: {err}", proxy.id),
+    let ping_task = if test_mode {
+        tracing::info!("test mode: skipping proxy ping task");
+        None
+    } else {
+        Some(tokio::spawn(async move {
+            loop {
+                for proxy in &ping_proxies {
+                    if let Ok(endpoint) = util::parse_proxy_url(&proxy.url) {
+                        match ping_proxy(&endpoint.host, endpoint.port, ping_timeout).await {
+                            Ok(ms) => state_clone.record_ping(&proxy.id, ms).await,
+                            Err(err) => tracing::warn!("ping failed for {}: {err}", proxy.id),
+                        }
                     }
                 }
+                tokio::time::sleep(Duration::from_secs(ping_interval)).await;
             }
-            tokio::time::sleep(Duration::from_secs(ping_interval)).await;
-        }
-    });
+        }))
+    };
 
     // Health check task (only if enabled)
     let health_task = if config.settings.health_check_enabled {
@@ -3257,7 +3276,7 @@ async fn run_daemon() -> Result<()> {
     ));
 
     // Metrics server task (only if enabled)
-    let metrics_task = if config.settings.metrics_enabled {
+    let metrics_task = if config.settings.metrics_enabled && !test_mode {
         let metrics_bind = format!(
             "{}:{}",
             config.settings.metrics_bind, config.settings.metrics_port
@@ -3301,8 +3320,12 @@ async fn run_daemon() -> Result<()> {
         }
     }
 
-    refresh_task.abort();
-    ping_task.abort();
+    if let Some(refresh_task) = refresh_task {
+        refresh_task.abort();
+    }
+    if let Some(ping_task) = ping_task {
+        ping_task.abort();
+    }
     if let Some((task, shutdown_tx)) = health_task {
         let _ = shutdown_tx.send(true);
         task.abort();
@@ -3311,7 +3334,11 @@ async fn run_daemon() -> Result<()> {
         let _ = shutdown_tx.send(true);
         task.abort();
     }
-    iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
+    if !test_mode {
+        iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
+    } else {
+        tracing::info!("test mode: skipping iptables cleanup");
+    }
     state.flush().await?;
 
     Ok(())
