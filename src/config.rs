@@ -314,7 +314,7 @@ pub struct Settings {
     /// Path for metrics endpoint (default: "/metrics")
     #[serde(default = "default_metrics_path")]
     pub metrics_path: String,
-    /// Bind address for metrics server (default: "0.0.0.0")
+    /// Bind address for metrics server (default: "127.0.0.1")
     #[serde(default = "default_metrics_bind")]
     pub metrics_bind: String,
     /// Max retry attempts for upstream proxy connections (0 = no retries)
@@ -389,7 +389,7 @@ fn default_metrics_path() -> String {
 }
 
 fn default_metrics_bind() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_health_check_enabled() -> bool {
@@ -1930,7 +1930,7 @@ mod tests {
         assert!(settings.metrics_enabled);
         assert_eq!(settings.metrics_port, 9090);
         assert_eq!(settings.metrics_path, "/metrics");
-        assert_eq!(settings.metrics_bind, "0.0.0.0");
+        assert_eq!(settings.metrics_bind, "127.0.0.1");
         // Health check settings
         assert!(settings.health_check_enabled);
         assert_eq!(settings.health_check_interval_secs, 30);
@@ -1999,7 +1999,7 @@ mod tests {
         assert!(template.contains("metrics_enabled = true"));
         assert!(template.contains("metrics_port = 9090"));
         assert!(template.contains("metrics_path = \"/metrics\""));
-        assert!(template.contains("metrics_bind = \"0.0.0.0\""));
+        assert!(template.contains("metrics_bind = \"127.0.0.1\""));
     }
 
     // ==========================================================================

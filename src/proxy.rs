@@ -419,6 +419,7 @@ async fn handle_connection_with_load_balancing(
                 &target_host,
                 target_port,
                 &retry_config,
+                &mut client,
             )
             .await
             {
@@ -518,6 +519,7 @@ async fn handle_degradation(
     target_host: &str,
     target_port: u16,
     retry_config: &RetryConfig,
+    client: &mut TcpStream,
 ) -> Result<Option<(TcpStream, String, UpstreamProxy)>> {
     // Check if degradation mode is active (delay period has elapsed)
     if !runtime.is_degraded().await {
@@ -542,13 +544,20 @@ async fn handle_degradation(
 
         DegradationPolicy::TryAll => {
             let (stream, proxy_id, upstream) =
-                try_all_proxies(config, target_host, target_port, retry_config).await?;
+                try_all_proxies(config, target_host, target_port, retry_config, client).await?;
             Ok(Some((stream, proxy_id, upstream)))
         }
 
         DegradationPolicy::UseLast => {
-            let (stream, proxy_id, upstream) =
-                use_last_proxy(config, state, target_host, target_port, retry_config).await?;
+            let (stream, proxy_id, upstream) = use_last_proxy(
+                config,
+                state,
+                target_host,
+                target_port,
+                retry_config,
+                client,
+            )
+            .await?;
             Ok(Some((stream, proxy_id, upstream)))
         }
 
@@ -569,6 +578,7 @@ async fn try_all_proxies(
     target_host: &str,
     target_port: u16,
     retry_config: &RetryConfig,
+    client: &mut TcpStream,
 ) -> Result<(TcpStream, String, UpstreamProxy)> {
     tracing::warn!("All proxies unhealthy, trying each sequentially (try_all policy)");
 
@@ -608,7 +618,18 @@ async fn try_all_proxies(
         .await;
 
         match connect_result {
-            Ok(Ok(stream)) => {
+            Ok(Ok((stream, trailer))) => {
+                // Relay any early data the proxy pipelined after the 2xx CONNECT
+                // response before handing the stream to the tunnel copy phase.
+                if let Err(e) = forward_trailer_to_client(client, &trailer).await {
+                    tracing::debug!(
+                        proxy = %proxy_cfg.id,
+                        error = %e,
+                        "Failed to forward post-CONNECT early data"
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
                 tracing::info!(
                     proxy = %proxy_cfg.id,
                     "Connection succeeded despite unhealthy status (try_all policy)"
@@ -650,6 +671,7 @@ async fn use_last_proxy(
     target_host: &str,
     target_port: u16,
     retry_config: &RetryConfig,
+    client: &mut TcpStream,
 ) -> Result<(TcpStream, String, UpstreamProxy)> {
     // Get the most recently healthy proxy
     let last_healthy_id = state.get_last_healthy_proxy().await;
@@ -660,7 +682,7 @@ async fn use_last_proxy(
             tracing::warn!(
                 "No proxy has ever been healthy, falling back to try_all (use_last policy)"
             );
-            return try_all_proxies(config, target_host, target_port, retry_config).await;
+            return try_all_proxies(config, target_host, target_port, retry_config, client).await;
         }
     };
 
@@ -677,7 +699,7 @@ async fn use_last_proxy(
                 proxy = %last_healthy_id,
                 "Last healthy proxy no longer in config, falling back to try_all (use_last policy)"
             );
-            return try_all_proxies(config, target_host, target_port, retry_config).await;
+            return try_all_proxies(config, target_host, target_port, retry_config, client).await;
         }
     };
 
@@ -690,7 +712,7 @@ async fn use_last_proxy(
                 error = %e,
                 "Failed to parse last healthy proxy config, falling back to try_all (use_last policy)"
             );
-            return try_all_proxies(config, target_host, target_port, retry_config).await;
+            return try_all_proxies(config, target_host, target_port, retry_config, client).await;
         }
     };
 
@@ -702,7 +724,18 @@ async fn use_last_proxy(
     .await;
 
     match connect_result {
-        Ok(Ok(stream)) => {
+        Ok(Ok((stream, trailer))) => {
+            // Relay any early data the proxy pipelined after the 2xx CONNECT
+            // response before handing the stream to the tunnel copy phase.
+            if let Err(e) = forward_trailer_to_client(client, &trailer).await {
+                tracing::warn!(
+                    proxy = %last_healthy_id,
+                    error = %e,
+                    "Failed to forward post-CONNECT early data, falling back to try_all (use_last policy)"
+                );
+                return try_all_proxies(config, target_host, target_port, retry_config, client)
+                    .await;
+            }
             tracing::info!(
                 proxy = %last_healthy_id,
                 "Connection to last healthy proxy succeeded (use_last policy)"
@@ -715,7 +748,7 @@ async fn use_last_proxy(
                 error = %e,
                 "Last healthy proxy failed, falling back to try_all (use_last policy)"
             );
-            try_all_proxies(config, target_host, target_port, retry_config).await
+            try_all_proxies(config, target_host, target_port, retry_config, client).await
         }
         Err(_) => {
             tracing::warn!(
@@ -723,7 +756,7 @@ async fn use_last_proxy(
                 timeout_secs = TRY_ALL_TIMEOUT_PER_PROXY_SECS,
                 "Last healthy proxy timed out, falling back to try_all (use_last policy)"
             );
-            try_all_proxies(config, target_host, target_port, retry_config).await
+            try_all_proxies(config, target_host, target_port, retry_config, client).await
         }
     }
 }
@@ -781,13 +814,17 @@ async fn direct_connect(
 
 /// Try to establish a CONNECT tunnel through a single proxy.
 ///
-/// Returns the connected upstream socket ready for bidirectional copy.
+/// Returns the connected upstream socket ready for bidirectional copy, along with
+/// any early bytes the proxy pipelined after the 2xx CONNECT response header
+/// (`header_buf[header_end..]`). Callers MUST forward those bytes to the client
+/// before entering the tunnel copy phase; dropping them corrupts the stream
+/// whenever the upstream sends data immediately after establishing the tunnel.
 async fn try_proxy_connect(
     upstream: &UpstreamProxy,
     target_host: &str,
     target_port: u16,
     retry_config: &RetryConfig,
-) -> Result<TcpStream> {
+) -> Result<(TcpStream, Vec<u8>)> {
     // Connect to upstream proxy
     let mut upstream_socket =
         connect_with_retry(&upstream.host, upstream.port, retry_config).await?;
@@ -839,7 +876,21 @@ async fn try_proxy_connect(
         return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
     }
 
-    Ok(upstream_socket)
+    // Preserve any early bytes the proxy pipelined after the response header so
+    // the caller can relay them to the client (mirrors the primary path).
+    let trailer = header_buf[header_end..].to_vec();
+
+    Ok((upstream_socket, trailer))
+}
+
+/// Forward post-CONNECT-header bytes to the client, mirroring the primary path's
+/// trailer relay. A failure here means the client stream is broken; callers must
+/// treat the connection attempt as failed rather than entering the tunnel phase.
+async fn forward_trailer_to_client(client: &mut TcpStream, trailer: &[u8]) -> Result<()> {
+    debug_assert!(!trailer.is_empty());
+    client.write_all(trailer).await?;
+    client.flush().await?;
+    Ok(())
 }
 
 /// Handle a single connection with a fixed upstream proxy.
@@ -993,6 +1044,100 @@ mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
 
+    /// Open a loopback client TcpStream for tests that need a sink argument but
+    /// never assert on what is written to it. Hermetic: 127.0.0.1 only.
+    async fn throwaway_client_stream() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        TcpStream::connect(addr).await.expect("connect loopback")
+    }
+
+    /// A connected (client, peer) loopback socket pair for asserting bytes.
+    async fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).await.expect("connect loopback");
+        let (peer, _) = listener.accept().await.expect("accept loopback");
+        (client, peer)
+    }
+
+    /// Spawn a scripted fake CONNECT proxy on loopback. Each step is
+    /// (delay_ms_before_write, bytes). The proxy first drains the client's
+    /// CONNECT request headers, then plays the script. When `hold_open` is true
+    /// the connection is held open afterwards (tunnel usable); when false it is
+    /// closed so any subsequent connect attempt fails fast. Returns the bound address.
+    async fn spawn_scripted_proxy(
+        script: &[(u64, &[u8])],
+        hold_open: bool,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake proxy");
+        let addr = listener.local_addr().expect("fake proxy addr");
+        let script: Vec<(u64, Vec<u8>)> = script
+            .iter()
+            .map(|(delay, data)| (*delay, data.to_vec()))
+            .collect();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the CONNECT request up to end of headers.
+                let mut buf = [0u8; 4096];
+                let mut seen = 0usize;
+                while seen < 4096 {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            seen += n;
+                            if buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                for (delay, data) in &script {
+                    if *delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(*delay)).await;
+                    }
+                    if sock.write_all(data).await.is_err() {
+                        return;
+                    }
+                    let _ = sock.flush().await;
+                }
+                if hold_open {
+                    // Hold the tunnel open so the stream stays usable.
+                    let mut hold = [0u8; 64];
+                    while let Ok(0) | Err(_) = sock.read(&mut hold).await {}
+                }
+                // Dropping `sock` closes the connection.
+            }
+        });
+        addr
+    }
+
+    fn single_proxy_config(proxy_addr: std::net::SocketAddr) -> AppConfig {
+        use crate::config::{ProxyAuth, ProxyConfig, Settings};
+        AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::UseLast,
+                degradation_delay_secs: 0,
+                ..Settings::default()
+            },
+            proxies: vec![ProxyConfig {
+                id: "fake-proxy".to_string(),
+                url: format!("http://{}", proxy_addr),
+                auth: ProxyAuth::default(),
+                priority: Some(1),
+                health_check_url: None,
+                weight: 100,
+            }],
+            ..AppConfig::default()
+        }
+    }
+
     #[test]
     fn test_transient_error_by_error_kind() {
         // Transient errors should return true
@@ -1133,9 +1278,17 @@ mod tests {
 
         let retry_config = RetryConfig::default();
 
-        // Call handle_degradation - should return None because not degraded yet
-        let result =
-            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none()); // None means "within delay period"
@@ -1167,9 +1320,17 @@ mod tests {
 
         let retry_config = RetryConfig::default();
 
-        // Call handle_degradation - should return Err for fail_closed
-        let result =
-            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("fail_closed"));
@@ -1200,9 +1361,17 @@ mod tests {
 
         let retry_config = RetryConfig::default();
 
-        // Call handle_degradation - should fail because allow_direct_fallback is false
-        let result =
-            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(result
@@ -1293,9 +1462,17 @@ mod tests {
 
         let retry_config = RetryConfig::default();
 
-        // Call handle_degradation - should fail since no proxies to try
-        let result =
-            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No proxies"));
@@ -1344,9 +1521,17 @@ mod tests {
         let retry_config = RetryConfig::default();
 
         // Call handle_degradation - use_last should fail since no proxy was ever healthy
-        // It will try try_all as fallback, which will fail on connection attempt
-        let result =
-            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
 
         // Should fail because we can't connect to the invalid proxies
         assert!(result.is_err());
@@ -1379,9 +1564,17 @@ mod tests {
 
         let retry_config = RetryConfig::default();
 
-        // Should immediately apply fail_closed (return error)
-        let result =
-            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("fail_closed"));
@@ -1418,6 +1611,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_use_last_proxy_forwards_trailer_after_2xx() {
+        // REGRESSION: early data the proxy pipelined after the 2xx CONNECT
+        // response must reach the client byte-exact before the tunnel phase.
+        // With the old code (trailer discarded) this test fails because the
+        // client would never receive EARLY42.
+        let proxy_addr = spawn_scripted_proxy(
+            &[(
+                0,
+                &b"HTTP/1.1 200 Connection established\r\n\r\nEARLY42"[..],
+            )],
+            true,
+        )
+        .await;
+        let config = single_proxy_config(proxy_addr);
+        let state = crate::state::StateStore::new_for_testing();
+        state
+            .record_health_check("fake-proxy", true, None, None, 1)
+            .await;
+
+        let retry_config = RetryConfig::default();
+        let (mut client, mut client_peer) = loopback_pair().await;
+
+        let result = use_last_proxy(
+            &config,
+            &state,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
+
+        let (_upstream_socket, proxy_id, _upstream) =
+            result.expect("use_last_proxy should succeed");
+        assert_eq!(proxy_id, "fake-proxy");
+
+        let mut buf = [0u8; b"EARLY42".len()];
+        tokio::time::timeout(Duration::from_secs(5), client_peer.read_exact(&mut buf))
+            .await
+            .expect("timely trailer delivery")
+            .expect("peer read");
+        assert_eq!(&buf, b"EARLY42");
+
+        // Nothing else was pipelined: a further read must stay empty.
+        let mut extra = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(150), client_peer.read(&mut extra)).await {
+            Err(_) | Ok(Ok(0)) => {} // timed out or EOF: no extra bytes
+            Ok(Ok(n)) => panic!("unexpected extra bytes after trailer: {n}"),
+            Ok(Err(e)) => panic!("unexpected peer read error after trailer: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_407_yields_err_and_zero_trailer_bytes() {
+        // NEGATIVE CONTROL: non-2xx CONNECT response yields Err and writes zero
+        // bytes to the client stream, even though the proxy sent trailing bytes.
+        let proxy_addr = spawn_scripted_proxy(
+            &[(
+                0,
+                &b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\nDENIED!"[..],
+            )],
+            false,
+        )
+        .await;
+        let config = single_proxy_config(proxy_addr);
+        let state = crate::state::StateStore::new_for_testing();
+        state
+            .record_health_check("fake-proxy", true, None, None, 1)
+            .await;
+
+        let retry_config = RetryConfig::default();
+        let (mut client, mut client_peer) = loopback_pair().await;
+
+        let result = use_last_proxy(
+            &config,
+            &state,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "407 CONNECT response must fail the attempt"
+        );
+
+        // Client received nothing at all.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(150), client_peer.read(&mut probe)).await {
+            Err(_) => {} // timed out: zero bytes delivered
+            Ok(Ok(n)) => panic!("client must receive zero bytes on failed CONNECT, got {n}"),
+            Ok(Err(e)) => panic!("unexpected peer read error on failed CONNECT: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_all_proxy_header_split_across_reads_forwards_trailer() {
+        // Header split across multiple small reads must still parse and forward
+        // its post-header bytes through try_all_proxies.
+        let proxy_addr = spawn_scripted_proxy(
+            &[
+                (10, &b"HTTP/1.1 200 Connec"[..]),
+                (10, &b"tion established\r\n"[..]),
+                (20, &b"\r\nEARLY77"[..]),
+            ],
+            true,
+        )
+        .await;
+
+        let config = single_proxy_config(proxy_addr);
+
+        let retry_config = RetryConfig::default();
+        let (mut client, mut client_peer) = loopback_pair().await;
+
+        let result = try_all_proxies(&config, "example.com", 443, &retry_config, &mut client).await;
+
+        let (_upstream_socket, proxy_id, _upstream) =
+            result.expect("try_all_proxies should succeed");
+        assert_eq!(proxy_id, "fake-proxy");
+
+        let mut buf = [0u8; b"EARLY77".len()];
+        tokio::time::timeout(Duration::from_secs(5), client_peer.read_exact(&mut buf))
+            .await
+            .expect("timely trailer delivery")
+            .expect("peer read");
+        assert_eq!(&buf, b"EARLY77");
+    }
+
+    #[tokio::test]
     async fn test_degradation_respects_delay_before_activation() {
         use crate::config::{AppConfig, DegradationPolicy, Settings};
 
@@ -1444,9 +1768,17 @@ mod tests {
 
         let retry_config = RetryConfig::default();
 
-        // handle_degradation should return Ok(None) indicating within delay period
-        let result =
-            handle_degradation(&config, &state, &runtime, "example.com", 443, &retry_config).await;
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none()); // None = within delay period

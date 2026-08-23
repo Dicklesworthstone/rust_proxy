@@ -101,7 +101,7 @@ enum Commands {
         /// Machine output format (json or toon)
         #[arg(long, value_enum)]
         format: Option<OutputFormatArg>,
-        /// Only output errors (no success messages)
+        /// Only print failing checks; silence on success
         #[arg(long)]
         quiet: bool,
         /// Skip network connectivity tests
@@ -857,19 +857,61 @@ fn deactivate_cmd(keep_rules: bool, _output: &OutputDispatcher) -> Result<()> {
     config.active_proxy = None;
     config.save()?;
 
-    if !keep_rules {
-        match iptables::require_root() {
-            Ok(_) => {
-                iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
-            }
-            Err(err) => {
-                println!("Note: {}", err);
-            }
+    let rules_present = iptables::chain_present(&config.settings.chain_name)
+        || ipset_present(&config.settings.ipset_name);
+
+    match deactivate_action(rules_present, iptables::require_root().is_ok(), keep_rules) {
+        DeactivateAction::ProceedClear => {
+            iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
+            println!("Proxy routing deactivated.");
+        }
+        DeactivateAction::WarnRemains => {
+            eprintln!(
+                "Warning: not running as root; routing rules were NOT removed and remain active."
+            );
+            eprintln!(
+                "Remaining: iptables chain '{}' and ipset '{}'.",
+                config.settings.chain_name, config.settings.ipset_name
+            );
+            eprintln!("Re-run with sudo to remove them: sudo rust_proxy deactivate");
+            std::process::exit(1);
+        }
+        DeactivateAction::NoteKept => {
+            println!("Proxy routing deactivated (rules intentionally kept).");
         }
     }
 
-    println!("Proxy routing deactivated.");
     Ok(())
+}
+
+/// Pure decision helper for `deactivate`: what should the command do about rules?
+fn deactivate_action(rules_present: bool, is_root: bool, keep_rules: bool) -> DeactivateAction {
+    if keep_rules {
+        return DeactivateAction::NoteKept;
+    }
+    if !rules_present || is_root {
+        return DeactivateAction::ProceedClear;
+    }
+    DeactivateAction::WarnRemains
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeactivateAction {
+    /// Rules absent or root available: clear them and report success.
+    ProceedClear,
+    /// Rules present but cannot be removed (not root): warn and exit non-zero.
+    WarnRemains,
+    /// --keep-rules: no removal attempted; success with an explicit note.
+    NoteKept,
+}
+
+/// True when the named ipset exists (complements `iptables::chain_present`).
+fn ipset_present(ipset_name: &str) -> bool {
+    std::process::Command::new("ipset")
+        .args(["list", ipset_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn diagnose_cmd(_output: &OutputDispatcher) -> Result<()> {
@@ -1039,6 +1081,16 @@ async fn doctor_cmd(output: &OutputDispatcher, offline: bool) -> Result<()> {
 }
 
 fn print_doctor_report(output: &OutputDispatcher, report: &DoctorReport) {
+    if output.mode().is_quiet() {
+        // Quiet contract: only failing checks, plain text on stdout, one per line,
+        // no ANSI; a fully healthy report prints nothing. `print_plain` is a no-op
+        // in Quiet mode, so write straight to stdout here.
+        for line in doctor_quiet_lines(report) {
+            println!("{line}");
+        }
+        return;
+    }
+
     output.print_rich("\n[bold]rust_proxy doctor[/]\n");
 
     for check in &report.checks {
@@ -1073,6 +1125,19 @@ fn print_doctor_report(output: &OutputDispatcher, report: &DoctorReport) {
         status_text, summary.passed, summary.warnings, summary.errors
     ));
     output.newline();
+}
+
+/// Pure helper: lines to emit for `doctor --quiet` (non-Ok checks, plain text).
+fn doctor_quiet_lines(report: &DoctorReport) -> Vec<String> {
+    report
+        .checks
+        .iter()
+        .filter(|check| check.status != DoctorStatus::Ok)
+        .map(|check| match check.suggestion.as_deref() {
+            Some(suggestion) => format!("{}: {} (fix: {})", check.name, check.message, suggestion),
+            None => format!("{}: {}", check.name, check.message),
+        })
+        .collect()
 }
 
 async fn check_config_file() -> DoctorCheck {
@@ -2038,12 +2103,12 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
     Ok(())
 }
 
-fn output_test_json(decision: &RoutingDecision, output: &OutputDispatcher) -> Result<()> {
-    let payload = serde_json::json!({
-        "input": decision.input,
-        "domain": decision.domain,
-        "resolved_ips": decision.resolved_ips,
-        "dns_error": decision.dns_error,
+fn test_decision_payload(decision: &RoutingDecision) -> serde_json::Value {
+    serde_json::json!({
+        "input": decision.input.clone(),
+        "domain": decision.domain.clone(),
+        "resolved_ips": decision.resolved_ips.clone(),
+        "dns_error": decision.dns_error.clone(),
         "would_proxy": decision.would_proxy,
         "active_proxy": decision.active_proxy.as_ref().map(|(id, url)| {
             serde_json::json!({
@@ -2053,7 +2118,7 @@ fn output_test_json(decision: &RoutingDecision, output: &OutputDispatcher) -> Re
         }),
         "routing_decision": {
             "domain_in_targets": decision.domain_in_targets,
-            "target_provider": decision.target_provider,
+            "target_provider": decision.target_provider.clone(),
             "provider_range_matches": decision.provider_range_matches.iter().map(|m| {
                 serde_json::json!({
                     "ip": m.ip,
@@ -2064,7 +2129,11 @@ fn output_test_json(decision: &RoutingDecision, output: &OutputDispatcher) -> Re
         },
         "daemon_running": decision.daemon_running,
         "suggestions": build_suggestions(decision)
-    });
+    })
+}
+
+fn output_test_json(decision: &RoutingDecision, output: &OutputDispatcher) -> Result<()> {
+    let payload = test_decision_payload(decision);
     output.print_json(&payload);
     Ok(())
 }
@@ -2145,10 +2214,11 @@ fn output_test_standard(decision: &RoutingDecision, verbose: bool) {
     // Suggestions
     let suggestions = build_suggestions(decision);
     if !suggestions.is_empty() {
-        println!();
-        println!("Suggestions:");
         for suggestion in suggestions {
-            println!("  • {}", suggestion);
+            match suggestion.split_once(": ") {
+                Some((label, command)) => println!("  • {}: {}", label, command.cyan()),
+                None => println!("  • {}", suggestion),
+            }
         }
     }
 
@@ -2167,16 +2237,13 @@ fn build_suggestions(decision: &RoutingDecision) -> Vec<String> {
 
     if !decision.would_proxy {
         suggestions.push(format!(
-            "Add domain to targets: {}",
-            format!("rust_proxy targets add {}", decision.domain).cyan()
+            "Add domain to targets: rust_proxy targets add {}",
+            decision.domain
         ));
     }
 
     if decision.active_proxy.is_none() && (decision.domain_in_targets || decision.would_proxy) {
-        suggestions.push(format!(
-            "Activate a proxy: {}",
-            "rust_proxy activate --select".cyan()
-        ));
+        suggestions.push("Activate a proxy: rust_proxy activate --select".to_string());
     }
 
     suggestions
@@ -3269,4 +3336,196 @@ async fn refresh_target_entries(
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Scope A: machine-mode payloads must be free of ANSI escapes
+    // =========================================================================
+
+    fn fixture_decision() -> RoutingDecision {
+        RoutingDecision {
+            input: "https://api.anthropic.com/v1/messages".to_string(),
+            domain: "api.anthropic.com".to_string(),
+            resolved_ips: vec!["104.18.32.47".to_string()],
+            dns_error: None,
+            would_proxy: false,
+            domain_in_targets: true,
+            target_provider: None,
+            provider_range_matches: vec![ProviderMatch {
+                ip: "104.18.32.47".to_string(),
+                provider: "anthropic".to_string(),
+                cidr: "104.18.32.0/19".to_string(),
+            }],
+            daemon_running: false,
+            active_proxy: None,
+        }
+    }
+
+    fn assert_no_ansi(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::String(s) => assert!(
+                !s.contains('\u{1b}'),
+                "ANSI escape leaked into serialized payload string: {s:?}"
+            ),
+            serde_json::Value::Array(items) => items.iter().for_each(assert_no_ansi),
+            serde_json::Value::Object(map) => map.values().for_each(assert_no_ansi),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_json_payload_is_ansi_free_and_suggestions_plain() {
+        // Fixture hits both suggestion branches: would_proxy=true + no active
+        // proxy + domain not in targets.
+        let decision = fixture_decision();
+        let payload = test_decision_payload(&decision);
+
+        assert_no_ansi(&payload);
+
+        let suggestions = payload["suggestions"]
+            .as_array()
+            .expect("suggestions array");
+        assert!(
+            suggestions.iter().any(|s| s
+                .as_str()
+                .unwrap_or("")
+                .starts_with("Activate a proxy: rust_proxy activate --select")),
+            "expected plain 'Activate a proxy' suggestion, got {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|s| s.as_str().unwrap_or("")
+                == "Add domain to targets: rust_proxy targets add api.anthropic.com"),
+            "expected plain 'Add domain to targets' suggestion, got {suggestions:?}"
+        );
+    }
+
+    // =========================================================================
+    // Scope B: doctor --quiet prints failing checks only, plain, on stdout
+    // =========================================================================
+
+    fn healthy_report() -> DoctorReport {
+        DoctorReport {
+            healthy: true,
+            checks: vec![
+                DoctorCheck::ok("Config File", "Found at /tmp/config.toml"),
+                DoctorCheck::ok("Network Tests", "Skipped (--offline mode)"),
+            ],
+            summary: DoctorSummary {
+                total: 2,
+                passed: 2,
+                warnings: 0,
+                errors: 0,
+            },
+        }
+    }
+
+    fn failing_report() -> DoctorReport {
+        DoctorReport {
+            healthy: false,
+            checks: vec![
+                DoctorCheck::ok("State Directory", "Found"),
+                DoctorCheck::error(
+                    "Config File",
+                    "Not found at /tmp/config.toml",
+                    "Run 'rp init' to create a default configuration",
+                ),
+            ],
+            summary: DoctorSummary {
+                total: 2,
+                passed: 1,
+                warnings: 0,
+                errors: 1,
+            },
+        }
+    }
+
+    fn mixed_report() -> DoctorReport {
+        DoctorReport {
+            healthy: false,
+            checks: vec![
+                DoctorCheck::warning(
+                    "Active Proxy",
+                    "No proxy is currently active",
+                    "Run 'rp activate --select'",
+                ),
+                DoctorCheck::ok("DNS Resolution", "Resolved api.anthropic.com"),
+                DoctorCheck::error("Listen Port", "Port 8080 in use", "Free the port"),
+            ],
+            summary: DoctorSummary {
+                total: 3,
+                passed: 1,
+                warnings: 1,
+                errors: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn doctor_quiet_lines_healthy_report_is_empty() {
+        assert!(doctor_quiet_lines(&healthy_report()).is_empty());
+    }
+
+    #[test]
+    fn doctor_quiet_lines_failing_report_lists_only_failures_with_fix() {
+        let lines = doctor_quiet_lines(&failing_report());
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains('\u{1b}'));
+        assert_eq!(
+            lines[0],
+            "Config File: Not found at /tmp/config.toml (fix: Run 'rp init' to create a default configuration)"
+        );
+    }
+
+    #[test]
+    fn doctor_quiet_lines_mixed_report_skips_ok_checks_and_is_ansi_free() {
+        let lines = doctor_quiet_lines(&mixed_report());
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| !l.contains('\u{1b}')));
+        assert!(lines[0].starts_with("Active Proxy: No proxy is currently active"));
+        assert!(lines[1].starts_with("Listen Port: Port 8080 in use"));
+        assert!(
+            !lines.iter().any(|l| l.contains("DNS Resolution")),
+            "Ok checks must be silent in quiet mode"
+        );
+    }
+
+    // =========================================================================
+    // Scope C: deactivate decision matrix without root
+    // =========================================================================
+
+    #[test]
+    fn deactivate_action_keep_rules_always_notes_kept() {
+        assert_eq!(
+            deactivate_action(true, false, true),
+            DeactivateAction::NoteKept
+        );
+    }
+
+    #[test]
+    fn deactivate_action_rules_present_but_not_root_warns() {
+        assert_eq!(
+            deactivate_action(true, false, false),
+            DeactivateAction::WarnRemains
+        );
+    }
+
+    #[test]
+    fn deactivate_action_rules_present_and_root_proceeds_to_clear() {
+        assert_eq!(
+            deactivate_action(true, true, false),
+            DeactivateAction::ProceedClear
+        );
+    }
+
+    #[test]
+    fn deactivate_action_rules_absent_proceeds_even_without_root() {
+        assert_eq!(
+            deactivate_action(false, false, false),
+            DeactivateAction::ProceedClear
+        );
+    }
 }

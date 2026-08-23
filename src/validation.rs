@@ -457,6 +457,27 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
         );
     }
 
+    // Warn when metrics would be exposed beyond loopback while enabled
+    if settings.metrics_enabled && !settings.metrics_bind.trim().is_empty() {
+        if let Ok(ip) = settings.metrics_bind.trim().parse::<std::net::IpAddr>() {
+            if !ip.is_loopback() {
+                results.push(
+                    ValidationResult::warning(
+                        "settings",
+                        format!(
+                            "metrics_bind ({}) exposes the metrics endpoint beyond localhost",
+                            settings.metrics_bind
+                        ),
+                    )
+                    .with_id("metrics_bind")
+                    .with_suggestion(
+                        "Metrics may contain sensitive operational data; expose them only on trusted networks, or bind to 127.0.0.1",
+                    ),
+                );
+            }
+        }
+    }
+
     // dns_refresh_secs
     if settings.dns_refresh_secs == 0 {
         results.push(
@@ -927,6 +948,44 @@ mod tests {
         let results = validate_settings(&settings);
         assert!(results.iter().any(|r| {
             r.severity == ValidationSeverity::Error && r.message.contains("metrics_bind")
+        }));
+    }
+
+    #[test]
+    fn test_validate_metrics_bind_default_loopback_no_warning() {
+        let settings = Settings::default();
+        assert_eq!(settings.metrics_bind, "127.0.0.1");
+        let results = validate_settings(&settings);
+        assert!(!results.iter().any(|r| {
+            r.severity == ValidationSeverity::Warning && r.message.contains("metrics_bind")
+        }));
+    }
+
+    #[test]
+    fn test_validate_metrics_bind_non_loopback_warns() {
+        let settings = Settings {
+            metrics_bind: "0.0.0.0".to_string(),
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(results.iter().any(|r| {
+            r.severity == ValidationSeverity::Warning
+                && r.category == "settings"
+                && r.message.contains("metrics_bind")
+                && r.message.contains("beyond localhost")
+        }));
+    }
+
+    #[test]
+    fn test_validate_metrics_disabled_no_bind_warning() {
+        let settings = Settings {
+            metrics_enabled: false,
+            metrics_bind: "0.0.0.0".to_string(),
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        assert!(!results.iter().any(|r| {
+            r.severity == ValidationSeverity::Warning && r.message.contains("metrics_bind")
         }));
     }
 

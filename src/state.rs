@@ -72,11 +72,28 @@ impl State {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed reading state {}", path.display()))?;
-        let state: State = serde_json::from_str(&content)
-            .with_context(|| format!("Failed parsing state {}", path.display()))?;
-        Ok(state)
+        let parsed = fs::read_to_string(path)
+            .with_context(|| format!("Failed reading state {}", path.display()))
+            .and_then(|content| {
+                serde_json::from_str(&content)
+                    .with_context(|| format!("Failed parsing state {}", path.display()))
+            });
+        match parsed {
+            Ok(state) => Ok(state),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Corrupt state file; quarantining it and continuing with default state"
+                );
+                let ts = Utc::now().timestamp();
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(format!(".corrupt-{}", ts));
+                // Best-effort: a failed quarantine must not block daemon startup.
+                let _ = fs::rename(path, PathBuf::from(sidecar));
+                Ok(Self::default())
+            }
+        }
     }
 
     pub fn save(&self, path: &PathBuf) -> Result<()> {
@@ -85,8 +102,22 @@ impl State {
                 .with_context(|| format!("Failed creating state dir {}", parent.display()))?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(path, content)
-            .with_context(|| format!("Failed writing state {}", path.display()))?;
+        // Write to a sibling temp file, then atomically rename onto the final
+        // path so readers never observe partial content.
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(format!(".tmp-{}", std::process::id()));
+        let tmp_path = PathBuf::from(tmp_name);
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp_path)
+                .with_context(|| format!("Failed creating temp state {}", tmp_path.display()))?;
+            f.write_all(content.as_bytes())
+                .with_context(|| format!("Failed writing temp state {}", tmp_path.display()))?;
+            f.flush()
+                .with_context(|| format!("Failed flushing temp state {}", tmp_path.display()))?;
+        }
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("Failed renaming state into place {}", path.display()))?;
         Ok(())
     }
 }
@@ -712,5 +743,70 @@ mod tests {
         assert_eq!(format!("{}", HealthStatus::Healthy), "healthy");
         assert_eq!(format!("{}", HealthStatus::Degraded), "degraded");
         assert_eq!(format!("{}", HealthStatus::Unhealthy), "unhealthy");
+    }
+
+    #[test]
+    fn test_state_save_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut state = State::default();
+        state
+            .proxies
+            .insert("proxy-a".to_string(), ProxyStats::default());
+        state.save(&path).unwrap();
+
+        let loaded = State::load(&path).unwrap();
+        // Compare via canonical serialization (State does not derive PartialEq).
+        assert_eq!(
+            serde_json::to_string_pretty(&loaded).unwrap(),
+            serde_json::to_string_pretty(&state).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_state_load_recovers_from_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.proxies.len(), 0);
+
+        let mut sidecars: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("state.json.corrupt-"))
+            .collect();
+        sidecars.sort();
+        assert_eq!(sidecars.len(), 1, "exactly one corrupt sidecar expected");
+        let kept = std::fs::read_to_string(dir.path().join(&sidecars[0])).unwrap();
+        assert_eq!(kept, "{ this is not valid json", "original bytes preserved");
+        assert!(
+            !path.exists(),
+            "corrupt file moved aside, not left in place"
+        );
+    }
+
+    #[test]
+    fn test_state_double_save_leaves_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        for i in 0..2 {
+            let mut state = State::default();
+            state
+                .proxies
+                .insert(format!("proxy-{}", i), ProxyStats::default());
+            state.save(&path).unwrap();
+        }
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["state.json"], "no temp files may linger");
+        let loaded = State::load(&path).unwrap();
+        assert!(loaded.proxies.contains_key("proxy-1"));
     }
 }
