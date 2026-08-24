@@ -92,6 +92,7 @@ impl ConfigWatcher {
             .watch(watch_path, RecursiveMode::NonRecursive)
             .with_context(|| format!("Failed to watch path: {}", watch_path.display()))?;
 
+
         info!(
             path = %config_path.display(),
             "Config watcher initialized"
@@ -262,6 +263,33 @@ mod tests {
     }
 
     #[test]
+
+    /// TEMP-DIAGNOSTIC (remove before commit): does the real notify backend
+    /// deliver events inside THIS workspace's build?
+    #[test]
+    fn temp_live_notify_delivers_events_in_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, "a = 1\n").unwrap();
+
+        let mut watcher = ConfigWatcher::new(&config_path).unwrap();
+        assert!(!watcher.poll(), "no event yet");
+
+        std::fs::write(&config_path, "a = 2\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut fired = false;
+        while std::time::Instant::now() < deadline {
+            if watcher.poll() {
+                fired = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(fired, "notify backend delivered no events within 5s");
+    }
+
+    #[test]
+    fn test_watcher_nonexistent_file() {
     fn test_watcher_nonexistent_file() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("nonexistent.toml");

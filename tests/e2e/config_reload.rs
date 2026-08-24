@@ -97,6 +97,18 @@ fn render_config(mock_port: u16, listen_port: u16, proxy_id: &str) -> String {
     )
 }
 
+/// Kills the daemon on scope exit — including test panics. A dropped
+/// `std::process::Child` is NOT terminated, and a leaked daemon would serve
+/// stale configs to later tests (and poison their port probes).
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn spawn_daemon(home: &ReloadHome, stderr_file: &Path) -> Result<Child> {
     let stderr = std::fs::File::create(stderr_file)?;
     Command::new(proxy_binary())
@@ -171,10 +183,9 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
     let workdir = TempDir::new()?;
     let stderr_path = workdir.path().join("daemon.stderr.log");
 
-    let mut child = spawn_daemon(&home, &stderr_path)?;
+    let mut child = ChildGuard(spawn_daemon(&home, &stderr_path)?);
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse()?;
     if let Err(err) = wait_for_listener(listen_addr).await {
-        let _ = child.kill();
         panic!("daemon failed to boot: {err:#}\n--- stderr ---\n{}", read_stderr(&stderr_path));
     }
 
@@ -199,9 +210,8 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
     // debounce 500ms; budget covers scheduler jitter).
     let deadline = tokio::time::Instant::now() + RELOAD_BUDGET;
     while mock_b.get_requests().is_empty() {
-        assert_alive(&mut child, "while awaiting reload pickup");
+        assert_alive(&mut child.0, "while awaiting reload pickup");
         if tokio::time::Instant::now() >= deadline {
-            let _ = child.kill();
             panic!(
                 "hot-reloaded proxy set never took effect\n--- stderr ---\n{}",
                 read_stderr(&stderr_path)
@@ -213,7 +223,7 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
 
     // No restart happened: same process, listener served throughout, and the
     // startup log appears exactly once.
-    assert_alive(&mut child, "after reload pickup");
+    assert_alive(&mut child.0, "after reload pickup");
     let stderr = read_stderr(&stderr_path);
     assert_eq!(
         stderr.matches("transparent proxy listening on").count(),
@@ -225,8 +235,6 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
         "daemon must not panic across a valid reload"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
     Ok(())
 }
 
@@ -242,7 +250,7 @@ async fn invalid_config_edit_keeps_last_known_good() -> Result<()> {
     let workdir = TempDir::new()?;
     let stderr_path = workdir.path().join("daemon.stderr.log");
 
-    let mut child = spawn_daemon(&home, &stderr_path)?;
+    let mut child = ChildGuard(spawn_daemon(&home, &stderr_path)?);
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse()?;
     wait_for_listener(listen_addr).await?;
 
@@ -253,7 +261,7 @@ async fn invalid_config_edit_keeps_last_known_good() -> Result<()> {
     tokio::time::sleep(RELOAD_BUDGET.min(Duration::from_secs(4))).await;
 
     // Daemon alive, still serving, routed to the original proxy.
-    assert_alive(&mut child, "after invalid config edit");
+    assert_alive(&mut child.0, "after invalid config edit");
     tunnel_attempt(listen_addr).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while mock_a.get_requests().is_empty() {
@@ -269,7 +277,5 @@ async fn invalid_config_edit_keeps_last_known_good() -> Result<()> {
         "expected rejection warning on stderr\n--- stderr ---\n{stderr}"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
     Ok(())
 }
