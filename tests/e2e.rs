@@ -16,3 +16,6 @@ mod daemon_path;
 
 #[path = "e2e/routing_and_failover.rs"]
 mod routing_and_failover;
+
+#[path = "e2e/config_reload.rs"]
+mod config_reload;
