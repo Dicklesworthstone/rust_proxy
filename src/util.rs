@@ -744,6 +744,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart={binary} daemon
+ExecStartPre={binary} cleanup-stale
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
@@ -1077,6 +1078,10 @@ mod tests {
         let binary = std::path::Path::new("/usr/local/bin/rust_proxy");
         let config = std::path::Path::new("/etc/rust_proxy/config.toml");
         let service = generate_service_file(binary, config, "root", "root", false);
+        assert!(service.contains(&format!(
+            "ExecStartPre={binary} cleanup-stale",
+            binary = "/usr/local/bin/rust_proxy"
+        )));
         assert!(service.contains("ExecStart=/usr/local/bin/rust_proxy daemon"));
         assert!(service.contains("Environment=RUST_PROXY_CONFIG=/etc/rust_proxy/config.toml"));
         assert!(service.contains("User=root"));

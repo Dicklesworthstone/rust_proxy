@@ -207,6 +207,15 @@ sudo rust_proxy deactivate
 sudo rust_proxy deactivate --keep-rules
 ```
 
+### `rust_proxy cleanup-stale`
+Clear firewall/pid state left by a crashed daemon (SIGKILL, OOM, panic).
+Refuses while a live daemon holds the pidfile. Invoked automatically by the
+systemd unit's `ExecStartPre`; safe to run manually.
+
+```bash
+sudo rust_proxy cleanup-stale
+```
+
 ### `rust_proxy list`
 Show proxy stats table.
 

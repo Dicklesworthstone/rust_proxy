@@ -261,6 +261,53 @@ pub fn chain_present(chain_name: &str) -> bool {
     dispatch("iptables", &["-t", "nat", "-S", chain_name], None).is_ok()
 }
 
+/// What `iptables -t nat -S <chain>` says about rules left by a previous run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSnapshot {
+    /// The chain exists (was created by us or a predecessor).
+    pub present: bool,
+    /// REDIRECT `--to-ports` values found among the chain's rules.
+    pub redirect_ports: Vec<u16>,
+}
+
+/// Parse the rule listing emitted by `iptables -t nat -S <chain>`.
+/// Rule lines look like `-A CHAIN ... -j REDIRECT --to-ports 12345`;
+/// declaration (`-N`) / builtin policy lines carry no `-A ` prefix.
+pub fn parse_chain_rules(rules: &str) -> ChainSnapshot {
+    let mut redirect_ports = Vec::new();
+    for line in rules.lines() {
+        let line = line.trim_start();
+        if !line.starts_with("-A ") {
+            continue;
+        }
+        if let Some(pos) = line.find("--to-ports ") {
+            let port_str = line[pos + "--to-ports ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if let Ok(port) = port_str.parse::<u16>() {
+                redirect_ports.push(port);
+            }
+        }
+    }
+    ChainSnapshot {
+        present: !rules.trim().is_empty(),
+        redirect_ports,
+    }
+}
+
+/// Snapshot any chain remnants from a previous run. A missing chain is not
+/// an error — it just means a clean slate.
+pub fn chain_snapshot(chain_name: &str) -> Result<ChainSnapshot> {
+    match dispatch("iptables", &["-t", "nat", "-S", chain_name], None) {
+        Ok(out) => Ok(parse_chain_rules(&out)),
+        Err(_) => Ok(ChainSnapshot {
+            present: false,
+            redirect_ports: Vec::new(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +531,39 @@ mod tests {
         assert!(!flat.contains(&"owner".to_string()));
         assert!(!flat.contains(&"--uid-owner".to_string()));
         assert!(!flat.contains(&"mark".to_string()));
+    }
+
+    #[test]
+    fn parse_chain_rules_extracts_redirect_ports() {
+        let rules = "-A RP -d 127.0.0.0/8 -j RETURN\n\
+                     -A RP -p tcp -m set --match-set rp_set dst -j REDIRECT --to-ports 12345\n";
+        let snap = parse_chain_rules(rules);
+        assert!(snap.present);
+        assert_eq!(snap.redirect_ports, vec![12345]);
+    }
+
+    #[test]
+    fn parse_chain_rules_handles_empty_and_declaration_only_output() {
+        // Missing chain: empty output.
+        let snap = parse_chain_rules("");
+        assert!(!snap.present);
+        assert!(snap.redirect_ports.is_empty());
+
+        // Chain created but flushed: only the declaration line.
+        let snap = parse_chain_rules("-N RP\n");
+        assert!(snap.present, "a declared-but-empty chain still exists");
+        assert!(snap.redirect_ports.is_empty());
+    }
+
+    #[test]
+    fn parse_chain_rules_ignores_non_rule_lines_and_bad_ports() {
+        let rules = "-P INPUT ACCEPT\n\
+                     garbage line\n\
+                     -A RP -j REDIRECT --to-ports notaport\n";
+        let snap = parse_chain_rules(rules);
+        // The malformed-redirect rule line is still a rule (chain has rules),
+        // but contributes no port.
+        assert!(snap.present);
+        assert!(snap.redirect_ports.is_empty());
     }
 }

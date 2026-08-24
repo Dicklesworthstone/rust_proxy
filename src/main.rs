@@ -82,6 +82,8 @@ enum Commands {
         #[arg(long)]
         keep_rules: bool,
     },
+    /// Clear stale firewall/pid state left by a crashed daemon
+    CleanupStale,
     /// Manage systemd service files
     Service {
         #[command(subcommand)]
@@ -342,6 +344,10 @@ async fn main() -> Result<()> {
         Commands::Deactivate { keep_rules } => {
             let output = OutputDispatcher::from_flags(false, false, None);
             deactivate_cmd(keep_rules, &output)?
+        }
+        Commands::CleanupStale => {
+            let output = OutputDispatcher::from_flags(false, false, None);
+            cleanup_stale_cmd(&output)?
         }
         Commands::Service { action } => {
             let output = OutputDispatcher::from_flags(false, false, None);
@@ -912,6 +918,98 @@ fn ipset_present(ipset_name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// What `cleanup-stale` should do given what it found. Pure for tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupAction {
+    /// A live daemon owns the rules: refuse to touch anything.
+    RefuseLive(u32),
+    /// No chain remnants and no (dead) pidfile owner: nothing to do.
+    NothingStale,
+    /// Crash leftovers present: clear rules and/or remove the stale pidfile.
+    ClearStale {
+        had_chain: bool,
+        stale_pid: Option<u32>,
+    },
+}
+
+fn cleanup_action(
+    pidfile_pid: Option<u32>,
+    is_alive: impl Fn(u32) -> bool,
+    chain_present: bool,
+) -> CleanupAction {
+    if let Some(pid) = pidfile_pid {
+        if is_alive(pid) {
+            return CleanupAction::RefuseLive(pid);
+        }
+    }
+    let stale_pid = pidfile_pid.filter(|pid| !is_alive(*pid));
+    if chain_present || stale_pid.is_some() {
+        CleanupAction::ClearStale {
+            had_chain: chain_present,
+            stale_pid,
+        }
+    } else {
+        CleanupAction::NothingStale
+    }
+}
+
+fn cleanup_stale_cmd(output: &OutputDispatcher) -> Result<()> {
+    let config = AppConfig::load()?;
+    let pid_path = std::path::PathBuf::from(state::DEFAULT_PID_PATH);
+    let pidfile_pid = state::read_pidfile(&pid_path);
+    let snapshot = iptables::chain_snapshot(&config.settings.chain_name)?;
+
+    match cleanup_action(pidfile_pid, state::process_alive, snapshot.present) {
+        CleanupAction::RefuseLive(pid) => {
+            output.print_json(&serde_json::json!({
+                "cleared": false,
+                "live_daemon_pid": pid,
+                "had_chain": snapshot.present,
+                "stale_pid_removed": null,
+            }));
+            bail!("Daemon is alive (pid {pid}); refusing to clear state it owns.");
+        }
+        CleanupAction::NothingStale => {
+            output.print_json(&serde_json::json!({
+                "cleared": false,
+                "live_daemon_pid": null,
+                "had_chain": false,
+                "stale_pid_removed": null,
+            }));
+            Ok(())
+        }
+        CleanupAction::ClearStale {
+            had_chain,
+            stale_pid,
+        } => {
+            // Removal mutates firewall state; mirror deactivate's rule of
+            // only attempting as root.
+            if !iptables::require_root().is_ok() {
+                bail!(
+                    "Found stale state (chain: {had_chain}, stale pidfile: {}) \
+                     but root is required to remove it. Re-run with sudo.",
+                    stale_pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                );
+            }
+            if had_chain {
+                iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
+            }
+            if stale_pid.is_some() {
+                state::remove_pidfile(&pid_path);
+            }
+            output.print_json(&serde_json::json!({
+                "cleared": true,
+                "live_daemon_pid": null,
+                "had_chain": had_chain,
+                "stale_pid_removed": stale_pid,
+            }));
+            Ok(())
+        }
+    }
 }
 
 fn diagnose_cmd(_output: &OutputDispatcher) -> Result<()> {
@@ -3173,6 +3271,27 @@ async fn run_daemon() -> Result<()> {
     let test_mode = std::env::var("RUST_PROXY_TEST_MODE").as_deref() == Ok("1");
     if !test_mode {
         iptables::require_root()?;
+
+        // Single-daemon guarantee + crash detection: a pidfile holding a
+        // live pid means another daemon owns the firewall rules; a dead one
+        // means a predecessor crashed and likely left stale state behind.
+        let pid_path = std::path::PathBuf::from(state::DEFAULT_PID_PATH);
+        match state::decide_pidfile_action(state::read_pidfile(&pid_path), state::process_alive) {
+            state::PidfileDecision::Refuse(pid) => bail!(
+                "Another rust_proxy daemon appears to be running (pid {pid}, \
+                 per {}). If that process is really gone, run \
+                 `sudo rust_proxy cleanup-stale` and retry.",
+                pid_path.display()
+            ),
+            state::PidfileDecision::TakeOver(pid) => tracing::warn!(
+                stale_pid = pid,
+                "Previous daemon exited ungracefully (stale pidfile); \
+                 taking over and rebuilding firewall state"
+            ),
+            state::PidfileDecision::Start => {}
+        }
+        state::write_pidfile(&pid_path, std::process::id())
+            .with_context(|| format!("Failed writing pidfile {}", pid_path.display()))?;
     } else {
         tracing::info!("test mode: skipping root privilege requirement");
     }
@@ -3310,6 +3429,20 @@ async fn run_daemon() -> Result<()> {
 
         initial_targets = build_target_entries(&config).await?;
         iptables::sync_ipset(&config.settings.ipset_name, &initial_targets)?;
+
+        // Staleness surfacing: rules surviving from a previous run mean the
+        // last exit was ungraceful (the pidfile guard above has already told
+        // us whether a live daemon could own them). apply_rules flushes and
+        // rebuilds the chain regardless; this log explains any pre-start
+        // blackholing operators observed.
+        let stale_snapshot = iptables::chain_snapshot(&config.settings.chain_name)?;
+        if stale_snapshot.present {
+            tracing::warn!(
+                redirect_ports = ?stale_snapshot.redirect_ports,
+                "Found existing chain from a previous run (crash leftover \
+                 unless another daemon is live); flushing and rebuilding"
+            );
+        }
 
         // Self-exemption: without it the daemon's own direct connections
         // (Direct degradation policy) are REDIRECTed back into this listener
@@ -3577,6 +3710,7 @@ async fn run_daemon() -> Result<()> {
     }
     if !test_mode {
         iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
+        state::remove_pidfile(&std::path::PathBuf::from(state::DEFAULT_PID_PATH));
     } else {
         tracing::info!("test mode: skipping iptables cleanup");
     }

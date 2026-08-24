@@ -15,6 +15,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/rust_proxy daemon
+# Post-crash recovery: clear stale rules/pidfile before starting (idempotent;
+# refuses while a live daemon holds the pidfile).
+ExecStartPre=/usr/local/bin/rust_proxy cleanup-stale
 
 # Restart on failure with exponential backoff
 Restart=on-failure

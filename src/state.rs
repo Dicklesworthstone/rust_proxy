@@ -550,6 +550,86 @@ pub struct DegradationStatus {
     pub active: bool,
 }
 
+// =============================================================================
+// Pidfile — single-daemon guarantee and crash detection
+// =============================================================================
+
+/// Default pidfile path. Lives on tmpfs; written by the daemon at startup,
+/// removed on graceful exit, left behind by crashes (which is the point:
+/// a leftover file with a dead pid proves the previous run died).
+pub const DEFAULT_PID_PATH: &str = "/run/rust_proxy.pid";
+
+/// What to do about an existing pidfile before starting a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidfileDecision {
+    /// No usable existing record: start.
+    Start,
+    /// File holds `pid` of a LIVE process: another daemon owns the rules.
+    Refuse(u32),
+    /// File held `pid` of a DEAD process: a crashed predecessor left it
+    /// behind (along with likely-stale firewall rules). Safe to take over
+    /// after clearing that state.
+    TakeOver(u32),
+}
+
+/// Decide the action for an existing pidfile. Pure so tests can inject any
+/// liveness probe.
+pub fn decide_pidfile_action<F>(existing_pid: Option<u32>, is_alive: F) -> PidfileDecision
+where
+    F: FnOnce(u32) -> bool,
+{
+    match existing_pid {
+        None => PidfileDecision::Start,
+        Some(pid) if is_alive(pid) => PidfileDecision::Refuse(pid),
+        Some(pid) => PidfileDecision::TakeOver(pid),
+    }
+}
+
+/// Read a pid from `path`; None if missing or unparseable (both treated as
+/// "no usable record").
+pub fn read_pidfile(path: &std::path::Path) -> Option<u32> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content.trim().parse::<u32>().ok()
+}
+
+/// Atomically write our pid: temp file + rename in the same directory, so a
+/// concurrent reader never sees a torn write.
+pub fn write_pidfile(path: &std::path::Path, pid: u32) -> anyhow::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "rust_proxy.pid".to_string()),
+        std::process::id()
+    ));
+    let mut f = std::fs::File::create(&tmp)?;
+    writeln!(f, "{pid}")?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Remove the pidfile if present; missing is success.
+pub fn remove_pidfile(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// True when `pid` refers to a live process. `kill(pid, 0)` returns EPERM
+/// for a live process we lack permission to signal — that still counts as
+/// alive.
+pub fn process_alive(pid: u32) -> bool {
+    // SAFETY: kill(2) with signal 0 performs permission/liveness checks only;
+    // no signal is delivered and no state is mutated.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,5 +912,55 @@ mod tests {
         assert_eq!(entries, vec!["state.json"], "no temp files may linger");
         let loaded = State::load(&path).unwrap();
         assert!(loaded.proxies.contains_key("proxy-1"));
+    }
+
+    #[test]
+    fn test_decide_pidfile_action_all_cases() {
+        // No file: start.
+        assert_eq!(
+            decide_pidfile_action(None, |_| true),
+            PidfileDecision::Start
+        );
+        // Live owner: refuse.
+        assert_eq!(
+            decide_pidfile_action(Some(4242), |pid| pid == 4242),
+            PidfileDecision::Refuse(4242)
+        );
+        // Dead owner (crash): take over.
+        assert_eq!(
+            decide_pidfile_action(Some(4242), |_| false),
+            PidfileDecision::TakeOver(4242)
+        );
+    }
+
+    #[test]
+    fn test_pidfile_write_read_remove_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rust_proxy.pid");
+
+        assert_eq!(read_pidfile(&path), None, "missing file reads as None");
+
+        write_pidfile(&path, 12345).unwrap();
+        assert_eq!(read_pidfile(&path), Some(12345));
+
+        // Overwrite (take-over path) replaces cleanly.
+        write_pidfile(&path, 999).unwrap();
+        assert_eq!(read_pidfile(&path), Some(999));
+
+        remove_pidfile(&path);
+        assert_eq!(read_pidfile(&path), None);
+    }
+
+    #[test]
+    fn test_read_pidfile_tolerates_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.pid");
+        std::fs::write(&path, "not-a-pid\n").unwrap();
+        assert_eq!(read_pidfile(&path), None);
+    }
+
+    #[test]
+    fn test_process_alive_self_is_true() {
+        assert!(process_alive(std::process::id()));
     }
 }
