@@ -116,13 +116,13 @@ impl ConfigWatcher {
     ///
     /// # Returns
     /// `true` if the configuration file changed and should be reloaded.
-    pub fn poll(&mut self) -> bool {
-        // Drain all pending events, accumulating relevance across polls. The
-        // flag must live on `self`: draining before the debounce check means a
-        // per-call local would silently drop events observed mid-window.
+        // TEMP-DIAGNOSTIC (remove before commit)
+        let mut drained_total = 0usize;
+        let mut drained_relevant = 0usize;
         loop {
             match self.rx.try_recv() {
                 Ok(Ok(event)) => {
+                    drained_total += 1;
                     if self.is_relevant_event(&event) {
                         debug!(
                             path = ?event.paths,
@@ -130,6 +130,7 @@ impl ConfigWatcher {
                             "Relevant config file event"
                         );
                         self.pending_relevant = true;
+                        drained_relevant += 1;
                     }
                 }
                 Ok(Err(e)) => {
@@ -142,6 +143,10 @@ impl ConfigWatcher {
                 }
             }
         }
+        eprintln!(
+            "WATCHER-DIAG poll: drained={drained_total} relevant={drained_relevant} pending={} last_change={:?}",
+            self.pending_relevant, self.last_change
+        );
 
         let now = Instant::now();
         let (fire, last_change) =
@@ -262,8 +267,6 @@ mod tests {
         assert!(watcher.is_ok());
     }
 
-    #[test]
-
     /// TEMP-DIAGNOSTIC (remove before commit): does the real notify backend
     /// deliver events inside THIS workspace's build?
     #[test]
@@ -289,7 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn test_watcher_nonexistent_file() {
     fn test_watcher_nonexistent_file() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("nonexistent.toml");
