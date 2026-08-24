@@ -92,7 +92,6 @@ impl ConfigWatcher {
             .watch(watch_path, RecursiveMode::NonRecursive)
             .with_context(|| format!("Failed to watch path: {}", watch_path.display()))?;
 
-
         info!(
             path = %config_path.display(),
             "Config watcher initialized"
@@ -116,13 +115,13 @@ impl ConfigWatcher {
     ///
     /// # Returns
     /// `true` if the configuration file changed and should be reloaded.
-        // TEMP-DIAGNOSTIC (remove before commit)
-        let mut drained_total = 0usize;
-        let mut drained_relevant = 0usize;
+    pub fn poll(&mut self) -> bool {
+        // Drain all pending events, accumulating relevance across polls. The
+        // flag must live on `self`: draining before the debounce check means a
+        // per-call local would silently drop events observed mid-window.
         loop {
             match self.rx.try_recv() {
                 Ok(Ok(event)) => {
-                    drained_total += 1;
                     if self.is_relevant_event(&event) {
                         debug!(
                             path = ?event.paths,
@@ -130,7 +129,6 @@ impl ConfigWatcher {
                             "Relevant config file event"
                         );
                         self.pending_relevant = true;
-                        drained_relevant += 1;
                     }
                 }
                 Ok(Err(e)) => {
@@ -143,10 +141,6 @@ impl ConfigWatcher {
                 }
             }
         }
-        eprintln!(
-            "WATCHER-DIAG poll: drained={drained_total} relevant={drained_relevant} pending={} last_change={:?}",
-            self.pending_relevant, self.last_change
-        );
 
         let now = Instant::now();
         let (fire, last_change) =
@@ -267,10 +261,13 @@ mod tests {
         assert!(watcher.is_ok());
     }
 
-    /// TEMP-DIAGNOSTIC (remove before commit): does the real notify backend
-    /// deliver events inside THIS workspace's build?
+    /// Integration guard: the REAL notify backend must deliver events through
+    /// ConfigWatcher inside this workspace's build — not just through the
+    /// synthetic-event unit tests above. A silent backend regression (wrong
+    /// feature resolution, kernel/fs incompatibility) would disable config
+    /// hot-reload end to end with no other failing test.
     #[test]
-    fn temp_live_notify_delivers_events_in_workspace() {
+    fn live_notify_backend_delivers_config_events() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         std::fs::write(&config_path, "a = 1\n").unwrap();

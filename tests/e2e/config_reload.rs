@@ -66,7 +66,10 @@ fn write_test_config(mock_port: u16, listen_port: u16, proxy_id: &str) -> Result
     let config_dir = temp.path().join(".config").join("rust_proxy");
     std::fs::create_dir_all(&config_dir)?;
     let config_path = config_dir.join("config.toml");
-    std::fs::write(&config_path, render_config(mock_port, listen_port, proxy_id))?;
+    std::fs::write(
+        &config_path,
+        render_config(mock_port, listen_port, proxy_id),
+    )?;
     Ok(ReloadHome { temp, config_path })
 }
 
@@ -84,7 +87,7 @@ fn render_config(mock_port: u16, listen_port: u16, proxy_id: &str) -> String {
          dns_refresh_secs = 3600\n\
          ping_interval_secs = 3600\n\
          ping_timeout_ms = 1000\n\
-         ipset_name = \"reload-e2e-ipset\"\n\
+         ipset_name = \"reload_e2e_ipset\"\n\
          chain_name = \"RELOAD_E2E_CHAIN\"\n\
          include_aws_ip_ranges = false\n\
          include_cloudflare_ip_ranges = false\n\
@@ -155,11 +158,7 @@ async fn tunnel_attempt(addr: std::net::SocketAddr) {
     }
     let _ = client.flush().await;
     let mut echoed = vec![0u8; PAYLOAD.len()];
-    let _ = tokio::time::timeout(
-        Duration::from_secs(3),
-        client.read_exact(&mut echoed),
-    )
-    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut echoed)).await;
 }
 
 fn assert_alive(child: &mut Child, context: &str) {
@@ -186,7 +185,10 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
     let mut child = ChildGuard(spawn_daemon(&home, &stderr_path)?);
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse()?;
     if let Err(err) = wait_for_listener(listen_addr).await {
-        panic!("daemon failed to boot: {err:#}\n--- stderr ---\n{}", read_stderr(&stderr_path));
+        panic!(
+            "daemon failed to boot: {err:#}\n--- stderr ---\n{}",
+            read_stderr(&stderr_path)
+        );
     }
 
     // Baseline: traffic reaches mock-a only.
