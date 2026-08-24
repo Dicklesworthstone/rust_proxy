@@ -665,6 +665,23 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
         );
     }
 
+    // Warn about the firewall-level requirement of the Direct policy: the
+    // daemon's own direct connections must escape our REDIRECT via SO_MARK,
+    // or they would loop back into the listener. Runtime refuses Direct at
+    // use time when the exemption could not be installed.
+    if settings.degradation_policy == DegradationPolicy::Direct {
+        results.push(
+            ValidationResult::warning(
+                "settings",
+                "degradation_policy 'direct' requires the daemon to run with \
+                 CAP_NET_ADMIN so direct-connect sockets can be exempted from \
+                 the REDIRECT rule (SO_MARK); without it, direct fallback is \
+                 refused at use time",
+            )
+            .with_id("degradation_policy_direct_so_mark"),
+        );
+    }
+
     // Warn about degradation_delay_secs == 0
     if settings.degradation_delay_secs == 0 {
         results.push(

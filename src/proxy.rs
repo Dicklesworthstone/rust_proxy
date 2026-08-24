@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::{AppConfig, DegradationPolicy, ProxyConfig};
+use crate::iptables::DIRECT_BYPASS_MARK;
 use crate::load_balancer::LoadBalancer;
 use crate::metrics;
 use crate::state::{RuntimeState, StateStore};
@@ -566,7 +567,7 @@ async fn handle_degradation(
 
         DegradationPolicy::Direct => {
             let (stream, proxy_id, upstream) =
-                direct_connect(config, target_host, target_port).await?;
+                direct_connect(config, runtime, target_host, target_port).await?;
             Ok(Some((stream, proxy_id, upstream)))
         }
     }
@@ -775,6 +776,7 @@ async fn use_last_proxy(
 /// than proxy enforcement.
 async fn direct_connect(
     config: &AppConfig,
+    runtime: &RuntimeState,
     target_host: &str,
     target_port: u16,
 ) -> Result<(TcpStream, String, UpstreamProxy)> {
@@ -786,6 +788,16 @@ async fn direct_connect(
         ));
     }
 
+    let (firewall_active, bypass_mark) = runtime.firewall_context().await;
+    if firewall_active && bypass_mark.is_none() {
+        return Err(anyhow!(
+            "Direct degradation policy unavailable: the daemon's own connections \
+             have no firewall self-exemption, so a direct connect to a targeted \
+             IP would be re-redirected into this proxy in an unbounded loop. \
+             Run the daemon with CAP_NET_ADMIN available (SO_MARK exemption)."
+        ));
+    }
+
     tracing::warn!(
         target = %target_host,
         port = target_port,
@@ -794,14 +806,20 @@ async fn direct_connect(
     );
 
     // Connect directly to the target
-    let target_addr = format!("{}:{}", target_host, target_port);
-    let socket = tokio::time::timeout(
-        Duration::from_secs(TRY_ALL_TIMEOUT_PER_PROXY_SECS),
-        TcpStream::connect(&target_addr),
-    )
+    let target_addr: SocketAddr = format!("{target_host}:{target_port}")
+        .parse()
+        .with_context(|| format!("Invalid direct target {target_host}:{target_port}"))?;
+    let socket = tokio::time::timeout(Duration::from_secs(TRY_ALL_TIMEOUT_PER_PROXY_SECS), async {
+        let res: Result<TcpStream> = match bypass_mark {
+            Some(mark) => connect_with_mark(target_addr, mark).await,
+            None => TcpStream::connect(target_addr)
+                .await
+                .context(format!("Direct connection to {target_addr} failed")),
+        };
+        res
+    })
     .await
-    .map_err(|_| anyhow!("Direct connection to {} timed out", target_addr))?
-    .context(format!("Direct connection to {} failed", target_addr))?;
+    .map_err(|_| anyhow!("Direct connection to {target_addr} timed out"))??;
 
     // Create a synthetic UpstreamProxy to track as "direct"
     let direct_upstream = UpstreamProxy {
@@ -813,6 +831,47 @@ async fn direct_connect(
     };
 
     Ok((socket, "direct".to_string(), direct_upstream))
+}
+
+/// Open a TCP connection whose packets carry `mark` (SO_MARK), exempting them
+/// from our own nat OUTPUT REDIRECT via the `-m mark` RETURN rule installed by
+/// [`crate::iptables::apply_rules`].
+///
+/// The mark MUST be set before `connect(2)`: it is copied onto the socket's
+/// sk_buff at SYN time, which is exactly what keeps this flow out of the
+/// redirect that would otherwise loop it back into our listener.
+async fn connect_with_mark(addr: SocketAddr, mark: u32) -> Result<TcpStream> {
+    // Blocking connect offloaded to the blocking pool so the caller keeps its
+    // timeout semantics; the mark must be applied before connect(2) so the
+    // SYN itself carries it and escapes our own REDIRECT rule.
+    tokio::task::spawn_blocking(move || -> Result<TcpStream> {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+            .context("Failed creating direct-connect socket")?;
+        sock.set_mark(mark)
+            .context("Failed setting SO_MARK on direct-connect socket")?;
+        sock.connect(&addr.into())
+            .context("Direct connect(2) failed")?;
+        sock.set_nonblocking(true)
+            .context("Failed setting non-blocking mode on direct-connect socket")?;
+        let std_stream = std::net::TcpStream::from(sock);
+        TcpStream::from_std(std_stream)
+            .context("Failed registering direct-connect socket with tokio")
+    })
+    .await
+    .context("Direct-connect blocking task panicked")?
+}
+
+/// Probe whether this process may set SO_MARK (requires CAP_NET_ADMIN).
+/// Called once at daemon startup to choose the self-exemption mechanism
+/// before any firewall rules are built.
+pub fn can_set_so_mark() -> bool {
+    use socket2::{Domain, Protocol, Socket, Type};
+    match Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) {
+        Ok(sock) => sock.set_mark(DIRECT_BYPASS_MARK).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Try to establish a CONNECT tunnel through a single proxy.
@@ -1436,6 +1495,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("allow_direct_fallback"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_degradation_direct_refused_without_self_exemption_when_firewall_live() {
+        use crate::config::{AppConfig, DegradationPolicy, Settings};
+
+        let config = AppConfig {
+            settings: Settings {
+                degradation_policy: DegradationPolicy::Direct,
+                allow_direct_fallback: true,
+                degradation_delay_secs: 0,
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
+        let state = crate::state::StateStore::new_for_testing();
+
+        // Firewall is live but no self-exemption mark could be installed:
+        // a direct connect would be re-redirected into the daemon (loop).
+        let runtime = RuntimeState::new(Some("proxy-a".to_string()));
+        runtime.set_firewall_context(true, None).await;
+        let empty: Vec<String> = vec![];
+        runtime.update_degradation_state(&empty, 0).await;
+
+        let retry_config = RetryConfig::default();
+        let mut client = throwaway_client_stream().await;
+        let result = handle_degradation(
+            &config,
+            &state,
+            &runtime,
+            "example.com",
+            443,
+            &retry_config,
+            &mut client,
+        )
+        .await;
+
+        let err = result.expect_err("direct fallback must be refused without self-exemption");
+        assert!(
+            err.to_string().contains("self-exemption"),
+            "error should name the missing self-exemption, got: {err}"
+        );
     }
 
     #[test]

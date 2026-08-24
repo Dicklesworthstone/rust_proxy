@@ -141,11 +141,33 @@ fn current_ipset_members(ipset_name: &str) -> Result<HashSet<String>> {
     Ok(members)
 }
 
+/// How the daemon exempts its own traffic from the REDIRECT rule.
+///
+/// Without an exemption, any connection the daemon itself opens toward an
+/// ipset member (notably the Direct degradation policy's plain TCP connect)
+/// is redirected back into our own listener and re-handled in a loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfExemption {
+    /// Exempt sockets carrying this firewall mark via `-m mark`. The daemon
+    /// sets SO_MARK only on its own direct-connect sockets, making the
+    /// exemption precise regardless of daemon uid. Requires CAP_NET_ADMIN,
+    /// which the daemon already needs for every other iptables/ipset write.
+    ///
+    /// A `-m owner` uid exemption was deliberately rejected: the daemon
+    /// always runs as root (require_root), and exempting uid 0 would
+    /// silently bypass the proxy for every root process on the machine.
+    Mark(u32),
+}
+
+/// Firewall mark used for [`SelfExemption::Mark`]. Arbitrary non-zero value;
+/// chosen to be unlikely to collide with unrelated policy marks.
+pub const DIRECT_BYPASS_MARK: u32 = 0x5250_0001;
+
 pub fn apply_rules(
     chain_name: &str,
     ipset_name: &str,
     listen_port: u16,
-    exclude_uid: Option<u32>,
+    self_exempt: Option<SelfExemption>,
     exclude_dests: &HashSet<String>,
 ) -> Result<()> {
     // Create chain if missing.
@@ -168,7 +190,7 @@ pub fn apply_rules(
         ],
     )?;
 
-    if let Some(uid) = exclude_uid {
+    if let Some(SelfExemption::Mark(mark)) = self_exempt {
         run(
             "iptables",
             &[
@@ -177,9 +199,9 @@ pub fn apply_rules(
                 "-A",
                 chain_name,
                 "-m",
-                "owner",
-                "--uid-owner",
-                &uid.to_string(),
+                "mark",
+                "--mark",
+                &mark.to_string(),
                 "-j",
                 "RETURN",
             ],
@@ -351,14 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_rules_emits_pinned_rule_text_including_owner_return() {
+    fn apply_rules_emits_pinned_rule_text_including_mark_return() {
         install_capturing_spawn(None);
         let dests = set_of(&["10.0.0.1"]);
         apply_rules(
             "RUST_PROXY_CHAIN",
             "rust_proxy_set",
             9090,
-            Some(1000),
+            Some(SelfExemption::Mark(DIRECT_BYPASS_MARK)),
             &dests,
         )
         .unwrap();
@@ -390,21 +412,21 @@ mod tests {
                     "RETURN",
                 ]),
             ),
-            (
-                "iptables".into(),
-                v(&[
+            ("iptables".into(), {
+                let mut argv = v(&[
                     "-t",
                     "nat",
                     "-A",
                     "RUST_PROXY_CHAIN",
                     "-m",
-                    "owner",
-                    "--uid-owner",
-                    "1000",
-                    "-j",
-                    "RETURN",
-                ]),
-            ),
+                    "mark",
+                    "--mark",
+                ]);
+                argv.push(DIRECT_BYPASS_MARK.to_string());
+                argv.push("-j".to_string());
+                argv.push("RETURN".to_string());
+                argv
+            }),
             (
                 "iptables".into(),
                 v(&[
@@ -450,5 +472,17 @@ mod tests {
             ),
         ];
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn apply_rules_without_exemption_omits_both_owner_and_mark_rules() {
+        install_capturing_spawn(None);
+        let dests = set_of(&[]);
+        apply_rules("C", "S", 80, None, &dests).unwrap();
+
+        let flat: Vec<String> = calls().into_iter().flat_map(|(_, argv, _)| argv).collect();
+        assert!(!flat.contains(&"owner".to_string()));
+        assert!(!flat.contains(&"--uid-owner".to_string()));
+        assert!(!flat.contains(&"mark".to_string()));
     }
 }

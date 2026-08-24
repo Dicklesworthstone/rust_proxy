@@ -3255,13 +3255,51 @@ async fn run_daemon() -> Result<()> {
 
         initial_targets = build_target_entries(&config).await?;
         iptables::sync_ipset(&config.settings.ipset_name, &initial_targets)?;
+
+        // Self-exemption: without it the daemon's own direct connections
+        // (Direct degradation policy) are REDIRECTed back into this listener
+        // and loop until fds run out. SO_MARK is precise — only sockets we
+        // marked ourselves are exempt; a uid exemption as root would exempt
+        // every root process on the machine, so it is deliberately not used
+        // for the root-run daemon.
+        let direct_enabled = matches!(
+            config.settings.degradation_policy,
+            config::DegradationPolicy::Direct
+        ) && config.settings.allow_direct_fallback;
+        let (self_exempt, bypass_mark) = if proxy::can_set_so_mark() {
+            tracing::info!(
+                mark = format_args!("{:#x}", iptables::DIRECT_BYPASS_MARK),
+                "SO_MARK self-exemption installed: daemon direct-connect \
+                 sockets bypass the REDIRECT rule"
+            );
+            (
+                Some(iptables::SelfExemption::Mark(iptables::DIRECT_BYPASS_MARK)),
+                Some(iptables::DIRECT_BYPASS_MARK),
+            )
+        } else if direct_enabled {
+            bail!(
+                "Direct degradation policy requires the SO_MARK capability \
+                 (CAP_NET_ADMIN) to exempt the daemon's own connections from \
+                 the REDIRECT rule. Without it, direct fallback would be \
+                 re-redirected into this proxy in an unbounded loop. Refusing \
+                 to install live firewall rules."
+            );
+        } else {
+            tracing::warn!(
+                "SO_MARK unavailable: no self-exemption installed; the Direct \
+                 degradation policy will be refused if it is ever triggered"
+            );
+            (None, None)
+        };
+
         iptables::apply_rules(
             &config.settings.chain_name,
             &config.settings.ipset_name,
             config.settings.listen_port,
-            None,
+            self_exempt,
             &upstream_excludes,
         )?;
+        runtime_state.set_firewall_context(true, bypass_mark).await;
     }
     let refresh_rx = config_rx.clone();
     let refresh_task = if test_mode {

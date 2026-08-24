@@ -312,6 +312,13 @@ struct RuntimeStateInner {
     all_unhealthy_since: Option<DateTime<Utc>>,
     /// Whether degradation policy is currently active
     degradation_active: bool,
+    /// True once the daemon has applied live ipset/iptables rules. Test-mode
+    /// daemons leave this false so policy paths skip firewall-coupled guards.
+    firewall_active: bool,
+    /// Firewall mark exempting the daemon's own direct-connect sockets from
+    /// the REDIRECT rule (see iptables::SelfExemption::Mark). None means no
+    /// self-exemption is installable and Direct fallback must be refused.
+    direct_bypass_mark: Option<u32>,
 }
 
 /// Thread-safe runtime state for dynamic proxy management
@@ -332,8 +339,25 @@ impl RuntimeState {
                 recovery_detected_at: None,
                 all_unhealthy_since: None,
                 degradation_active: false,
+                firewall_active: false,
+                direct_bypass_mark: None,
             })),
         }
+    }
+
+    /// Record the daemon's firewall posture, fixed for the process lifetime:
+    /// whether live REDIRECT rules exist and which mark (if any) exempts our
+    /// own direct-connect sockets. Called once by run_daemon before tasks spawn.
+    pub async fn set_firewall_context(&self, active: bool, bypass_mark: Option<u32>) {
+        let mut inner = self.inner.write().await;
+        inner.firewall_active = active;
+        inner.direct_bypass_mark = bypass_mark;
+    }
+
+    /// Firewall context snapshot: (rules live, self-exemption mark).
+    pub async fn firewall_context(&self) -> (bool, Option<u32>) {
+        let inner = self.inner.read().await;
+        (inner.firewall_active, inner.direct_bypass_mark)
     }
 
     /// Get currently effective proxy ID (may be failover target)

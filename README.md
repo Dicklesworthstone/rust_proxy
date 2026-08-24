@@ -432,6 +432,29 @@ rust_proxy targets add api.openai.com
 - **Non-Linux platforms**: uses `iptables` + `ipset` and is Linux-only.
 - **TLS inspection**: no MITM or certificate injection.
 
+### Direct Degradation Policy and the Self-Redirect Loop
+
+When `degradation_policy = "direct"` fires, the daemon opens a plain TCP
+connection to the original destination. That IP is, by definition, in the
+`ipset` matched by the daemon's own NAT OUTPUT REDIRECT rule — so without a
+self-exemption the connection would be redirected back into the daemon,
+re-handled, degraded again, and loop until file descriptors run out.
+
+rust_proxy breaks this loop with **SO_MARK**: direct-connect sockets are
+tagged with a firewall mark before `connect(2)`, and an `-m mark ... -j RETURN`
+rule ahead of the REDIRECT rule exempts exactly those sockets (never other
+processes' traffic). Consequences:
+
+- The daemon needs `CAP_NET_ADMIN` to set SO_MARK. It already needs it for
+  iptables/ipset, so this adds no new privilege requirement for normal runs.
+- If SO_MARK is unavailable at startup while `direct` + `allow_direct_fallback`
+  are configured, the daemon refuses to install live firewall rules rather
+  than risk the loop; with any other policy it starts but refuses Direct at
+  use time.
+- A `-m owner --uid-owner` exemption was deliberately rejected: the daemon
+  runs as root, and exempting uid 0 would silently bypass the proxy for every
+  root process on the machine.
+
 ## FAQ
 
 ### Why "rust_proxy"?
