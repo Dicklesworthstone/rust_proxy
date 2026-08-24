@@ -16,6 +16,7 @@ inquire = "0.9"
 libc = "0.2"
 notify = "8"
 owo-colors = "4.1"
+parking_lot = "0.12"
 prometheus = "0.14"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 rustls-native-certs = "0.8.3"

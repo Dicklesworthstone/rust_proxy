@@ -1082,6 +1082,17 @@ mod tests {
         assert!(service.contains("User=root"));
         assert!(service.contains("Group=root"));
         assert!(!service.contains("ProtectSystem=strict"));
+
+        // Runtime consumption: the emitted Environment line must actually
+        // steer config_path() so service runs read the same file as manual
+        // runs (round-trip proof for RUST_PROXY_CONFIG support).
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        std::env::set_var("RUST_PROXY_CONFIG", "/etc/rust_proxy/config.toml");
+        assert_eq!(
+            crate::config::config_path().unwrap(),
+            std::path::PathBuf::from("/etc/rust_proxy/config.toml")
+        );
+        std::env::remove_var("RUST_PROXY_CONFIG");
     }
 
     #[test]

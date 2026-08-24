@@ -266,10 +266,13 @@ rust_proxy completions elvish >> ~/.elvish/rc.elv
 
 ## Configuration
 
-Config file location:
-- `~/.config/rust_proxy/config.toml`
+Config file location (precedence order):
+1. `--config <path>` flag where a command offers one (e.g. `service generate`)
+2. `RUST_PROXY_CONFIG` environment variable — this is what `service generate`
+   emits into systemd units, so service runs read the same file as manual runs
+3. `~/.config/rust_proxy/config.toml` (XDG default)
 
-State file location:
+State file location (not affected by `RUST_PROXY_CONFIG`):
 - `~/.local/state/rust_proxy/state.json`
 
 Example config (copy-paste ready):

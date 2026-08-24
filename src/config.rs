@@ -1065,7 +1065,20 @@ fn insert_metrics_comments(content: &str) -> String {
     )
 }
 
+/// Resolve the config file path.
+///
+/// Precedence: `RUST_PROXY_CONFIG` environment variable (as emitted by
+/// `service generate` into systemd units via `Environment=RUST_PROXY_CONFIG=...`)
+/// wins over the XDG default so manual runs and service runs see the same
+/// file. Callers with their own explicit `--config` flag pass that path
+/// directly instead of consulting this function. State paths are NOT
+/// affected: they always resolve to the XDG state dir.
 pub fn config_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("RUST_PROXY_CONFIG") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
     let proj = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME)
         .context("Failed to resolve project dirs")?;
     Ok(proj.config_dir().join("config.toml"))
@@ -1077,7 +1090,6 @@ pub fn state_dir() -> Result<PathBuf> {
     let dir = proj.state_dir().context("Failed to resolve state dir")?;
     Ok(dir.to_path_buf())
 }
-
 // =============================================================================
 // Config Holder — Thread-safe config access with atomic reload
 // =============================================================================
@@ -1774,8 +1786,46 @@ fn diff_settings(old: &Settings, new: &Settings, diff: &mut ConfigDiff) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Serialize env-var mutations; RUST_PROXY_CONFIG is process-global.
+    /// pub(crate) so other modules' tests (util service-file round trip)
+    /// share it.
+    pub(crate) static CONFIG_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    #[test]
+    fn test_config_path_env_override_resolution_order() {
+        let _guard = CONFIG_ENV_LOCK.lock();
+
+        // Env set wins over the XDG default. This is the exact variable
+        // `service generate` emits into units (Environment=RUST_PROXY_CONFIG=...);
+        // ignoring it made service runs silently read root's default config.
+        std::env::set_var("RUST_PROXY_CONFIG", "/tmp/rp-test-config.toml");
+        assert_eq!(
+            config_path().unwrap(),
+            PathBuf::from("/tmp/rp-test-config.toml")
+        );
+
+        // Empty value falls through to the default instead of resolving to ""
+        // and failing confusingly downstream.
+        std::env::set_var("RUST_PROXY_CONFIG", "");
+        assert!(config_path().unwrap().is_absolute());
+
+        // Unset behaves as before.
+        std::env::remove_var("RUST_PROXY_CONFIG");
+        let default = config_path().unwrap();
+        assert!(default.is_absolute());
+        assert!(default.ends_with("config.toml"));
+    }
+
+    #[test]
+    fn test_state_dir_unaffected_by_config_env() {
+        let _guard = CONFIG_ENV_LOCK.lock();
+        std::env::set_var("RUST_PROXY_CONFIG", "/tmp/rp-test-state-probe");
+        let state = state_dir().unwrap();
+        std::env::remove_var("RUST_PROXY_CONFIG");
+        assert!(!state.ends_with("rp-test-state-probe"));
+    }
 
     #[test]
     fn test_infer_provider_anthropic() {
