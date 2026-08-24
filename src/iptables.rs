@@ -566,4 +566,44 @@ mod tests {
         assert!(snap.present);
         assert!(snap.redirect_ports.is_empty());
     }
+
+    #[test]
+    fn clear_rules_removes_jump_flushes_chain_and_destroys_ipset() {
+        install_capturing_spawn(None);
+        clear_rules("RUST_PROXY_CHAIN", "rust_proxy_set").unwrap();
+
+        let got: Vec<(String, Vec<String>)> = calls()
+            .into_iter()
+            .map(|(program, argv, _)| (program, argv))
+            .collect();
+        let v = |parts: &[&str]| parts.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "iptables".into(),
+                    v(&["-t", "nat", "-D", "OUTPUT", "-j", "RUST_PROXY_CHAIN"]),
+                ),
+                (
+                    "iptables".into(),
+                    v(&["-t", "nat", "-F", "RUST_PROXY_CHAIN"]),
+                ),
+                (
+                    "iptables".into(),
+                    v(&["-t", "nat", "-X", "RUST_PROXY_CHAIN"]),
+                ),
+                ("ipset".into(), v(&["destroy", "rust_proxy_set"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn chain_snapshot_treats_spawn_failure_as_missing_chain() {
+        SPAWN.with(|spawn| {
+            spawn.set(|_p: &str, _a: &[&str], _s: Option<&str>| bail!("no iptables here"))
+        });
+        let snap = chain_snapshot("RP").unwrap();
+        assert!(!snap.present);
+        assert!(snap.redirect_ports.is_empty());
+    }
 }
