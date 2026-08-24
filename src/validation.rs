@@ -227,6 +227,32 @@ fn validate_proxy_auth(auth: &crate::config::ProxyAuth, proxy_id: &str) -> Vec<V
         }
     }
 
+    // Pair completeness: the CONNECT Basic-Auth header is emitted only when
+    // BOTH username and password resolve (proxy.rs); a half-configured pair
+    // sends UNAUTHENTICATED requests that fail opaquely upstream (407
+    // surfaced as generic "Proxy CONNECT failed"). Fail fast here instead.
+    let has_username = auth.username.is_some() || auth.username_env.is_some();
+    let has_password = auth.password.is_some() || auth.password_env.is_some();
+    if has_username != has_password {
+        let missing = if has_password { "username" } else { "password" };
+        results.push(
+            ValidationResult::error(
+                "proxy",
+                format!(
+                    "proxy '{}' has incomplete credentials: {} is missing \
+                     (exactly one side of the username/password pair is set)",
+                    proxy_id, missing
+                ),
+            )
+            .with_id(proxy_id)
+            .with_suggestion(format!(
+                "Set BOTH username and password for proxy '{}' (via --username/--password \
+                 or --username-env/--password-env), or remove the lone credential",
+                proxy_id
+            )),
+        );
+    }
+
     // Warn about plaintext credentials
     if auth.username.is_some() || auth.password.is_some() {
         results.push(
@@ -885,6 +911,70 @@ mod tests {
         assert!(results
             .iter()
             .any(|r| r.message.contains("Duplicate proxy ID")));
+    }
+
+    #[test]
+    fn test_partial_auth_inline_username_only_is_error() {
+        let auth = ProxyAuth {
+            username: Some("user".into()),
+            ..ProxyAuth::default()
+        };
+        let results = validate_proxy_auth(&auth, "p1");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.message.contains("incomplete credentials")
+                    && r.message.contains("password is missing")),
+            "expected incomplete-credentials error naming password, got: {results:?}"
+        );
+    }
+
+    #[test]
+    fn test_partial_auth_env_password_only_is_error() {
+        let auth = ProxyAuth {
+            password_env: Some("RUST_PROXY_TEST_PW".into()),
+            ..ProxyAuth::default()
+        };
+        let results = validate_proxy_auth(&auth, "p2");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.message.contains("incomplete credentials")
+                    && r.message.contains("username is missing")),
+            "expected incomplete-credentials error naming username, got: {results:?}"
+        );
+    }
+
+    #[test]
+    fn test_complete_inline_and_mixed_pairs_are_accepted() {
+        // Both inline: complete (plaintext warning is separate and expected).
+        let both = ProxyAuth {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            ..ProxyAuth::default()
+        };
+        let results = validate_proxy_auth(&both, "both");
+        assert!(!results
+            .iter()
+            .any(|r| r.message.contains("incomplete credentials")));
+
+        // Mixed env + inline: complete.
+        let mixed = ProxyAuth {
+            username_env: Some("RUST_PROXY_TEST_USER".into()),
+            password: Some("p".into()),
+            ..ProxyAuth::default()
+        };
+        let results = validate_proxy_auth(&mixed, "mixed");
+        assert!(!results
+            .iter()
+            .any(|r| r.message.contains("incomplete credentials")));
+
+        // Neither side: complete-by-absence, no auth sent by design.
+        let none = ProxyAuth::default();
+        let results = validate_proxy_auth(&none, "none");
+        assert!(!results
+            .iter()
+            .any(|r| r.message.contains("incomplete credentials")));
     }
 
     #[test]

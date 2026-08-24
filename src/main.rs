@@ -3247,6 +3247,20 @@ async fn run_daemon() -> Result<()> {
 
     // Create runtime state for dynamic proxy management
     let runtime_state = RuntimeState::new(config.active_proxy.clone());
+
+    // Defense in depth for partial auth (validation also errors on this):
+    // Basic-Auth is sent only when BOTH sides resolve, so a half-configured
+    // pair would produce unauthenticated requests failing opaquely upstream.
+    for proxy_cfg in &config.proxies {
+        let (user, pass) = proxy_cfg.auth.resolve();
+        if user.is_some() != pass.is_some() {
+            tracing::warn!(
+                proxy = %proxy_cfg.id,
+                "Incomplete credential pair: exactly one of username/password \
+                 is set; NO Basic-Auth will be sent. Set both or neither."
+            );
+        }
+    }
     let mut initial_targets: HashSet<String> = HashSet::new();
     if test_mode {
         tracing::info!("test mode: skipping firewall mutations (ipset/iptables)");
