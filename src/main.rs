@@ -1468,9 +1468,6 @@ async fn check_cmd(
     validate_health_target: bool,
     output: &OutputDispatcher,
 ) -> Result<()> {
-    // Note: validate_health_target is accepted but not yet implemented
-    // This flag will enable validation of health check target reachability
-    let _ = validate_health_target; // Suppress unused warning until implemented
     use validation::{validate_config, ValidationSeverity};
 
     let config_path = config::config_path()?;
@@ -1513,6 +1510,21 @@ async fn check_cmd(
         } else {
             Vec::new()
         };
+
+    // --validate-health-target: probe the configured target directly so we
+    // can tell "target down" apart from "proxies broken". If this probe
+    // fails, every proxy health check against it fails for that reason alone.
+    let target_probe = if validate_health_target {
+        Some(
+            health::check_target_reachable(
+                config.settings.health_check_timeout_ms,
+                &config.settings.health_check_target,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     if output.mode().is_json() {
         let errors: Vec<serde_json::Value> = report
@@ -1567,6 +1579,15 @@ async fn check_cmd(
         // Add connectivity results if tested
         if test_connectivity {
             json_output["connectivity"] = serde_json::json!(connectivity_results);
+        }
+
+        // Add direct-target probe results when requested
+        if let Some(probe) = &target_probe {
+            json_output["health_target"] = serde_json::json!({
+                "directly_reachable": probe.success,
+                "latency_ms": probe.latency_ms,
+                "error": probe.failure_reason,
+            });
         }
 
         output.print_json(&json_output);
@@ -1647,6 +1668,26 @@ async fn check_cmd(
                     ),
                 };
                 println!("  {} [{}] {}", prefix, result.proxy_id, status_text);
+            }
+            println!();
+        }
+
+        // Display direct-target verdict when probed
+        if let Some(probe) = &target_probe {
+            println!("Health Check Target:");
+            if probe.success {
+                println!(
+                    "  {} directly reachable ({}ms)",
+                    "✓".green(),
+                    probe.latency_ms as u64
+                );
+            } else {
+                println!(
+                    "  {} NOT directly reachable from this machine ({}) — \
+                     every proxy check against it will fail for that reason",
+                    "⚠".yellow(),
+                    probe.failure_reason.clone().unwrap_or_default()
+                );
             }
             println!();
         }

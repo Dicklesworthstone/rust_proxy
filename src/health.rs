@@ -64,6 +64,68 @@ pub async fn check_proxy_health(
     }
 }
 
+/// Probe the configured health check target DIRECTLY (no proxy).
+///
+/// Used by `check --validate-health-target` to distinguish "the target is
+/// down" from "the proxies are broken": when this probe fails, the target is
+/// unreachable from this machine and every proxy health check against it
+/// fails for that reason alone.
+///
+/// `Connect` targets get a plain TCP connect. `Get` URLs get a
+/// transport-level connect to the URL's host/port (TLS is not negotiated) —
+/// enough to answer "is anything listening there".
+pub async fn check_target_reachable(
+    timeout_ms: u64,
+    target: &HealthCheckTarget,
+) -> HealthCheckResult {
+    let timeout_dur = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
+
+    let addr: String = match target {
+        HealthCheckTarget::Connect { host, port } => format!("{host}:{port}"),
+        HealthCheckTarget::Get { url } => match probe_address_for_url(url) {
+            Ok(addr) => addr,
+            Err(e) => {
+                return HealthCheckResult {
+                    success: false,
+                    latency_ms: start.elapsed().as_millis() as f64,
+                    failure_reason: Some(e.to_string()),
+                };
+            }
+        },
+    };
+
+    let result = timeout(timeout_dur, TcpStream::connect(&addr)).await;
+    let latency_ms = start.elapsed().as_millis() as f64;
+    match result {
+        Ok(Ok(_)) => HealthCheckResult {
+            success: true,
+            latency_ms,
+            failure_reason: None,
+        },
+        Ok(Err(e)) => HealthCheckResult {
+            success: false,
+            latency_ms,
+            failure_reason: Some(format!("Direct connect to {addr}: {e}")),
+        },
+        Err(_) => HealthCheckResult {
+            success: false,
+            latency_ms,
+            failure_reason: Some(format!("Direct connect to {addr} timed out")),
+        },
+    }
+}
+
+/// Extract "host:port" from a Get-target URL, defaulting the port by scheme.
+fn probe_address_for_url(url: &str) -> Result<String> {
+    let parsed = url::Url::parse(url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL missing host"))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Ok(format!("{host}:{port}"))
+}
+
 /// Parse proxy URL to extract host:port
 fn parse_proxy_address(url: &str) -> Result<String> {
     // Handle URLs like "http://host:port" or just "host:port"
@@ -453,6 +515,34 @@ async fn run_health_checks(config: &AppConfig, state: &StateStore) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_probe_address_for_url_defaults_port_by_scheme() {
+        assert_eq!(
+            probe_address_for_url("https://example.com/health").unwrap(),
+            "example.com:443"
+        );
+        assert_eq!(
+            probe_address_for_url("http://example.com:8080/health").unwrap(),
+            "example.com:8080"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_target_reachable_succeeds_against_local_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = HealthCheckTarget::Connect {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let result = check_target_reachable(1000, &target).await;
+        assert!(
+            result.success,
+            "expected success, got {:?}",
+            result.failure_reason
+        );
+    }
 
     #[test]
     fn test_parse_proxy_address_with_scheme() {
