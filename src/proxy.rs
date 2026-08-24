@@ -207,12 +207,13 @@ pub async fn run_proxy(
 /// multiple healthy proxies.
 pub async fn run_proxy_with_load_balancing(
     listen_port: u16,
-    config: Arc<AppConfig>,
+    config_rx: tokio::sync::watch::Receiver<std::sync::Arc<AppConfig>>,
     state: Arc<StateStore>,
     runtime: Arc<RuntimeState>,
     load_balancer: Arc<LoadBalancer>,
     retry_config: RetryConfig,
 ) -> Result<()> {
+    let config = config_rx.borrow().clone();
     let addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
     let listener = TcpListener::bind(addr)
         .await
@@ -247,8 +248,8 @@ pub async fn run_proxy_with_load_balancing(
                 return Err(e.into());
             }
         };
-
-        let config_clone = config.clone();
+        // Hot-reload: snapshot the latest config for this connection.
+        let config_clone = config_rx.borrow().clone();
         let state_clone = state.clone();
         let runtime_clone = runtime.clone();
         let lb_clone = load_balancer.clone();

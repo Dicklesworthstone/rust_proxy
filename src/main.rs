@@ -33,7 +33,7 @@ mod util;
 mod validation;
 mod watcher;
 
-use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, TargetSpec};
+use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, Settings, TargetSpec};
 use load_balancer::LoadBalancer;
 use output::{OutputDispatcher, OutputFormat};
 use proxy::RetryConfig;
@@ -3030,6 +3030,102 @@ fn service_generate(
     Ok(())
 }
 
+// ============================================================================
+// Config Hot-Reload
+// ============================================================================
+
+/// Settings that only take effect at daemon start: the listen socket, firewall
+/// chain/ipset names, and metrics bind coordinates are captured once by their
+/// long-lived tasks and cannot be swapped live.
+const RESTART_REQUIRED_SETTINGS: &[&str] = &[
+    "listen_port",
+    "chain_name",
+    "ipset_name",
+    "metrics_bind",
+    "metrics_port",
+];
+
+/// Pure helper: which restart-required settings differ between two snapshots,
+/// in [`RESTART_REQUIRED_SETTINGS`] order.
+fn changed_restart_required_settings(old: &Settings, new: &Settings) -> Vec<&'static str> {
+    RESTART_REQUIRED_SETTINGS
+        .iter()
+        .copied()
+        .filter(|&name| match name {
+            "listen_port" => old.listen_port != new.listen_port,
+            "chain_name" => old.chain_name != new.chain_name,
+            "ipset_name" => old.ipset_name != new.ipset_name,
+            "metrics_bind" => old.metrics_bind != new.metrics_bind,
+            "metrics_port" => old.metrics_port != new.metrics_port,
+            _ => false,
+        })
+        .collect()
+}
+
+/// Load the config from an explicit path for a hot-reload attempt.
+fn load_config_for_reload(path: &std::path::Path) -> Result<AppConfig> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed reading config {}", path.display()))?;
+    let config: AppConfig = toml::from_str(&content)
+        .with_context(|| format!("Failed parsing config {}", path.display()))?;
+    Ok(config)
+}
+
+/// Run one hot-reload cycle: load from disk, gate on the same validation as
+/// `rust_proxy check`, warn about restart-required fields, and swap the new
+/// snapshot into the config bus. Returns true when the bus was updated.
+///
+/// Invalid configs are rejected with a warning and the last-known-good
+/// snapshot stays live.
+async fn reload_config_once(
+    config_tx: &tokio::sync::watch::Sender<Arc<AppConfig>>,
+    path: &std::path::Path,
+) -> bool {
+    let new_config = match load_config_for_reload(path) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "Config reload could not read/parse file; keeping last-known-good configuration"
+            );
+            return false;
+        }
+    };
+
+    let report = validation::validate_config(&new_config, path);
+    if report.has_errors() {
+        tracing::warn!(
+            errors = report.error_count(),
+            warnings = report.warning_count(),
+            "Rejected invalid config on hot-reload; keeping last-known-good configuration"
+        );
+        return false;
+    }
+
+    let old = config_tx.borrow().clone();
+    for field in changed_restart_required_settings(&old.settings, &new_config.settings) {
+        tracing::warn!(
+            setting = field,
+            "setting '{field}' requires daemon restart to take effect"
+        );
+    }
+    if old.active_proxy != new_config.active_proxy {
+        // RuntimeState has no reset API for the failback origin, so the new
+        // active proxy is picked up by consumers but not written back into
+        // runtime failover bookkeeping.
+        tracing::info!("active_proxy change applies to failback origin on next restart");
+    }
+
+    match config_tx.send(Arc::new(new_config)) {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "Configuration hot-reloaded");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 async fn run_daemon() -> Result<()> {
     // Runtime-gated test mode: the production binary behaves identically unless
     // the operator explicitly opts in via RUST_PROXY_TEST_MODE=1.
@@ -3045,6 +3141,16 @@ async fn run_daemon() -> Result<()> {
     if let Err(e) = metrics::init_metrics() {
         tracing::warn!(error = %e, "Failed to initialize metrics (continuing without metrics)");
     }
+
+    // Config hot-reload bus. Consumers hold a receiver and borrow+clone the
+    // latest validated snapshot per tick / per accept instead of pinning a
+    // static Arc<AppConfig>.
+    let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(config.clone()));
+    let watch_config_path = config::config_path()?;
+    tracing::info!(
+        path = %watch_config_path.display(),
+        "config hot-reload enabled: watching configuration file for changes (SIGHUP forces a reload)"
+    );
 
     // For Single strategy, require active_proxy; for load-balanced strategies, just need proxies
     let active_id = match config.settings.load_balance_strategy {
@@ -3157,12 +3263,7 @@ async fn run_daemon() -> Result<()> {
             &upstream_excludes,
         )?;
     }
-    let refresh_targets = config.targets.clone();
-    let include_aws = config.settings.include_aws_ip_ranges;
-    let include_cloudflare = config.settings.include_cloudflare_ip_ranges;
-    let include_google = config.settings.include_google_ip_ranges;
-    let ipset_name = config.settings.ipset_name.clone();
-    let refresh_secs = config.settings.dns_refresh_secs;
+    let refresh_rx = config_rx.clone();
     let refresh_task = if test_mode {
         tracing::info!("test mode: skipping DNS/ipset refresh task");
         None
@@ -3171,12 +3272,16 @@ async fn run_daemon() -> Result<()> {
             // so even the first refresh keeps the stale ipset on total failure.
             let mut seen: HashSet<String> = initial_targets.clone();
             loop {
-                tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
+                // Per-tick pickup: borrow the latest validated snapshot so
+                // target lists, include flags, and refresh cadence follow
+                // hot-reloads each cycle.
+                let cfg = refresh_rx.borrow().clone();
+                tokio::time::sleep(Duration::from_secs(cfg.settings.dns_refresh_secs)).await;
                 match refresh_target_entries(
-                    &refresh_targets,
-                    include_aws,
-                    include_cloudflare,
-                    include_google,
+                    &cfg.targets,
+                    cfg.settings.include_aws_ip_ranges,
+                    cfg.settings.include_cloudflare_ip_ranges,
+                    cfg.settings.include_google_ip_ranges,
                 )
                 .await
                 {
@@ -3190,10 +3295,8 @@ async fn run_daemon() -> Result<()> {
                         // one was not, re-probe with the report-aware API and keep
                         // the stale ipset for this cycle on total failure.
                         let total_failure = entries.is_empty() && !seen.is_empty() && {
-                            let domains: Vec<String> = refresh_targets
-                                .iter()
-                                .map(|t| t.domain().to_string())
-                                .collect();
+                            let domains: Vec<String> =
+                                cfg.targets.iter().map(|t| t.domain().to_string()).collect();
                             dns::resolve_parallel(&domains).await.total_failure()
                         };
                         if total_failure {
@@ -3201,7 +3304,9 @@ async fn run_daemon() -> Result<()> {
                             kept = seen.len(),
                             "Total DNS failure while refreshing targets; keeping stale ipset rather than emptying it"
                         );
-                        } else if let Err(err) = iptables::sync_ipset(&ipset_name, &entries) {
+                        } else if let Err(err) =
+                            iptables::sync_ipset(&cfg.settings.ipset_name, &entries)
+                        {
                             tracing::warn!("ipset sync failed: {err}");
                         } else if seen != entries {
                             tracing::info!("ipset refreshed: {} targets", entries.len());
@@ -3214,9 +3319,7 @@ async fn run_daemon() -> Result<()> {
         }))
     };
 
-    let ping_proxies = config.proxies.clone();
-    let ping_interval = config.settings.ping_interval_secs;
-    let ping_timeout = config.settings.ping_timeout_ms;
+    let ping_rx = config_rx.clone();
     let state_clone = state.clone();
     let ping_task = if test_mode {
         tracing::info!("test mode: skipping proxy ping task");
@@ -3224,28 +3327,38 @@ async fn run_daemon() -> Result<()> {
     } else {
         Some(tokio::spawn(async move {
             loop {
-                for proxy in &ping_proxies {
+                // Per-tick pickup: borrow the latest validated snapshot so
+                // the proxy list and ping cadence follow hot-reloads.
+                let cfg = ping_rx.borrow().clone();
+                for proxy in &cfg.proxies {
                     if let Ok(endpoint) = util::parse_proxy_url(&proxy.url) {
-                        match ping_proxy(&endpoint.host, endpoint.port, ping_timeout).await {
+                        match ping_proxy(
+                            &endpoint.host,
+                            endpoint.port,
+                            cfg.settings.ping_timeout_ms,
+                        )
+                        .await
+                        {
                             Ok(ms) => state_clone.record_ping(&proxy.id, ms).await,
                             Err(err) => tracing::warn!("ping failed for {}: {err}", proxy.id),
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(ping_interval)).await;
+                tokio::time::sleep(Duration::from_secs(cfg.settings.ping_interval_secs)).await;
             }
         }))
     };
 
-    // Health check task (only if enabled)
+    // Health check task (only if enabled). Consumes the config bus so
+    // health_check_* settings and the proxy set update live on reload.
     let health_task = if config.settings.health_check_enabled {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let health_config = config.clone();
+        let health_config_rx = config_rx.clone();
         let health_state = state.clone();
         let health_runtime = runtime_state.clone();
         Some((
             tokio::spawn(health::health_check_loop(
-                health_config,
+                health_config_rx,
                 health_state,
                 health_runtime,
                 shutdown_rx,
@@ -3262,13 +3375,12 @@ async fn run_daemon() -> Result<()> {
         max_backoff_ms: config.settings.connect_max_backoff_ms,
     };
 
-    // Wrap config in Arc for sharing with proxy task
-    let config_arc = Arc::new(config.clone());
-
+    // Proxy task: consumes the config bus; each accepted connection
+    // snapshots the latest validated config (hot-reload pickup).
     let runtime_arc = Arc::new(runtime_state.clone());
     let proxy_task = tokio::spawn(proxy::run_proxy_with_load_balancing(
         config.settings.listen_port,
-        config_arc,
+        config_rx.clone(),
         state.clone(),
         runtime_arc,
         load_balancer,
@@ -3307,9 +3419,43 @@ async fn run_daemon() -> Result<()> {
         None
     };
 
+    // Reload source: fs-event watcher drives the same validated reload path
+    // as SIGHUP. Poll cadence bounds worst-case reload latency; debounce is
+    // handled inside ConfigWatcher::poll.
+    let watcher_tx = config_tx.clone();
+    let watcher_path = watch_config_path.clone();
+    let watcher_task = tokio::spawn(async move {
+        let mut watcher = match watcher::ConfigWatcher::new(&watcher_path) {
+            Ok(w) => w,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to create config file watcher; hot-reload disabled until restart"
+                );
+                return;
+            }
+        };
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if watcher.poll() {
+                reload_config_once(&watcher_tx, &watcher_path).await;
+            }
+        }
+    });
+
+    // SIGHUP forces an immediate re-read of the config regardless of fs events.
+    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(err) => bail!("Failed to install SIGHUP handler: {err}"),
+    };
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Shutdown signal received");
+        }
+        _ = sighup.recv() => {
+            tracing::info!("SIGHUP received: reloading configuration");
+            let _swapped = reload_config_once(&config_tx, &watch_config_path).await;
         }
         res = proxy_task => {
             match res {
@@ -3319,6 +3465,8 @@ async fn run_daemon() -> Result<()> {
             }
         }
     }
+
+    watcher_task.abort();
 
     if let Some(refresh_task) = refresh_task {
         refresh_task.abort();
@@ -3615,5 +3763,39 @@ mod tests {
             deactivate_action(false, false, false),
             DeactivateAction::ProceedClear
         );
+    }
+    #[test]
+    fn changed_restart_required_settings_detects_each_field() {
+        let base = Settings::default();
+        for expected in RESTART_REQUIRED_SETTINGS {
+            let mut modified = base.clone();
+            match *expected {
+                "listen_port" => modified.listen_port += 1,
+                "chain_name" => modified.chain_name = format!("{}_x", modified.chain_name),
+                "ipset_name" => modified.ipset_name = format!("{}_x", modified.ipset_name),
+                "metrics_bind" => modified.metrics_bind = "0.0.0.0".to_string(),
+                "metrics_port" => modified.metrics_port += 1,
+                other => panic!("unhandled restart-required setting: {other}"),
+            }
+            assert_eq!(
+                changed_restart_required_settings(&base, &modified),
+                vec![*expected],
+                "changing {expected} must be classified restart-required"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_restart_required_settings_empty_when_equal_or_live_only() {
+        let base = Settings::default();
+        assert!(changed_restart_required_settings(&base, &base).is_empty());
+
+        // Live-swap fields (not in RESTART_REQUIRED_SETTINGS) must not be
+        // flagged: e.g. ping cadence and DNS refresh change per tick.
+        let mut live_only = base.clone();
+        live_only.ping_interval_secs += 1;
+        live_only.dns_refresh_secs += 1;
+        live_only.ping_timeout_ms += 1;
+        assert!(changed_restart_required_settings(&base, &live_only).is_empty());
     }
 }

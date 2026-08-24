@@ -13,3 +13,6 @@ mod load_balancing;
 
 #[path = "e2e/daemon_path.rs"]
 mod daemon_path;
+
+#[path = "e2e/routing_and_failover.rs"]
+mod routing_and_failover;

@@ -36,6 +36,12 @@ pub struct ConfigWatcher {
     debounce: Duration,
     /// Timestamp of last change notification.
     last_change: Option<Instant>,
+    /// A relevant event has been observed since the last fired notification.
+    ///
+    /// This is retained across `poll()` calls so that events arriving inside
+    /// the debounce window are not lost: they stay pending until the window
+    /// elapses and the pending change finally fires.
+    pending_relevant: bool,
 }
 
 impl ConfigWatcher {
@@ -97,6 +103,7 @@ impl ConfigWatcher {
             config_path: config_path.to_path_buf(),
             debounce,
             last_change: None,
+            pending_relevant: false,
         })
     }
 
@@ -109,9 +116,9 @@ impl ConfigWatcher {
     /// # Returns
     /// `true` if the configuration file changed and should be reloaded.
     pub fn poll(&mut self) -> bool {
-        let mut has_relevant_change = false;
-
-        // Drain all pending events
+        // Drain all pending events, accumulating relevance across polls. The
+        // flag must live on `self`: draining before the debounce check means a
+        // per-call local would silently drop events observed mid-window.
         loop {
             match self.rx.try_recv() {
                 Ok(Ok(event)) => {
@@ -121,7 +128,7 @@ impl ConfigWatcher {
                             kind = ?event.kind,
                             "Relevant config file event"
                         );
-                        has_relevant_change = true;
+                        self.pending_relevant = true;
                     }
                 }
                 Ok(Err(e)) => {
@@ -135,20 +142,17 @@ impl ConfigWatcher {
             }
         }
 
-        if !has_relevant_change {
+        let now = Instant::now();
+        let (fire, last_change) =
+            debounce_decision(self.pending_relevant, self.last_change, self.debounce, now);
+        self.last_change = last_change;
+        if !fire {
+            // Keep `pending_relevant` set: the observed change is deferred to
+            // a future poll once the debounce window elapses.
             return false;
         }
 
-        // Apply debouncing
-        let now = Instant::now();
-        if let Some(last) = self.last_change {
-            if now.duration_since(last) < self.debounce {
-                debug!("Debouncing config change event");
-                return false;
-            }
-        }
-
-        self.last_change = Some(now);
+        self.pending_relevant = false;
         info!(
             path = %self.config_path.display(),
             "Config file change detected"
@@ -195,9 +199,55 @@ impl ConfigWatcher {
     }
 }
 
+/// Pure debounce decision used by [`ConfigWatcher::poll`].
+///
+/// Returns whether a reload should fire now and the updated last-change
+/// timestamp. When relevant changes are pending but still inside the debounce
+/// window, the decision is "do not fire" while the caller retains the pending
+/// state for a later poll.
+fn debounce_decision(
+    pending_relevant: bool,
+    last_change: Option<Instant>,
+    debounce: Duration,
+    now: Instant,
+) -> (bool, Option<Instant>) {
+    if !pending_relevant {
+        return (false, last_change);
+    }
+    if let Some(last) = last_change {
+        if now.duration_since(last) < debounce {
+            return (false, last_change);
+        }
+    }
+    (true, Some(now))
+}
+
+#[cfg(test)]
+impl ConfigWatcher {
+    /// Test-only constructor that injects a pre-made event receiver, letting
+    /// unit tests drive `poll()` deterministically without real file events.
+    fn with_receiver(
+        config_path: &Path,
+        debounce: Duration,
+        rx: Receiver<Result<Event, notify::Error>>,
+    ) -> Self {
+        let watcher =
+            RecommendedWatcher::new(|_| {}, Config::default()).expect("test watcher creation");
+        Self {
+            watcher,
+            rx,
+            config_path: config_path.to_path_buf(),
+            debounce,
+            last_change: None,
+            pending_relevant: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{DataChange, ModifyKind};
     use std::fs;
     use tempfile::TempDir;
 
@@ -219,5 +269,75 @@ mod tests {
         // Should still succeed by watching the parent directory
         let watcher = ConfigWatcher::new(&config_path);
         assert!(watcher.is_ok());
+    }
+
+    fn modify_event(path: &Path) -> Result<Event, notify::Error> {
+        Ok(
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                .add_path(path.to_path_buf()),
+        )
+    }
+
+    /// Regression: an event drained during the debounce window must survive
+    /// until the window elapses instead of being dropped.
+    ///
+    /// Pre-fix mechanism: `poll()` kept relevance in a per-call local
+    /// (`has_relevant_change`) and returned `false` on the debounced poll
+    /// without retaining it, so the post-window poll found an empty channel
+    /// and reported no change -- the save was lost.
+    #[test]
+    fn test_poll_retains_events_observed_inside_debounce_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        fs::write(&config_path, "a = 1").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = ConfigWatcher::with_receiver(&config_path, Duration::from_millis(30), rx);
+
+        tx.send(modify_event(&config_path)).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            watcher.poll(),
+            "first relevant event fires immediately (no prior change)"
+        );
+
+        // Second save lands inside the debounce window.
+        tx.send(modify_event(&config_path)).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!watcher.poll(), "in-window event is debounced");
+
+        // Window elapsed and no new events arrive: the retained event must
+        // still fire. Pre-fix this returned false (event lost).
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            watcher.poll(),
+            "event observed during the debounce window must fire after it elapses"
+        );
+
+        // And nothing further is pending.
+        assert!(!watcher.poll(), "pending state cleared after firing");
+    }
+
+    #[test]
+    fn test_debounce_decision_pure_helper() {
+        let t0 = Instant::now();
+        let win = Duration::from_millis(100);
+
+        // Nothing pending never fires and preserves last_change.
+        let (fire, lc) = debounce_decision(false, Some(t0), win, t0 + win);
+        assert!(!fire);
+        assert_eq!(lc, Some(t0));
+
+        // Pending inside the window: no fire, pending stays (caller keeps it).
+        let (fire, _) = debounce_decision(true, Some(t0), win, t0 + Duration::from_millis(50));
+        assert!(!fire);
+
+        // Pending outside the window (or never fired): fire and stamp now.
+        let (fire, lc) = debounce_decision(true, Some(t0), win, t0 + win);
+        assert!(fire);
+        assert_eq!(lc, Some(t0 + win));
+        let (fire, lc) = debounce_decision(true, None, win, t0);
+        assert!(fire);
+        assert_eq!(lc, Some(t0));
     }
 }

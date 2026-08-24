@@ -458,7 +458,7 @@ sudo rust_proxy deactivate
 
 ## License
 
-License is not yet specified.
+Licensed under the MIT License with OpenAI/Anthropic rider — see [LICENSE](LICENSE).
 
 ## Disclaimer
 

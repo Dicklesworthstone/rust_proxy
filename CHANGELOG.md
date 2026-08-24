@@ -148,7 +148,7 @@ Controls behavior when all configured proxies are unhealthy.
   connection tracking, and per-proxy statistics collection.
   ([0370be8](https://github.com/Dicklesworthstone/rust_proxy/commit/0370be8de0df58858effec5bbca6e74cebc94b07))
 - **HTTP metrics server** (`src/metrics_server.rs`): endpoint for
-  Prometheus scraping, with additional health and status endpoints.
+  Prometheus scraping plus a `/health` liveness route.
   ([0370be8](https://github.com/Dicklesworthstone/rust_proxy/commit/0370be8de0df58858effec5bbca6e74cebc94b07),
    [bb12079](https://github.com/Dicklesworthstone/rust_proxy/commit/bb120793b59ad2d3ce61deb6b98cb8f54051b3c8))
 - **Metrics tests and degradation tracking**: expanded test coverage for

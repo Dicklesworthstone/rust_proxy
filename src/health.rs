@@ -322,11 +322,12 @@ pub async fn check_and_perform_failback(
 
 /// Health check loop that runs as a background task in the daemon
 pub async fn health_check_loop(
-    config: AppConfig,
+    config_rx: watch::Receiver<std::sync::Arc<crate::AppConfig>>,
     state: Arc<StateStore>,
     runtime: RuntimeState,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let config = config_rx.borrow().clone();
     let interval = Duration::from_secs(config.settings.health_check_interval_secs);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -351,6 +352,8 @@ pub async fn health_check_loop(
                 break;
             }
             _ = ticker.tick() => {
+                // Hot-reload: adopt the latest validated config each tick.
+                let config = config_rx.borrow().clone();
                 run_health_checks(&config, &state).await;
 
                 // Update degradation state (debounced) based on current health
