@@ -207,6 +207,15 @@ sudo rust_proxy deactivate
 sudo rust_proxy deactivate --keep-rules
 ```
 
+### `rust_proxy reload`
+Trigger a configuration reload of the running daemon (sends SIGHUP via the
+pidfile). Equivalent to `kill -HUP $(cat /run/rust_proxy.pid)` but with
+clear success/failure feedback.
+
+```bash
+sudo rust_proxy reload
+```
+
 ### `rust_proxy cleanup-stale`
 Clear firewall/pid state left by a crashed daemon (SIGKILL, OOM, panic).
 Refuses while a live daemon holds the pidfile. Invoked automatically by the

@@ -89,6 +89,8 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Reload configuration of the running daemon (sends SIGHUP)
+    Reload,
     /// Run transparent proxy daemon (requires sudo)
     Daemon,
     /// Show current status
@@ -357,6 +359,10 @@ async fn main() -> Result<()> {
             service_cmd(action, &output)?
         }
         Commands::Daemon => run_daemon().await?,
+        Commands::Reload => {
+            let output = OutputDispatcher::from_flags(false, false, None);
+            reload_cmd(&output)?
+        }
         Commands::Status(args) => {
             let output =
                 OutputDispatcher::from_flags(args.json, false, args.format.map(Into::into));
@@ -955,6 +961,68 @@ fn cleanup_action(
         }
     } else {
         CleanupAction::NothingStale
+    }
+}
+
+/// What `reload` should do given the pidfile contents. Pure for tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadAction {
+    /// No pidfile: no daemon was started (or state was cleaned up).
+    NoDaemon,
+    /// Pidfile holds a dead pid: stale leftover, nothing to signal.
+    Stale(u32),
+    /// Pidfile holds a live pid: signal it.
+    Signal(u32),
+}
+
+fn reload_action(pidfile_pid: Option<u32>, is_alive: impl Fn(u32) -> bool) -> ReloadAction {
+    match pidfile_pid {
+        None => ReloadAction::NoDaemon,
+        Some(pid) if is_alive(pid) => ReloadAction::Signal(pid),
+        Some(pid) => ReloadAction::Stale(pid),
+    }
+}
+
+fn reload_cmd(output: &OutputDispatcher) -> Result<()> {
+    let pid_path = std::path::PathBuf::from(state::DEFAULT_PID_PATH);
+    let action = reload_action(state::read_pidfile(&pid_path), state::process_alive);
+    match action {
+        ReloadAction::NoDaemon => {
+            output.print_json(&serde_json::json!({"reloaded": false, "reason": "no daemon"}));
+            bail!(
+                "No running daemon found (no pidfile at {}). Start it with \
+                 `sudo rust_proxy daemon`.",
+                pid_path.display()
+            );
+        }
+        ReloadAction::Stale(pid) => {
+            output.print_json(&serde_json::json!({
+                "reloaded": false,
+                "reason": "stale pidfile",
+                "stale_pid": pid,
+            }));
+            bail!(
+                "Pidfile {} points at dead pid {pid}; run \
+                 `sudo rust_proxy cleanup-stale`.",
+                pid_path.display()
+            );
+        }
+        ReloadAction::Signal(pid) => {
+            // SAFETY: SIGHUP to a valid pid triggers the daemon's reload
+            // path; no data is mutated by the signal itself.
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                output.print_json(&serde_json::json!({
+                    "reloaded": false,
+                    "reason": format!("signal failed: {err}"),
+                    "pid": pid,
+                }));
+                bail!("Failed to send SIGHUP to pid {pid}: {err}");
+            }
+            output.print_json(&serde_json::json!({"reloaded": true, "pid": pid}));
+            Ok(())
+        }
     }
 }
 
@@ -4027,5 +4095,18 @@ mod tests {
         live_only.dns_refresh_secs += 1;
         live_only.ping_timeout_ms += 1;
         assert!(changed_restart_required_settings(&base, &live_only).is_empty());
+    }
+
+    #[test]
+    fn test_reload_action_all_cases() {
+        // No pidfile: nothing to signal.
+        assert_eq!(reload_action(None, |_| true), ReloadAction::NoDaemon);
+        // Live daemon: signal it.
+        assert_eq!(
+            reload_action(Some(7), |pid| pid == 7),
+            ReloadAction::Signal(7)
+        );
+        // Dead pid: stale leftover, refuse to signal.
+        assert_eq!(reload_action(Some(7), |_| false), ReloadAction::Stale(7));
     }
 }
