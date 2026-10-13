@@ -46,5 +46,12 @@ sync_base.jsonl
 # Local history backups
 .br_history/
 
+# Derived locks, migration scratch files, and preserved local recovery evidence
+.write.lock
+*.lock
+*.tmp
+.br_recovery/
+.br-wal-index-*/
+
 # bv (beads viewer) lock file
 .bv.lock
