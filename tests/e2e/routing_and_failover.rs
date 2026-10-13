@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -193,6 +193,14 @@ fn failover_config(primary_port: u16, secondary_port: u16, listen_port: u16) -> 
 
 /// Spawn the real binary as `daemon` under the runtime test seam.
 fn spawn_daemon(home: &TestHome, stderr_file: &Path) -> Result<Child> {
+    spawn_daemon_with_env(home, stderr_file, &[])
+}
+
+fn spawn_daemon_with_env(
+    home: &TestHome,
+    stderr_file: &Path,
+    variables: &[(&str, &str)],
+) -> Result<Child> {
     let stderr = std::fs::File::create(stderr_file)?;
     Command::new(proxy_binary())
         .args(["daemon"])
@@ -202,11 +210,231 @@ fn spawn_daemon(home: &TestHome, stderr_file: &Path) -> Result<Child> {
         .env("RUST_LOG", "debug")
         .env("RUST_PROXY_TEST_MODE", "1")
         .env("RUST_PROXY_TEST_ORIGINAL_DST", ORIGINAL_DST)
+        .envs(variables.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))
         .spawn()
         .context("spawn rust_proxy daemon")
+}
+
+struct ManagedDaemon(Child);
+
+impl Drop for ManagedDaemon {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[tokio::test]
+async fn authentication_sources_establish_real_byte_exact_daemon_tunnels() -> Result<()> {
+    use base64::Engine as _;
+    require_non_root();
+    for source in ["url", "config", "env", "mixed"] {
+        let expected = match source {
+            "url" => "url-user:url+pass",
+            "config" => "config-user:config-pass",
+            "env" => "env-user:env-pass",
+            _ => "env-user:config-pass",
+        };
+        let primary = MockProxy::new(
+            0,
+            MockBehavior::AuthenticatedTunnelEcho {
+                token: base64::engine::general_purpose::STANDARD.encode(expected),
+            },
+        )
+        .await?;
+        let secondary = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+        let port = free_listen_port();
+        let home = activation_config("alpha", primary.port, secondary.port, port)?;
+        let path = home._temp.path().join(".config/rust_proxy/config.toml");
+        let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        let proxy = config["proxies"][0]
+            .as_table_mut()
+            .context("proxy fixture table")?;
+        proxy.insert(
+            "url".into(),
+            format!("http://url-user:url%2Bpass@127.0.0.1:{}", primary.port).into(),
+        );
+        if source != "url" {
+            let mut auth = toml::Table::new();
+            auth.insert("username".into(), "config-user".into());
+            auth.insert("password".into(), "config-pass".into());
+            if source == "env" || source == "mixed" {
+                auth.insert("username_env".into(), "RUST_PROXY_E2E_AUTH_USER".into());
+            }
+            if source == "env" {
+                auth.insert("password_env".into(), "RUST_PROXY_E2E_AUTH_PASS".into());
+            }
+            proxy.insert("auth".into(), auth.into());
+        }
+        std::fs::write(path, toml::to_string(&config)?)?;
+        let stderr = home._temp.path().join("daemon.stderr");
+        let mut daemon = ManagedDaemon(spawn_daemon_with_env(
+            &home,
+            &stderr,
+            &[
+                ("RUST_PROXY_E2E_AUTH_USER", "env-user"),
+                ("RUST_PROXY_E2E_AUTH_PASS", "env-pass"),
+            ],
+        )?);
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        // TCP readiness connections themselves create CONNECTs under this seam.
+        // Wait on the daemon's post-bind marker so only the three payload clients
+        // enter the endpoint's forwarding denominator.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !read_stderr(&stderr).contains("transparent proxy listening")
+            && Instant::now() < deadline
+        {
+            anyhow::ensure!(
+                daemon.0.try_wait()?.is_none(),
+                "auth daemon exited before startup"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::ensure!(
+            read_stderr(&stderr).contains("transparent proxy listening"),
+            "auth daemon startup marker absent"
+        );
+        for _ in 0..3 {
+            assert!(
+                drive_tunnel(addr, Duration::from_secs(2)).await?,
+                "source {source} did not produce a byte-exact authenticated tunnel"
+            );
+        }
+        assert!(graceful_shutdown(&mut daemon.0)?.success());
+        assert_eq!(
+            client_connect_count(&primary),
+            3,
+            "primary forwarding evidence for {source}"
+        );
+        assert_eq!(
+            client_connect_count(&secondary),
+            0,
+            "a wrong credential must not pass by selecting another proxy"
+        );
+        let output = read_stderr(&stderr);
+        for secret in [
+            "url-user",
+            "url+pass",
+            "config-user",
+            "config-pass",
+            "env-user",
+            "env-pass",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "daemon emitted a credential token for {source}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_failure_excludes_proxy_and_authenticated_recovery_fails_back() -> Result<()> {
+    use base64::Engine as _;
+    require_non_root();
+    let token = base64::engine::general_purpose::STANDARD.encode("recovered-user:recovered-pass");
+    let primary = MockProxy::new(
+        0,
+        MockBehavior::AuthenticatedTunnelEcho {
+            // ubs:ignore[rust.security.hardcoded-secrets] — intentionally incorrect public test token; controls 407 exclusion, never a usable credential.
+            token: "deliberately-wrong-token".into(),
+        },
+    )
+    .await?;
+    let secondary = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let port = free_listen_port();
+    let home = failover_config(primary.port, secondary.port, port)?;
+    let path = home._temp.path().join(".config/rust_proxy/config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    config["settings"]["auto_failback"] = true.into();
+    config["settings"]
+        .as_table_mut()
+        .context("settings fixture table")?
+        .insert("failback_delay_secs".into(), 2.into());
+    config["proxies"][0]["url"] = format!(
+        "http://recovered-user:recovered-pass@127.0.0.1:{}",
+        primary.port
+    )
+    .into();
+    std::fs::write(path, toml::to_string(&config)?)?;
+    let stderr = home._temp.path().join("daemon.stderr");
+    let mut daemon = ManagedDaemon(spawn_daemon(&home, &stderr)?);
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while !read_stderr(&stderr).contains("transparent proxy listening")
+        && Instant::now() < startup_deadline
+    {
+        anyhow::ensure!(
+            daemon.0.try_wait()?.is_none(),
+            "auth recovery daemon exited before startup"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::ensure!(
+        read_stderr(&stderr).contains("transparent proxy listening"),
+        "auth recovery daemon startup marker absent"
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !read_stderr(&stderr).contains("Failover triggered") && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        read_stderr(&stderr).contains("Failover triggered"),
+        "407 never excluded the primary"
+    );
+    let bad_before = client_connect_count(&primary);
+    let secondary_before = client_connect_count(&secondary);
+    for _ in 0..3 {
+        assert!(
+            drive_tunnel(addr, Duration::from_secs(2)).await?,
+            "alternative did not relay byte-exact after auth exclusion"
+        );
+    }
+    assert_eq!(
+        client_connect_count(&primary),
+        bad_before,
+        "excluded proxy still selected"
+    );
+    assert_eq!(client_connect_count(&secondary), secondary_before + 3);
+    let recovered_at = Instant::now();
+    primary.set_behavior(MockBehavior::AuthenticatedTunnelEcho { token });
+    while !read_stderr(&stderr).contains("Failback triggered")
+        && recovered_at.elapsed() < Duration::from_secs(8)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let log = read_stderr(&stderr);
+    assert!(
+        log.contains("Failback triggered"),
+        "authenticated recovery did not restore original proxy"
+    );
+    assert!(
+        recovered_at.elapsed() >= Duration::from_secs(2),
+        "failback skipped the configured recovery delay"
+    );
+    let primary_before = client_connect_count(&primary);
+    let secondary_before = client_connect_count(&secondary);
+    for _ in 0..3 {
+        assert!(
+            drive_tunnel(addr, Duration::from_secs(2)).await?,
+            "recovered original did not relay byte-exact"
+        );
+    }
+    assert_eq!(client_connect_count(&primary), primary_before + 3);
+    assert_eq!(client_connect_count(&secondary), secondary_before);
+    assert!(graceful_shutdown(&mut daemon.0)?.success());
+    let log = read_stderr(&stderr);
+    assert!(
+        !log.contains("recovered-user") && !log.contains("recovered-pass"),
+        "auth recovery log leaked credentials"
+    );
+    Ok(())
 }
 
 fn read_stderr(path: &Path) -> String {

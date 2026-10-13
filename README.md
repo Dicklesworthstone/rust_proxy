@@ -488,7 +488,25 @@ No. It only applies runtime `iptables` rules while the daemon is running.
 No. The proxy uses CONNECT and does not terminate TLS.
 
 ### Can I use environment variables for credentials?
-Yes. Use `--username-env` and `--password-env` when adding a proxy.
+Yes. Use `--username-env` and `--password-env` when adding a proxy. Each credential
+field resolves in this order: an explicitly configured environment variable,
+the explicit config field, then percent-decoded URL userinfo. A missing requested
+environment variable fails validation instead of falling back. Set a complete,
+nonempty username/password pair; usernames cannot contain a colon. CLI listings,
+diagnostics and debug output redact credentials; the config file still stores
+explicit credentials and must be protected appropriately.
+
+Upstream proxy transport supports HTTP only (`http://host:port`, with optional
+userinfo). HTTPS upstream URLs are rejected before daemon activation.
+
+Health checks use the same authenticated, bounded CONNECT parser as forwarding.
+`407` means the proxy is unusable with the configured credentials. A `GET http://...`
+target sends an absolute-form proxy request; `GET https://...` establishes an
+authenticated CONNECT tunnel, validates TLS against native trust, and sends GET
+to the origin without proxy credentials. GET health requires a 2xx response.
+Each proxy's optional `health_check_url` overrides the global target with a GET.
+Health deadlines are the configured timeout capped at ten seconds, covering the
+entire probe; established forwarding tunnels do not have this idle timeout.
 
 ### How do I reset all rules?
 

@@ -701,10 +701,22 @@ impl From<bool> for DryRun {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxyEndpoint {
     pub host: String,
     pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("authenticated", &self.username.is_some())
+            .finish()
+    }
 }
 
 pub fn parse_proxy_url(raw: &str) -> Result<ProxyEndpoint> {
@@ -713,17 +725,57 @@ pub fn parse_proxy_url(raw: &str) -> Result<ProxyEndpoint> {
     } else {
         format!("http://{}", raw)
     };
-    let url = Url::parse(&normalized).with_context(|| format!("Invalid proxy URL: {raw}"))?;
+    // Never include the input: it can contain inline credentials, even when invalid.
+    let url = Url::parse(&normalized).context("Invalid proxy URL")?;
+    if url.scheme() != "http" {
+        bail!("Only HTTP upstream proxies are supported; HTTPS proxy transport is not implemented");
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        bail!("Proxy URL must contain only an HTTP host, port and optional credentials");
+    }
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("Proxy URL missing host"))?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow::anyhow!("Proxy URL missing port"))?;
+    if port == 0 {
+        bail!("Proxy port must be greater than zero");
+    }
     Ok(ProxyEndpoint {
         host: host.to_string(),
         port,
+        username: (!url.username().is_empty())
+            .then(|| decode_url_credential(url.username()))
+            .transpose()?,
+        password: url.password().map(decode_url_credential).transpose()?,
     })
+}
+
+fn decode_url_credential(encoded: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut input = encoded.as_bytes().iter().copied();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let high = input.next().and_then(|b| char::from(b).to_digit(16));
+            let low = input.next().and_then(|b| char::from(b).to_digit(16));
+            let (Some(high), Some(low)) = (high, low) else {
+                bail!("Invalid percent encoding in proxy credentials");
+            };
+            bytes.push((high * 16 + low) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).context("Proxy credentials must be UTF-8")
+}
+
+/// Safe display even for malformed URLs: never echo unparsed input.
+pub fn redact_proxy_url(raw: &str) -> String {
+    match parse_proxy_url(raw) {
+        Ok(endpoint) => format!("http://{}:{}", endpoint.host, endpoint.port),
+        Err(_) => "[invalid proxy URL]".to_string(),
+    }
 }
 
 #[allow(dead_code)]
@@ -901,16 +953,38 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_proxy_url_https_default_port() {
-        let result = parse_proxy_url("https://proxy.example.com").unwrap();
-        assert_eq!(result.host, "proxy.example.com");
-        assert_eq!(result.port, 443);
+    fn test_parse_proxy_url_https_is_unsupported() {
+        assert!(parse_proxy_url("https://proxy.example.com").is_err());
     }
 
     #[test]
     fn test_parse_proxy_url_invalid() {
         let result = parse_proxy_url("not a valid url ::::");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn proxy_endpoint_rejects_unsupported_components_and_redacts_invalid_credentials() {
+        for raw in [
+            "https://secret-user:secret-password@proxy.example.com:443",
+            "socks5://secret-user:secret-password@proxy.example.com:1080",
+            "http://secret-user:secret-password@proxy.example.com:0",
+            "http://secret-user:secret-password@proxy.example.com/path",
+            "http://secret-user:secret-password@proxy.example.com?query=1",
+            "http://secret-user:secret-password@proxy.example.com#fragment",
+            "http://secret-user:secret%ZZ-password@proxy.example.com",
+        ] {
+            let error = parse_proxy_url(raw).unwrap_err();
+            assert!(!format!("{error:#}").contains("secret-"));
+            assert!(!redact_proxy_url(raw).contains("secret-"));
+        }
+        let parsed =
+            parse_proxy_url("http://secret-user:secret-password@proxy.example.com").unwrap();
+        assert!(!format!("{parsed:?}").contains("secret-"));
+        assert_eq!(
+            redact_proxy_url("http://secret-user:secret-password@proxy.example.com"),
+            "http://proxy.example.com:80"
+        );
     }
 
     #[test]

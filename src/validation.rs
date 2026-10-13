@@ -142,7 +142,9 @@ pub fn validate_proxies(proxies: &[ProxyConfig]) -> Vec<ValidationResult> {
             results.push(
                 ValidationResult::error("proxy", format!("Invalid proxy URL: {}", e))
                     .with_id(&proxy.id)
-                    .with_suggestion("URL must be in format http://host:port or https://host:port"),
+                    .with_suggestion(
+                        "Use http://host:port; HTTPS upstream transport is unsupported",
+                    ),
             );
         } else {
             // Check for http/https scheme
@@ -153,14 +155,31 @@ pub fn validate_proxies(proxies: &[ProxyConfig]) -> Vec<ValidationResult> {
                         "URL missing scheme, will default to http://",
                     )
                     .with_id(&proxy.id)
-                    .with_suggestion("Consider specifying http:// or https:// explicitly"),
+                    .with_suggestion("Consider specifying http:// explicitly"),
                 );
             }
         }
 
         // Validate auth configuration
-        let auth_results = validate_proxy_auth(&proxy.auth, &proxy.id);
-        results.extend(auth_results);
+        if let Ok(endpoint) = crate::util::parse_proxy_url(&proxy.url) {
+            if let Err(error) = proxy.auth.resolve(endpoint.username, endpoint.password) {
+                results
+                    .push(ValidationResult::error("proxy", error.to_string()).with_id(&proxy.id));
+            }
+        }
+        if proxy.auth.username.is_some() || proxy.auth.password.is_some() {
+            results.push(
+                ValidationResult::warning("proxy", "Using plaintext credentials in config file")
+                    .with_id(&proxy.id)
+                    .with_suggestion("Consider using --username-env/--password-env for security"),
+            );
+        }
+        if let Err(error) = proxy.health_target(&crate::config::HealthCheckTarget::default()) {
+            results.push(
+                ValidationResult::error("proxy", format!("Invalid health override: {error}"))
+                    .with_id(&proxy.id),
+            );
+        }
     }
 
     // Warn if no proxies defined
@@ -175,95 +194,17 @@ pub fn validate_proxies(proxies: &[ProxyConfig]) -> Vec<ValidationResult> {
 }
 
 /// Validate proxy authentication configuration
+#[cfg(test)]
 fn validate_proxy_auth(auth: &crate::config::ProxyAuth, proxy_id: &str) -> Vec<ValidationResult> {
-    let mut results = Vec::new();
-
-    // Check if using env vars
-    if let Some(ref env_user) = auth.username_env {
-        if std::env::var(env_user).is_err() {
-            results.push(
-                ValidationResult::error(
-                    "proxy",
-                    format!("{} environment variable not set", env_user),
-                )
-                .with_id(proxy_id)
-                .with_suggestion(format!(
-                    "Set {} or use --username flag when adding proxy",
-                    env_user
-                )),
-            );
-        } else if std::env::var(env_user).unwrap_or_default().is_empty() {
-            results.push(
-                ValidationResult::error(
-                    "proxy",
-                    format!("{} environment variable is empty", env_user),
-                )
-                .with_id(proxy_id),
-            );
-        }
-    }
-
-    if let Some(ref env_pass) = auth.password_env {
-        if std::env::var(env_pass).is_err() {
-            results.push(
-                ValidationResult::error(
-                    "proxy",
-                    format!("{} environment variable not set", env_pass),
-                )
-                .with_id(proxy_id)
-                .with_suggestion(format!(
-                    "Set {} or use --password flag when adding proxy",
-                    env_pass
-                )),
-            );
-        } else if std::env::var(env_pass).unwrap_or_default().is_empty() {
-            results.push(
-                ValidationResult::error(
-                    "proxy",
-                    format!("{} environment variable is empty", env_pass),
-                )
-                .with_id(proxy_id),
-            );
-        }
-    }
-
-    // Pair completeness: the CONNECT Basic-Auth header is emitted only when
-    // BOTH username and password resolve (proxy.rs); a half-configured pair
-    // sends UNAUTHENTICATED requests that fail opaquely upstream (407
-    // surfaced as generic "Proxy CONNECT failed"). Fail fast here instead.
-    let has_username = auth.username.is_some() || auth.username_env.is_some();
-    let has_password = auth.password.is_some() || auth.password_env.is_some();
-    // ubs:ignore[rust.security.constant-time-compare] — compares presence booleans, never credential bytes.
-    if has_username != has_password {
-        let missing = if has_password { "username" } else { "password" };
-        results.push(
-            ValidationResult::error(
-                "proxy",
-                format!(
-                    "proxy '{}' has incomplete credentials: {} is missing \
-                     (exactly one side of the username/password pair is set)",
-                    proxy_id, missing
-                ),
-            )
-            .with_id(proxy_id)
-            .with_suggestion(format!(
-                "Set BOTH username and password for proxy '{}' (via --username/--password \
-                 or --username-env/--password-env), or remove the lone credential",
-                proxy_id
-            )),
-        );
-    }
-
-    // Warn about plaintext credentials
-    if auth.username.is_some() || auth.password.is_some() {
-        results.push(
-            ValidationResult::warning("proxy", "Using plaintext credentials in config file")
-                .with_id(proxy_id)
-                .with_suggestion("Consider using --username-env/--password-env for security"),
-        );
-    }
-
-    results
+    // Existing auth controls exercise the production validator, not a parallel implementation.
+    validate_proxies(&[ProxyConfig {
+        id: proxy_id.to_string(),
+        url: "http://127.0.0.1:8080".to_string(),
+        auth: auth.clone(),
+        priority: None,
+        health_check_url: None,
+        weight: 100,
+    }])
 }
 
 /// Validate target domain configurations

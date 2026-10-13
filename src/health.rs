@@ -1,10 +1,11 @@
 use crate::config::{AppConfig, HealthCheckTarget, ProxyConfig};
 use crate::metrics;
+use crate::proxy::{read_response_head, try_proxy_connect, RetryConfig, UpstreamProxy};
 use crate::state::{HealthStatus, RuntimeState, StateStore};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{timeout, Instant, MissedTickBehavior};
@@ -23,26 +24,32 @@ pub async fn check_proxy_health(
     timeout_ms: u64,
     target: &HealthCheckTarget,
 ) -> HealthCheckResult {
-    let timeout_dur = Duration::from_millis(timeout_ms);
+    // Health may request a shorter deadline, never a larger transport budget.
+    let timeout_dur = Duration::from_millis(timeout_ms.min(10_000));
     let start = Instant::now();
 
-    // Parse proxy URL to get host and port
-    let proxy_addr = match parse_proxy_address(&proxy.url) {
-        Ok(addr) => addr,
+    let upstream = match UpstreamProxy::from_config(proxy) {
+        Ok(upstream) => upstream,
         Err(e) => {
             return HealthCheckResult {
                 success: false,
                 latency_ms: start.elapsed().as_millis() as f64,
-                failure_reason: Some(format!("Invalid proxy URL: {}", e)),
+                failure_reason: Some(e.to_string()),
             };
         }
     };
 
-    let result = timeout(
-        timeout_dur,
-        check_proxy_with_target(&proxy_addr, proxy, target),
-    )
-    .await;
+    let target = match proxy.health_target(target) {
+        Ok(target) => target,
+        Err(e) => {
+            return HealthCheckResult {
+                success: false,
+                latency_ms: start.elapsed().as_millis() as f64,
+                failure_reason: Some(e.to_string()),
+            }
+        }
+    };
+    let result = timeout(timeout_dur, check_proxy_with_target(&upstream, &target)).await;
     let latency_ms = start.elapsed().as_millis() as f64;
 
     match result {
@@ -126,155 +133,108 @@ fn probe_address_for_url(url: &str) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-/// Parse proxy URL to extract host:port
-fn parse_proxy_address(url: &str) -> Result<String> {
-    // Handle URLs like "http://host:port" or just "host:port"
-    let url = if url.starts_with("http://") || url.starts_with("https://") {
-        url.to_string()
-    } else {
-        format!("http://{}", url)
-    };
-
-    let parsed = url::Url::parse(&url)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing host"))?;
-    let port = parsed.port().unwrap_or(80);
-    Ok(format!("{}:{}", host, port))
-}
-
 /// Test that the proxy is reachable using the configured health check target
 async fn check_proxy_with_target(
-    proxy_addr: &str,
-    proxy: &ProxyConfig,
+    upstream: &UpstreamProxy,
     target: &HealthCheckTarget,
 ) -> Result<()> {
     match target {
         HealthCheckTarget::Connect { host, port } => {
-            check_proxy_connect(proxy_addr, host, *port).await
+            // Same credential header, parser and finite establishment budget as forwarding.
+            try_proxy_connect(
+                upstream,
+                host,
+                *port,
+                &RetryConfig {
+                    max_retries: 0,
+                    ..RetryConfig::default()
+                },
+            )
+            .await?;
+            Ok(())
         }
-        HealthCheckTarget::Get { url } => check_proxy_get(proxy_addr, proxy, url).await,
-    }
-}
-
-/// Test that the proxy accepts CONNECT requests to the specified target
-async fn check_proxy_connect(proxy_addr: &str, host: &str, port: u16) -> Result<()> {
-    // Connect to proxy
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-
-    // Build CONNECT request with configured target
-    let target = format!("{}:{}", host, port);
-    let connect_request = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target);
-    stream.write_all(connect_request.as_bytes()).await?;
-
-    // Read response
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await?;
-    let response = String::from_utf8_lossy(&buf[..n]);
-
-    // Check for success response (200 or similar)
-    let first_line = response.lines().next().unwrap_or("");
-
-    if first_line.contains("200") {
-        Ok(())
-    } else if first_line.contains("407") {
-        // 407 Proxy Authentication Required - proxy is reachable but needs auth
-        // This is still considered "reachable" for health purposes
-        Ok(())
-    } else if first_line.starts_with("HTTP/") {
-        anyhow::bail!("Proxy returned: {}", first_line)
-    } else {
-        anyhow::bail!("Invalid response from proxy")
+        HealthCheckTarget::Get { url } => check_proxy_get(upstream, url).await,
     }
 }
 
 /// Test that the proxy can perform an HTTP GET request to the specified URL
-async fn check_proxy_get(proxy_addr: &str, proxy: &ProxyConfig, url: &str) -> Result<()> {
-    // Parse the target URL
-    let parsed_url = url::Url::parse(url)?;
+async fn check_proxy_get(upstream: &UpstreamProxy, url: &str) -> Result<()> {
+    let parsed_url = url::Url::parse(url).context("Invalid health GET URL")?;
     let host = parsed_url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("Missing host in URL"))?;
     let port = parsed_url.port_or_known_default().unwrap_or(80);
-    let path = if parsed_url.path().is_empty() {
-        "/"
-    } else {
-        parsed_url.path()
-    };
-    let query = parsed_url
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
-
-    // Connect to proxy
-    let mut stream = TcpStream::connect(proxy_addr).await?;
-
-    // For HTTPS URLs, we need to use CONNECT first to establish tunnel
     if parsed_url.scheme() == "https" {
-        let target = format!("{}:{}", host, port);
-        let connect_request = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target);
-        stream.write_all(connect_request.as_bytes()).await?;
-
-        // Read CONNECT response
-        let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf).await?;
-        let response = String::from_utf8_lossy(&buf[..n]);
-        let first_line = response.lines().next().unwrap_or("");
-
-        if !first_line.contains("200") && !first_line.contains("407") {
-            anyhow::bail!("CONNECT failed: {}", first_line);
-        }
-
-        // For HTTPS health checks via CONNECT, successful tunnel is enough
-        // We don't do TLS handshake for simplicity - the CONNECT success is sufficient
-        return Ok(());
-    }
-
-    // For HTTP URLs, send GET request through proxy
-    let get_request = format!(
-        "GET {}{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-        path, query, host
-    );
-
-    // Add proxy auth if configured
-    let (username, password) = proxy.auth.resolve();
-    let request = if let (Some(user), Some(pass)) = (username, password) {
-        let credentials = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            format!("{}:{}", user, pass),
-        );
-        format!(
-            "{}Proxy-Authorization: Basic {}\r\n\r\n",
-            get_request, credentials
+        let (stream, early) = try_proxy_connect(
+            upstream,
+            host,
+            port,
+            &RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
         )
-    } else {
-        format!("{}\r\n", get_request)
-    };
-
-    stream.write_all(request.as_bytes()).await?;
-
-    // Read response
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await?;
-    let response = String::from_utf8_lossy(&buf[..n]);
-
-    // Check for success response
-    let first_line = response.lines().next().unwrap_or("");
-
-    if first_line.contains("200")
-        || first_line.contains("204")
-        || first_line.contains("301")
-        || first_line.contains("302")
-    {
-        Ok(())
-    } else if first_line.contains("407") {
-        // 407 Proxy Authentication Required - proxy is reachable but needs auth
-        Ok(())
-    } else if first_line.starts_with("HTTP/") {
-        anyhow::bail!("Proxy returned: {}", first_line)
-    } else {
-        anyhow::bail!("Invalid response from proxy")
+        .await?;
+        if !early.is_empty() {
+            anyhow::bail!("Unexpected bytes before health-check TLS ClientHello");
+        }
+        let native = rustls_native_certs::load_native_certs();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for cert in native.certs {
+            roots
+                .add(cert)
+                .context("Invalid native TLS root certificate")?;
+        }
+        if roots.is_empty() {
+            anyhow::bail!("No native TLS certificates available for health GET");
+        }
+        return check_https_get(stream, &parsed_url, roots).await;
     }
+    let mut stream = TcpStream::connect(format!("{}:{}", upstream.host, upstream.port)).await?;
+    send_get(&mut stream, &parsed_url, true, &upstream.auth_header()).await
+}
+
+async fn check_https_get(
+    stream: TcpStream,
+    url: &url::Url,
+    roots: tokio_rustls::rustls::RootCertStore,
+) -> Result<()> {
+    let host = url.host_str().context("Missing health GET host")?;
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from(
+        host.trim_matches(['[', ']']).to_string(),
+    )
+    .context("Invalid health GET TLS server name")?;
+    let config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, stream)
+        .await
+        .context("Health GET TLS validation failed")?;
+    // Proxy credentials belong on CONNECT, never on the tunneled origin GET.
+    send_get(&mut tls, url, false, "").await
+}
+
+async fn send_get<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    url: &url::Url,
+    absolute: bool,
+    auth: &str,
+) -> Result<()> {
+    let target = if absolute {
+        url.as_str()
+    } else {
+        &url[url::Position::BeforePath..url::Position::AfterQuery]
+    };
+    let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+    let request =
+        format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0\r\nConnection: close\r\n{auth}\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    let (status, _) = read_response_head(stream).await?;
+    if !(200..300).contains(&status) {
+        anyhow::bail!("Health GET failed: HTTP status {status}");
+    }
+    Ok(())
 }
 
 /// Event indicating a failover occurred
@@ -515,6 +475,299 @@ async fn run_health_checks(config: &AppConfig, state: &StateStore) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProxyAuth;
+    use base64::Engine as _;
+    use tokio::io::AsyncReadExt;
+
+    async fn read_request<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<String> {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await?;
+            bytes.push(byte[0]);
+            anyhow::ensure!(bytes.len() <= 16 * 1024, "request exceeded fixture cap");
+        }
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    async fn response_server(
+        response: Vec<u8>,
+    ) -> Result<(ProxyConfig, tokio::task::JoinHandle<Result<String>>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = ProxyConfig {
+            id: "probe".into(),
+            url: format!("http://{}", listener.local_addr()?),
+            auth: ProxyAuth::default(),
+            priority: None,
+            health_check_url: None,
+            weight: 100,
+        };
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_request(&mut stream).await?;
+            // Force a split status token and split final delimiter over real TCP.
+            for chunk in response.chunks(2) {
+                if stream.write_all(chunk).await.is_err() {
+                    break; // Rejection controls may close before the whole oversized head.
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok(request)
+        });
+        Ok((proxy, task))
+    }
+
+    #[tokio::test]
+    async fn authenticated_probe_sources_and_precedence() -> Result<()> {
+        let env_user = "RUST_PROXY_HEALTH_SOURCE_TEST_USER";
+        let env_pass = "RUST_PROXY_HEALTH_SOURCE_TEST_PASS";
+        let old_user = std::env::var_os(env_user);
+        let old_pass = std::env::var_os(env_pass);
+        struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _user_guard = RestoreEnv(env_user, old_user);
+        let _pass_guard = RestoreEnv(env_pass, old_pass);
+        std::env::set_var(env_user, "env-user");
+        std::env::set_var(env_pass, "env-pass");
+        for (source, expected) in [
+            ("url", "url-user:url+p:ass"),
+            ("config", "config-user:config-pass"),
+            ("env", "env-user:env-pass"),
+            ("mixed", "env-user:config-pass"),
+        ] {
+            let (mut proxy, task) =
+                response_server(b"HTTP/1.1 200 Established\r\n\r\n".to_vec()).await?;
+            proxy.url = proxy
+                .url
+                .replacen("http://", "http://url-user:url%2Bp%3Aass@", 1);
+            if source != "url" {
+                proxy.auth.username = Some("config-user".into());
+                proxy.auth.password = Some("config-pass".into());
+            }
+            if source == "env" || source == "mixed" {
+                proxy.auth.username_env = Some(env_user.into());
+            }
+            if source == "env" {
+                proxy.auth.password_env = Some(env_pass.into());
+            }
+            let result = check_proxy_health(&proxy, 1000, &HealthCheckTarget::default()).await;
+            assert!(
+                result.success,
+                "source {source}: {:?}",
+                result.failure_reason
+            );
+            let request = task.await??;
+            let token = base64::engine::general_purpose::STANDARD.encode(expected);
+            assert!(
+                request.contains(&format!("Proxy-Authorization: Basic {token}\r\n")),
+                "credential precedence did not reach the endpoint for {source}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probes_reject_auth_failures_incidental_status_digits_and_large_heads() -> Result<()> {
+        let mut oversize = b"HTTP/1.1 200 OK\r\nX-Large: ".to_vec();
+        oversize.extend(std::iter::repeat_n(b'x', 16 * 1024));
+        oversize.extend_from_slice(b"\r\n\r\n");
+        let cases = [
+            (b"HTTP/1.1 204 Ready\r\n\r\n".to_vec(), true),
+            (b"HTTP/1.1 407 Need auth 200\r\n\r\n".to_vec(), false),
+            (b"HTTP/1.1 502 token-200-secret\r\n\r\n".to_vec(), false),
+            (b"HTTP/9.9 200 token-200-secret\r\n\r\n".to_vec(), false),
+            (b"HTTP/1.1 2000 token-200-secret\r\n\r\n".to_vec(), false),
+            (b"HTTP/1.1 200 OK\r\nX: truncated".to_vec(), false),
+            (oversize, false),
+        ];
+        for (response, expected) in cases {
+            let (proxy, task) = response_server(response).await?;
+            let result = check_proxy_health(&proxy, 2000, &HealthCheckTarget::default()).await;
+            assert_eq!(result.success, expected, "exact status/header decision");
+            assert!(
+                !result
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("token-200-secret"),
+                "untrusted reason phrase leaked"
+            );
+            task.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_probe_uses_its_own_shorter_deadline_and_closes_socket() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut proxy = ProxyConfig {
+            id: "silent".into(),
+            url: format!("http://{}", listener.local_addr()?),
+            auth: ProxyAuth::default(),
+            priority: None,
+            health_check_url: None,
+            weight: 100,
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            read_request(&mut stream).await?;
+            let mut byte = [0];
+            // No fixture deadline: the client must cancel and release its socket.
+            Ok::<_, anyhow::Error>(stream.read(&mut byte).await?)
+        });
+        let started = Instant::now();
+        let result = check_proxy_health(&proxy, 200, &HealthCheckTarget::default()).await;
+        assert!(!result.success);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(timeout(Duration::from_secs(1), server).await???, 0);
+        proxy.auth.username = Some("only-one".into());
+        assert!(UpstreamProxy::from_config(&proxy).is_err());
+        proxy.auth.password = Some("unused".into());
+        proxy.auth.password_env =
+            Some("RUST_PROXY_DEFINITELY_MISSING_HEALTH_CREDENTIAL_20261013".into());
+        assert!(
+            UpstreamProxy::from_config(&proxy).is_err(),
+            "missing explicit environment must not fall back"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_get_is_absolute_authenticated_and_honors_per_proxy_override() -> Result<()> {
+        for target in [
+            "http://first.invalid:8080/health?probe=1",
+            "http://second.invalid/ready",
+        ] {
+            let (mut proxy, task) = response_server(b"HTTP/1.1 204 Ready\r\n\r\n".to_vec()).await?;
+            proxy.auth.username = Some("get-user".into());
+            proxy.auth.password = Some("get-pass".into());
+            proxy.health_check_url = Some(target.into());
+            let result = check_proxy_health(&proxy, 1000, &HealthCheckTarget::default()).await;
+            assert!(result.success, "{:?}", result.failure_reason);
+            let request = task.await??;
+            assert!(
+                request.starts_with(&format!("GET {target} HTTP/1.1\r\n")),
+                "GET override/absolute form was not sent"
+            );
+            assert!(request.contains("Proxy-Authorization: Basic "));
+        }
+        let (mut proxy, task) = response_server(b"HTTP/1.1 407 Auth 200\r\n\r\n".to_vec()).await?;
+        proxy.health_check_url = Some("http://first.invalid/health".into());
+        assert!(
+            !check_proxy_health(&proxy, 1000, &HealthCheckTarget::default())
+                .await
+                .success
+        );
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn https_get_requires_validated_tls_and_origin_get_without_proxy_auth() -> Result<()> {
+        use tokio_rustls::rustls::{
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+            RootCertStore, ServerConfig,
+        };
+        // Public test-only key/certificate for localhost, valid through 2036-10-10.
+        // This root is passed only to the fixture helper, never installed in production trust.
+        let cert = CertificateDer::from(base64::engine::general_purpose::STANDARD.decode("MIIBUDCCAQKgAwIBAgIULmnM1+XLhtNukcbaA14gGFGiG5EwBQYDK2VwMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDAeFw0yNjEwMTMyMzEzMDRaFw0zNjEwMTAyMzEzMDRaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDAqMAUGAytlcAMhALYa962bMj17JGFmOxgZH9kXD0ttqdAMMiVNIc6wo7TIo2YwZDAdBgNVHQ4EFgQUH2t/rhROpYaECVM8h2lBBM0uZocwHwYDVR0jBBgwFoAUH2t/rhROpYaECVM8h2lBBM0uZocwFAYDVR0RBA0wC4IJbG9jYWxob3N0MAwGA1UdEwEB/wQCMAAwBQYDK2VwA0EAauAETyQzW6rUFYIv7C9jIZzLq4F9DBsE7tjU2tNt/PLOhOs89yRvf4XuvEsoFng+j4M9kxz3DAzoFmoosk5aBQ==")?);
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            base64::engine::general_purpose::STANDARD
+                .decode("MC4CAQAwBQYDK2VwBCIEIFiwy4LYMtUWxMvfd8cYBG+nlCvuEXsIyOq3MJSZGwLa")?,
+        ));
+        let config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)?,
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(cert)?;
+        for (host, trust, expected) in [
+            ("localhost", true, true),
+            ("wrong.invalid", true, false),
+            ("localhost", false, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            let server_config = config.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let request = read_request(&mut stream).await?;
+                anyhow::ensure!(
+                    request.starts_with("CONNECT "),
+                    "missing TLS tunnel request"
+                );
+                anyhow::ensure!(
+                    request.contains("Proxy-Authorization: Basic "),
+                    "missing CONNECT authentication"
+                );
+                stream
+                    .write_all(b"HTTP/1.1 200 Established\r\n\r\n")
+                    .await?;
+                let Ok(mut tls) = tokio_rustls::TlsAcceptor::from(server_config)
+                    .accept(stream)
+                    .await
+                else {
+                    return Ok(false);
+                };
+                let request = read_request(&mut tls).await?;
+                anyhow::ensure!(
+                    request.starts_with("GET /health?tls=1 HTTP/1.1\r\n"),
+                    "origin GET missing"
+                );
+                anyhow::ensure!(
+                    !request.contains("Proxy-Authorization"),
+                    "proxy auth leaked to origin"
+                );
+                tls.write_all(b"HTTP/1.1 204 Healthy\r\n\r\n").await?;
+                Ok::<_, anyhow::Error>(true)
+            });
+            let proxy = ProxyConfig {
+                id: "tls".into(),
+                url: format!("http://127.0.0.1:{port}"),
+                auth: ProxyAuth {
+                    username: Some("tls-user".into()),
+                    password: Some("tls-pass".into()),
+                    ..ProxyAuth::default()
+                },
+                priority: None,
+                health_check_url: None,
+                weight: 100,
+            };
+            let upstream = UpstreamProxy::from_config(&proxy)?;
+            let (stream, early) =
+                try_proxy_connect(&upstream, host, 443, &RetryConfig::default()).await?;
+            assert!(early.is_empty());
+            let url = url::Url::parse(&format!("https://{host}/health?tls=1"))?;
+            let result = timeout(
+                Duration::from_secs(2),
+                check_https_get(
+                    stream,
+                    &url,
+                    if trust {
+                        roots.clone()
+                    } else {
+                        RootCertStore::empty()
+                    },
+                ),
+            )
+            .await?;
+            assert_eq!(result.is_ok(), expected, "TLS trust/name outcome");
+            assert_eq!(
+                timeout(Duration::from_secs(2), server).await???,
+                expected,
+                "GET observed only on validated TLS"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_probe_address_for_url_defaults_port_by_scheme() {
@@ -546,25 +799,25 @@ mod tests {
 
     #[test]
     fn test_parse_proxy_address_with_scheme() {
-        let addr = parse_proxy_address("http://proxy.example.com:8080").unwrap();
-        assert_eq!(addr, "proxy.example.com:8080");
+        let endpoint = crate::util::parse_proxy_url("http://proxy.example.com:8080").unwrap();
+        assert_eq!(endpoint.host, "proxy.example.com");
+        assert_eq!(endpoint.port, 8080);
     }
 
     #[test]
     fn test_parse_proxy_address_without_scheme() {
-        let addr = parse_proxy_address("proxy.example.com:8080").unwrap();
-        assert_eq!(addr, "proxy.example.com:8080");
+        let endpoint = crate::util::parse_proxy_url("proxy.example.com:8080").unwrap();
+        assert_eq!(endpoint.port, 8080);
     }
 
     #[test]
     fn test_parse_proxy_address_default_port() {
-        let addr = parse_proxy_address("http://proxy.example.com").unwrap();
-        assert_eq!(addr, "proxy.example.com:80");
+        let endpoint = crate::util::parse_proxy_url("http://proxy.example.com").unwrap();
+        assert_eq!(endpoint.port, 80);
     }
 
     #[test]
     fn test_parse_proxy_address_https() {
-        let addr = parse_proxy_address("https://proxy.example.com").unwrap();
-        assert_eq!(addr, "proxy.example.com:80"); // Still 80 since we use unwrap_or(80)
+        assert!(crate::util::parse_proxy_url("https://proxy.example.com").is_err());
     }
 }

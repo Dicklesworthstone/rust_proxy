@@ -8,7 +8,7 @@ const APP_QUALIFIER: &str = "dev";
 const APP_ORG: &str = "rustproxy";
 const APP_NAME: &str = "rust_proxy";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ProxyAuth {
     pub username: Option<String>,
     pub password: Option<String>,
@@ -17,22 +17,57 @@ pub struct ProxyAuth {
 }
 
 impl ProxyAuth {
-    pub fn resolve(&self) -> (Option<String>, Option<String>) {
-        let user = self
-            .username_env
-            .as_deref()
-            .and_then(|key| std::env::var(key).ok())
-            .or_else(|| self.username.clone());
-        let pass = self
-            .password_env
-            .as_deref()
-            .and_then(|key| std::env::var(key).ok())
-            .or_else(|| self.password.clone());
-        (user, pass)
+    /// Resolve each field in order: explicit environment, config, URL userinfo.
+    /// An explicitly requested environment variable never silently falls back.
+    pub fn resolve(
+        &self,
+        url_user: Option<String>,
+        url_pass: Option<String>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let user_present =
+            self.username_env.is_some() || self.username.is_some() || url_user.is_some();
+        let pass_present =
+            self.password_env.is_some() || self.password.is_some() || url_pass.is_some();
+        if user_present != pass_present {
+            let missing = if user_present { "password" } else { "username" };
+            anyhow::bail!("incomplete credentials: {missing} is missing");
+        }
+        let resolve_field = |env: &Option<String>, config: &Option<String>, url: Option<String>| {
+            if let Some(key) = env {
+                std::env::var(key)
+                    .map(Some)
+                    .context("Proxy credential environment variable not set or not UTF-8")
+            } else {
+                Ok(config.clone().or(url))
+            }
+        };
+        let user = resolve_field(&self.username_env, &self.username, url_user)?;
+        let pass = resolve_field(&self.password_env, &self.password, url_pass)?;
+        if user
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.contains(':') || s.chars().any(char::is_control))
+            || pass
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.chars().any(char::is_control))
+        {
+            anyhow::bail!("Proxy credentials must be nonempty and contain no control characters; username cannot contain a colon");
+        }
+        Ok((user, pass))
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for ProxyAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyAuth")
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("username_env", &self.username_env)
+            .field("password_env", &self.password_env)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub id: String,
     pub url: String,
@@ -47,6 +82,39 @@ pub struct ProxyConfig {
     /// Weight for weighted load balancing (default: 100)
     #[serde(default = "default_proxy_weight")]
     pub weight: u32,
+}
+
+impl ProxyConfig {
+    pub fn redacted(&self) -> Self {
+        let mut safe = self.clone();
+        safe.url = crate::util::redact_proxy_url(&self.url);
+        safe.auth.username = self.auth.username.as_ref().map(|_| "[redacted]".into());
+        safe.auth.password = self.auth.password.as_ref().map(|_| "[redacted]".into());
+        safe
+    }
+
+    pub fn health_target(&self, default: &HealthCheckTarget) -> Result<HealthCheckTarget> {
+        match &self.health_check_url {
+            Some(url) => HealthCheckTarget::parse(&format!("GET {url}")),
+            None => Ok(default.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("id", &self.id)
+            .field("url", &crate::util::redact_proxy_url(&self.url))
+            .field("auth", &self.auth)
+            .field("priority", &self.priority)
+            .field(
+                "health_check_url",
+                &self.health_check_url.as_ref().map(|_| "[configured]"),
+            )
+            .field("weight", &self.weight)
+            .finish()
+    }
 }
 
 fn default_proxy_weight() -> u32 {
@@ -157,8 +225,7 @@ impl HealthCheckTarget {
                 Self::parse_connect(s)
             } else {
                 anyhow::bail!(
-                    "Invalid health check target format: '{}'. Expected 'CONNECT host:port' or 'GET url'",
-                    s
+                    "Invalid health check target format. Expected 'CONNECT host:port' or 'GET url'"
                 )
             }
         }
@@ -176,18 +243,32 @@ impl HealthCheckTarget {
         if host.is_empty() {
             anyhow::bail!("Empty host in CONNECT target");
         }
+        if port == 0
+            || host
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b"/@?#".contains(&b))
+        {
+            anyhow::bail!("Invalid CONNECT target host or port");
+        }
         Ok(Self::Connect { host, port })
     }
 
     fn parse_get(s: &str) -> Result<Self> {
         // Validate URL format
         if !s.starts_with("http://") && !s.starts_with("https://") {
+            anyhow::bail!("GET target URL must start with http:// or https://");
+        }
+        let parsed = url::Url::parse(s).context("Invalid URL in GET target")?;
+        if parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || parsed.port() == Some(0)
+        {
             anyhow::bail!(
-                "Invalid GET target: '{}'. URL must start with http:// or https://",
-                s
+                "GET target requires a host and nonzero port, without userinfo or fragment"
             );
         }
-        url::Url::parse(s).context(format!("Invalid URL in GET target: '{}'", s))?;
         Ok(Self::Get { url: s.to_string() })
     }
 
@@ -1050,8 +1131,7 @@ impl AppConfig {
         }
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed reading config {}", path.display()))?;
-        let config: AppConfig = toml::from_str(&content)
-            .with_context(|| format!("Failed parsing config {}", path.display()))?;
+        let config = parse_config_text(&content, &path)?;
         Ok(config)
     }
 
@@ -1066,6 +1146,18 @@ impl AppConfig {
             .with_context(|| format!("Failed writing config {}", path.display()))?;
         Ok(())
     }
+}
+
+/// TOML's diagnostic display includes the source line, which may be a password.
+/// Keep a useful location without attaching that unredacted error as a cause.
+fn parse_config_text(content: &str, path: &std::path::Path) -> Result<AppConfig> {
+    toml::from_str(content).map_err(|error: toml::de::Error| {
+        let offset = error.span().map_or(0, |span| span.start);
+        let prefix = content.get(..offset).unwrap_or_default();
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix.rsplit('\n').next().unwrap_or_default().chars().count() + 1;
+        anyhow::anyhow!("Failed parsing config {} at line {line}, column {column}: check TOML syntax, field types and health target format", path.display())
+    })
 }
 
 pub fn default_config_template() -> Result<String> {
@@ -1180,8 +1272,7 @@ impl ConfigHolder {
         let config = if path.exists() {
             let content = fs::read_to_string(&path)
                 .with_context(|| format!("Failed reading config {}", path.display()))?;
-            toml::from_str(&content)
-                .with_context(|| format!("Failed parsing config {}", path.display()))?
+            parse_config_text(&content, &path)?
         } else {
             AppConfig::default()
         };
@@ -1282,8 +1373,7 @@ impl ConfigHolder {
         }
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed reading config {}", path.display()))?;
-        let config: AppConfig = toml::from_str(&content)
-            .with_context(|| format!("Failed parsing config {}", path.display()))?;
+        let config = parse_config_text(&content, path)?;
         Ok(config)
     }
 
@@ -1537,8 +1627,8 @@ fn diff_proxy(old: &ProxyConfig, new: &ProxyConfig, modifications: &mut Vec<Prox
         modifications.push(ProxyModification {
             proxy_id: proxy_id.clone(),
             field: "url".to_string(),
-            old_value: old.url.clone(),
-            new_value: new.url.clone(),
+            old_value: crate::util::redact_proxy_url(&old.url),
+            new_value: crate::util::redact_proxy_url(&new.url),
         });
     }
 
@@ -1564,15 +1654,23 @@ fn diff_proxy(old: &ProxyConfig, new: &ProxyConfig, modifications: &mut Vec<Prox
         modifications.push(ProxyModification {
             proxy_id: proxy_id.clone(),
             field: "health_check_url".to_string(),
-            old_value: format!("{:?}", old.health_check_url),
-            new_value: format!("{:?}", new.health_check_url),
+            old_value: old
+                .health_check_url
+                .as_ref()
+                .map(|_| "[configured]")
+                .unwrap_or("[default]")
+                .to_string(),
+            new_value: new
+                .health_check_url
+                .as_ref()
+                .map(|_| "[configured]")
+                .unwrap_or("[default]")
+                .to_string(),
         });
     }
 
     // Compare auth (check if credentials changed without exposing values)
-    let old_auth = old.auth.resolve();
-    let new_auth = new.auth.resolve();
-    if old_auth != new_auth {
+    if old.auth != new.auth {
         modifications.push(ProxyModification {
             proxy_id: proxy_id.clone(),
             field: "auth".to_string(),
@@ -2045,7 +2143,7 @@ pub(crate) mod tests {
             username_env: None,
             password_env: None,
         };
-        let (user, pass) = auth.resolve();
+        let (user, pass) = auth.resolve(None, None).unwrap();
         assert_eq!(user, Some("user".to_string()));
         assert_eq!(pass, Some("pass".to_string()));
     }
@@ -2053,9 +2151,29 @@ pub(crate) mod tests {
     #[test]
     fn test_proxy_auth_resolve_empty() {
         let auth = ProxyAuth::default();
-        let (user, pass) = auth.resolve();
+        let (user, pass) = auth.resolve(None, None).unwrap();
         assert_eq!(user, None);
         assert_eq!(pass, None);
+    }
+
+    #[test]
+    fn proxy_credentials_reject_empty_control_and_colon_username_without_leaking_values() {
+        for (user, pass) in [
+            ("", "sentinel-password"),
+            ("sentinel-user", ""),
+            ("sentinel:user", "sentinel-password"),
+            ("sentinel\r\nuser", "sentinel-password"),
+            ("sentinel-user", "sentinel\0password"),
+        ] {
+            let auth = ProxyAuth {
+                username: Some(user.into()),
+                password: Some(pass.into()),
+                ..ProxyAuth::default()
+            };
+            let error = auth.resolve(None, None).unwrap_err();
+            assert!(!format!("{error:#}").contains("sentinel"));
+            assert!(!format!("{auth:?}").contains("sentinel"));
+        }
     }
 
     #[test]

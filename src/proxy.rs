@@ -126,7 +126,7 @@ impl Default for RetryConfig {
 
 const SO_ORIGINAL_DST: libc::c_int = 80;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpstreamProxy {
     pub id: String,
     pub host: String,
@@ -137,8 +137,8 @@ pub struct UpstreamProxy {
 
 impl UpstreamProxy {
     pub fn from_config(proxy: &ProxyConfig) -> Result<Self> {
-        let (user, pass) = proxy.auth.resolve();
         let parsed = crate::util::parse_proxy_url(&proxy.url)?;
+        let (user, pass) = proxy.auth.resolve(parsed.username, parsed.password)?;
         Ok(Self {
             id: proxy.id.clone(),
             host: parsed.host,
@@ -146,6 +146,27 @@ impl UpstreamProxy {
             username: user,
             password: pass,
         })
+    }
+
+    pub(crate) fn auth_header(&self) -> String {
+        match (&self.username, &self.password) {
+            (Some(user), Some(pass)) => format!(
+                "Proxy-Authorization: Basic {}\r\n",
+                Base64.encode(format!("{user}:{pass}"))
+            ),
+            _ => String::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for UpstreamProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamProxy")
+            .field("id", &self.id)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("authenticated", &self.username.is_some())
+            .finish()
     }
 }
 
@@ -875,12 +896,7 @@ async fn connect_tunnel_once(
     let mut upstream_socket = connect_with_retry(upstream, retry_config).await?;
 
     // Build auth header
-    let auth_header = if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
-        let token = Base64.encode(format!("{}:{}", user, pass));
-        format!("Proxy-Authorization: Basic {}\r\n", token)
-    } else {
-        String::new()
-    };
+    let auth_header = upstream.auth_header();
 
     // Send CONNECT request
     let connect_req = format!(
@@ -947,10 +963,8 @@ pub(crate) async fn read_response_head<S: tokio::io::AsyncRead + Unpin>(
         || token.len() != 3
         || !token.iter().all(u8::is_ascii_digit)
     {
-        return Err(anyhow!(
-            "Proxy response invalid status line: {}",
-            String::from_utf8_lossy(status_line)
-        ));
+        // An untrusted upstream may echo credentials in its reason phrase.
+        return Err(anyhow!("Proxy response invalid status line"));
     }
     let status_code = u16::from(token[0] - b'0') * 100
         + u16::from(token[1] - b'0') * 10

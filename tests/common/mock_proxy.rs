@@ -65,6 +65,9 @@ pub enum MockBehavior {
     /// Establish the tunnel (200) and then echo every tunneled byte back to
     /// the client, so a caller can prove end-to-end byte-exact relay.
     TunnelEcho,
+    /// Only establish/echo when the received Basic token matches the fixture.
+    /// Stored request logs redact this header so failures cannot print credentials.
+    AuthenticatedTunnelEcho { token: String },
 }
 
 impl Default for MockBehavior {
@@ -208,9 +211,15 @@ impl MockProxy {
         }
 
         // Read request
-        let mut buf = vec![0u8; 4096];
-        let n = socket.read(&mut buf).await?;
-        let request_str = String::from_utf8_lossy(&buf[..n]);
+        let mut buf = Vec::new();
+        while !buf.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 1024];
+            let n = socket.read(&mut chunk).await?;
+            anyhow::ensure!(n > 0, "proxy fixture received incomplete request");
+            buf.extend_from_slice(&chunk[..n]);
+            anyhow::ensure!(buf.len() <= 16 * 1024, "proxy fixture request exceeded cap");
+        }
+        let request_str = String::from_utf8_lossy(&buf);
 
         // Parse request
         let mut lines = request_str.lines();
@@ -226,7 +235,32 @@ impl MockProxy {
             }
         }
 
-        // Log request
+        let behavior = behavior.lock().unwrap().clone();
+        let authorized = match &behavior {
+            MockBehavior::AuthenticatedTunnelEcho { token } => {
+                headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("Proxy-Authorization")
+                        && value == &format!("Basic {token}")
+                })
+            }
+            _ => true,
+        };
+        let tunnel_echo = authorized
+            && matches!(
+                &behavior,
+                MockBehavior::TunnelEcho | MockBehavior::AuthenticatedTunnelEcho { .. }
+            );
+        let response = if authorized {
+            Self::determine_response(&behavior, &success_count)
+        } else {
+            MockResponse::Error(MockError::AuthRequired)
+        };
+        for (name, value) in &mut headers {
+            if name.eq_ignore_ascii_case("Proxy-Authorization") {
+                *value = "[redacted]".into();
+            }
+        }
+        // Log method/target/header presence, never the authentication token.
         let request = MockRequest {
             request_line: request_line.clone(),
             headers,
@@ -242,16 +276,6 @@ impl MockProxy {
                 reqs.pop_front();
             }
         }
-
-        // Determine response based on behavior
-        let tunnel_echo = {
-            let behavior = behavior.lock().unwrap();
-            matches!(&*behavior, MockBehavior::TunnelEcho)
-        };
-        let response = {
-            let behavior = behavior.lock().unwrap();
-            Self::determine_response(&behavior, &success_count)
-        };
 
         // Send response
         match response {
@@ -306,7 +330,9 @@ impl MockProxy {
                     MockResponse::Success { latency_ms: 0 }
                 }
             }
-            MockBehavior::TunnelEcho => MockResponse::Success { latency_ms: 0 },
+            MockBehavior::TunnelEcho | MockBehavior::AuthenticatedTunnelEcho { .. } => {
+                MockResponse::Success { latency_ms: 0 }
+            }
             MockBehavior::Sequence { responses } => {
                 let idx = success_count.load(Ordering::SeqCst) as usize;
                 responses
@@ -351,7 +377,6 @@ impl MockProxy {
     }
 
     /// Change the mock's behavior
-    #[expect(dead_code)]
     pub fn set_behavior(&self, behavior: MockBehavior) {
         let mut b = self.behavior.lock().unwrap();
         *b = behavior;

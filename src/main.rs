@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -555,7 +555,7 @@ fn proxy_cmd(cmd: ProxyCmd, _output: &OutputDispatcher) -> Result<()> {
         }
         ProxyCmd::List => {
             for proxy in &config.proxies {
-                println!("{} -> {}", proxy.id, proxy.url);
+                println!("{} -> {}", proxy.id, util::redact_proxy_url(&proxy.url));
             }
         }
     }
@@ -647,7 +647,7 @@ fn list_cmd(output: &OutputDispatcher) -> Result<()> {
     if output.mode().is_json() {
         let payload = serde_json::json!({
             "active_proxy": config.active_proxy,
-            "proxies": config.proxies,
+            "proxies": config.proxies.iter().map(ProxyConfig::redacted).collect::<Vec<_>>(),
             "stats": state,
         });
         output.print_json(&payload);
@@ -1872,7 +1872,7 @@ async fn check_cmd(
                     ),
                     "auth_required" => (
                         "⚠".yellow().to_string(),
-                        "reachable (auth required)".to_string(),
+                        "unusable (authentication failed, 407)".to_string(),
                     ),
                     "timeout" => ("✗".red().to_string(), "timeout".to_string()),
                     _ => (
@@ -2336,7 +2336,7 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
             .proxies
             .iter()
             .find(|p| &p.id == id)
-            .map(|p| (p.id.clone(), p.url.clone()))
+            .map(|p| (p.id.clone(), util::redact_proxy_url(&p.url)))
     });
 
     // Determine final routing decision
@@ -2712,7 +2712,7 @@ async fn trace_cmd(target: &str, tls: bool, output: &OutputDispatcher) -> Result
     let upstream = proxy::UpstreamProxy::from_config(proxy_cfg)?;
     let proxy_info = TraceProxyInfo {
         id: upstream.id.clone(),
-        url: proxy_cfg.url.clone(),
+        url: util::redact_proxy_url(&proxy_cfg.url),
         host: upstream.host.clone(),
         port: upstream.port,
     };
@@ -2903,32 +2903,21 @@ async fn trace_cmd(target: &str, tls: bool, output: &OutputDispatcher) -> Result
 
     // Step 5: Proxy response
     let response_start = Instant::now();
-    let mut buffer = [0u8; 1024];
-    let response_result = tokio::time::timeout(timeout, upstream_socket.read(&mut buffer)).await;
+    let response_result =
+        tokio::time::timeout(timeout, proxy::read_response_head(&mut upstream_socket)).await;
     let response_duration = response_start.elapsed();
 
     let mut connect_ok = false;
     match response_result {
-        Ok(Ok(0)) => {
-            push_trace_step(
-                &mut steps,
-                "Proxy response",
-                TraceStatus::Failed,
-                Some(response_duration),
-                Some("Proxy closed connection without response".to_string()),
-            );
-        }
-        Ok(Ok(n)) => {
-            let response = String::from_utf8_lossy(&buffer[..n]);
-            let first_line = response.lines().next().unwrap_or("");
-            if first_line.contains("200") {
+        Ok(Ok((status, _))) => {
+            if (200..300).contains(&status) {
                 connect_ok = true;
                 push_trace_step(
                     &mut steps,
                     "Proxy response",
                     TraceStatus::Ok,
                     Some(response_duration),
-                    Some(first_line.to_string()),
+                    Some(format!("HTTP status {status}")),
                 );
             } else {
                 push_trace_step(
@@ -2936,7 +2925,7 @@ async fn trace_cmd(target: &str, tls: bool, output: &OutputDispatcher) -> Result
                     "Proxy response",
                     TraceStatus::Failed,
                     Some(response_duration),
-                    Some(first_line.to_string()),
+                    Some(format!("HTTP status {status}")),
                 );
             }
         }
@@ -3207,7 +3196,7 @@ async fn ping_cmd(
 
     let report = PingReport {
         proxy_id: proxy_cfg.id.clone(),
-        proxy_url: proxy_cfg.url.clone(),
+        proxy_url: util::redact_proxy_url(&proxy_cfg.url),
         proxy_host: upstream.host,
         proxy_port: upstream.port,
         count,
@@ -3621,18 +3610,10 @@ async fn run_daemon() -> Result<()> {
     // Create runtime state for dynamic proxy management
     let runtime_state = RuntimeState::new(config.active_proxy.clone());
 
-    // Defense in depth for partial auth (validation also errors on this):
-    // Basic-Auth is sent only when BOTH sides resolve, so a half-configured
-    // pair would produce unauthenticated requests failing opaquely upstream.
+    // Validate the same endpoint/auth contract used by forwarding and health.
+    // Failure remains before listener and firewall admission.
     for proxy_cfg in &config.proxies {
-        let (user, pass) = proxy_cfg.auth.resolve();
-        if user.is_some() != pass.is_some() {
-            tracing::warn!(
-                proxy = %proxy_cfg.id,
-                "Incomplete credential pair: exactly one of username/password \
-                 is set; NO Basic-Auth will be sent. Set both or neither."
-            );
-        }
+        proxy::UpstreamProxy::from_config(proxy_cfg)?;
     }
     // Binding is an awaited startup step: a live REDIRECT can never precede a
     // successfully bound local listener. OUTPUT interception needs loopback only.
@@ -3993,7 +3974,7 @@ fn build_proxy_rows(config: &AppConfig, state: &State) -> Vec<ProxyRow> {
 
         rows.push(ProxyRow {
             id: proxy.id.clone(),
-            url: proxy.url.clone(),
+            url: util::redact_proxy_url(&proxy.url),
             active,
             since,
             sent,

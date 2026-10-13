@@ -7,6 +7,108 @@ use crate::common::fixtures;
 use crate::common::mock_proxy::{MockBehavior, MockProxy};
 use crate::common::TestHarness;
 
+#[tokio::test]
+async fn proxy_credentials_are_redacted_without_modifying_persisted_configuration(
+) -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    assert!(
+        harness
+            .run_command(&["proxy", "add", "secret-test", "http://127.0.0.1:12345"])
+            .success
+    );
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
+    config["proxies"][0]["url"] =
+        "http://distinct-url-user:distinct-url-password@127.0.0.1:12345".into();
+    let mut auth = toml::Table::new();
+    auth.insert("username".into(), "distinct-config-user".into());
+    auth.insert("password".into(), "distinct-config-password".into());
+    config["proxies"][0]["auth"] = auth.into();
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let original = std::fs::read(&harness.config_path)?;
+    for args in [
+        vec!["proxy", "list"],
+        vec!["list", "--json"],
+        vec!["list", "--format", "toon"],
+        vec!["list"],
+        vec!["status", "--json"],
+        vec!["check", "--json"],
+        vec!["test", "example.invalid", "--json", "--verbose", "--no-dns"],
+    ] {
+        let result = harness.run_command(&args);
+        assert!(result.success, "command failed: {args:?}");
+        let output = format!("{}{}", result.stdout, result.stderr);
+        for secret in [
+            "distinct-url-user",
+            "distinct-url-password",
+            "distinct-config-user",
+            "distinct-config-password",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "command leaked a credential token: {args:?}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(&harness.config_path)?,
+        original,
+        "display redaction changed usable config"
+    );
+    // Even invalid URL/TOML errors must not echo the original credential line.
+    config["proxies"][0]["url"] =
+        "http://distinct-url-user:distinct-url-password@bad host:12345".into();
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let invalid = harness.run_command(&["check", "--json"]);
+    assert!(!invalid.success);
+    assert!(!format!("{}{}", invalid.stdout, invalid.stderr).contains("distinct-url-password"));
+    std::fs::write(&harness.config_path, "[[proxies]]\nid = \"broken\"\nurl = \"http://distinct-url-user:distinct-url-password@broken\n")?;
+    let invalid = harness.run_command(&["list", "--json"]);
+    assert!(!invalid.success);
+    assert!(!format!("{}{}", invalid.stdout, invalid.stderr).contains("distinct-url-password"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_proxy_transport_and_incomplete_auth_fail_before_listener_admission(
+) -> anyhow::Result<()> {
+    for (url, username) in [
+        ("https://127.0.0.1:12345", None),
+        ("http://127.0.0.1:12345", Some("partial-auth-user")),
+    ] {
+        let harness = TestHarness::new().await?;
+        assert!(
+            harness
+                .run_command(&["proxy", "add", "rejected", url])
+                .success
+        );
+        assert!(harness.run_command(&["activate", "rejected"]).success);
+        let mut config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
+        if let Some(username) = username {
+            let mut auth = toml::Table::new();
+            auth.insert("username".into(), username.into());
+            config["proxies"][0]["auth"] = auth.into();
+        }
+        std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+        let before = std::fs::read(&harness.config_path)?;
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+            .arg("daemon")
+            .env("RUST_PROXY_CONFIG", &harness.config_path)
+            .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+            .env("RUST_PROXY_TEST_MODE", "1")
+            .output()?;
+        assert!(!result.status.success());
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", harness.listen_port())).is_err(),
+            "rejected endpoint opened a listener"
+        );
+        assert_eq!(std::fs::read(&harness.config_path)?, before);
+        let output = String::from_utf8(result.stderr)?;
+        assert!(!output.contains("partial-auth-user"));
+    }
+    Ok(())
+}
+
 /// Test that the test harness can be created
 #[tokio::test]
 async fn test_harness_creation() {
