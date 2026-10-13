@@ -233,6 +233,7 @@ fn validate_proxy_auth(auth: &crate::config::ProxyAuth, proxy_id: &str) -> Vec<V
     // surfaced as generic "Proxy CONNECT failed"). Fail fast here instead.
     let has_username = auth.username.is_some() || auth.username_env.is_some();
     let has_password = auth.password.is_some() || auth.password_env.is_some();
+    // ubs:ignore[rust.security.constant-time-compare] — compares presence booleans, never credential bytes.
     if has_username != has_password {
         let missing = if has_password { "username" } else { "password" };
         results.push(
@@ -274,7 +275,12 @@ pub fn validate_targets(targets: &[TargetSpec]) -> Vec<ValidationResult> {
         let domain = target.domain();
 
         // Check for duplicate domains
-        if !seen_domains.insert(domain.to_lowercase()) {
+        let canonical = crate::config::canonical_target_domain(domain);
+        if !seen_domains.insert(
+            canonical
+                .as_ref()
+                .map_or_else(|_| domain.to_lowercase(), Clone::clone),
+        ) {
             results.push(
                 ValidationResult::warning("target", format!("Duplicate target domain: {}", domain))
                     .with_id(domain),
@@ -315,7 +321,7 @@ pub fn validate_targets(targets: &[TargetSpec]) -> Vec<ValidationResult> {
         }
 
         // Validate hostname characters (basic check)
-        if !is_valid_hostname(domain) {
+        if canonical.is_err() {
             results.push(
                 ValidationResult::error("target", format!("Invalid hostname format: {}", domain))
                     .with_id(domain)
@@ -396,6 +402,26 @@ fn is_valid_bind_addr(addr: &str) -> bool {
 /// Validate settings
 pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
     let mut results = Vec::new();
+
+    for (name, value) in [
+        ("listen_port", u64::from(settings.listen_port)),
+        ("ping_timeout_ms", settings.ping_timeout_ms),
+        (
+            "health_check_interval_secs",
+            settings.health_check_interval_secs,
+        ),
+        ("health_check_timeout_ms", settings.health_check_timeout_ms),
+        (
+            "consecutive_failures_threshold",
+            u64::from(settings.consecutive_failures_threshold),
+        ),
+    ] {
+        if value == 0 {
+            results.push(
+                ValidationResult::error("settings", format!("{name} cannot be 0")).with_id(name),
+            );
+        }
+    }
 
     // listen_port
     if settings.listen_port < 1024 {
@@ -567,7 +593,7 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
     }
 
     // ping_timeout_ms vs ping_interval_secs
-    let ping_interval_ms = settings.ping_interval_secs * 1000;
+    let ping_interval_ms = settings.ping_interval_secs.saturating_mul(1000);
     if settings.ping_timeout_ms >= ping_interval_ms {
         results.push(
             ValidationResult::error(
@@ -586,12 +612,12 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
         results.push(
             ValidationResult::error("settings", "ipset_name cannot be empty").with_id("ipset_name"),
         );
-    } else if settings.ipset_name.len() > 31 {
+    } else if settings.ipset_name.len() > 27 {
         results.push(
             ValidationResult::error(
                 "settings",
                 format!(
-                    "ipset_name ({}) exceeds 31 characters",
+                    "ipset_name ({}) exceeds 27 characters (atomic swap reserves four bytes)",
                     settings.ipset_name.len()
                 ),
             )
@@ -638,6 +664,17 @@ pub fn validate_settings(settings: &Settings) -> Vec<ValidationResult> {
             )
             .with_id("chain_name")
             .with_suggestion("Use only alphanumeric characters and underscores"),
+        );
+    }
+
+    // connect_max_retries
+    if matches!(
+        settings.chain_name.as_str(),
+        "INPUT" | "OUTPUT" | "FORWARD" | "PREROUTING" | "POSTROUTING"
+    ) {
+        results.push(
+            ValidationResult::error("settings", "chain_name cannot name a built-in system chain")
+                .with_id("chain_name"),
         );
     }
 
@@ -806,7 +843,7 @@ pub fn validate_load_balance_config(
 
 /// Check if a string is a valid identifier (alphanumeric + underscore)
 fn is_valid_identifier(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 /// Validate active proxy reference
@@ -1018,6 +1055,29 @@ mod tests {
             .iter()
             .any(|r| r.severity == ValidationSeverity::Error
                 && r.message.contains("ping_timeout_ms")));
+    }
+
+    #[test]
+    fn zero_health_timing_and_threshold_are_errors() {
+        let settings = Settings {
+            health_check_interval_secs: 0,
+            health_check_timeout_ms: 0,
+            consecutive_failures_threshold: 0,
+            ..Settings::default()
+        };
+        let results = validate_settings(&settings);
+        for name in [
+            "health_check_interval_secs",
+            "health_check_timeout_ms",
+            "consecutive_failures_threshold",
+        ] {
+            assert!(results
+                .iter()
+                .any(|r| r.id.as_deref() == Some(name) && r.severity == ValidationSeverity::Error));
+        }
+        assert!(!validate_settings(&Settings::default())
+            .iter()
+            .any(|r| r.severity == ValidationSeverity::Error));
     }
 
     #[test]

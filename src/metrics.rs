@@ -141,6 +141,18 @@ pub static CONNECTION_RETRIES: LazyLock<CounterVec> = LazyLock::new(|| {
     .expect("Failed to create CONNECTION_RETRIES metric")
 });
 
+/// Failed or IPv6-only routing sources (1), versus fresh usable coverage (0).
+pub static ROUTE_SOURCE_STALE: LazyLock<GaugeVec> = LazyLock::new(|| {
+    GaugeVec::new(
+        Opts::new(
+            "rust_proxy_route_source_stale",
+            "Routing source retaining last-good data or missing IPv4 coverage",
+        ),
+        &["source"],
+    )
+    .expect("Failed to create ROUTE_SOURCE_STALE metric")
+});
+
 /// Total connections established.
 ///
 /// Labels:
@@ -316,6 +328,7 @@ pub fn init_metrics() -> Result<(), prometheus::Error> {
     register_or_ignore(PROXY_HEALTH.clone())?;
     register_or_ignore(EFFECTIVE_PROXY.clone())?;
     register_or_ignore(IPSET_SIZE.clone())?;
+    register_or_ignore(ROUTE_SOURCE_STALE.clone())?;
     register_or_ignore(TARGETS_COUNT.clone())?;
     register_or_ignore(PROXIES_COUNT.clone())?;
     register_or_ignore(UPTIME_SECONDS.clone())?;
@@ -371,7 +384,7 @@ pub fn record_request_error(proxy_id: &str) {
 #[inline]
 pub fn record_request_timeout(proxy_id: &str) {
     REQUESTS_TOTAL
-        .with_label_values(&[proxy_id, "failure"])
+        .with_label_values(&[proxy_id, "timeout"])
         .inc();
 }
 

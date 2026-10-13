@@ -197,8 +197,8 @@ impl LoadBalancer {
 
     /// Select proxy with lowest latency (LeastLatency strategy).
     ///
-    /// Uses average ping latency from health checks. Proxies without
-    /// latency data are treated as having maximum latency.
+    /// Prefer finite nonnegative samples; ties follow configuration order.
+    /// Before samples exist, use the first eligible proxy in that same order.
     async fn select_least_latency(
         &self,
         healthy: &[&ProxyConfig],
@@ -212,14 +212,21 @@ impl LoadBalancer {
         let mut best_latency = f64::MAX;
 
         for proxy in healthy {
-            let latency = state.get_latency(&proxy.id).await.unwrap_or(f64::MAX);
-            if latency < best_latency {
-                best_latency = latency;
-                best_proxy = Some(proxy);
+            if let Some(latency) = state
+                .get_latency(&proxy.id)
+                .await
+                .filter(|ms| ms.is_finite() && *ms >= 0.0)
+            {
+                if best_proxy.is_none() || latency < best_latency {
+                    best_latency = latency;
+                    best_proxy = Some(proxy);
+                }
             }
         }
 
-        best_proxy.map(|p| p.id.clone())
+        best_proxy
+            .or_else(|| healthy.first().copied())
+            .map(|p| p.id.clone())
     }
 
     /// Select using weighted distribution (Weighted strategy).
@@ -240,16 +247,18 @@ impl LoadBalancer {
         }
 
         // Calculate total weight
-        let total_weight: u32 = weighted.iter().map(|p| p.weight).sum();
+        // u128 holds the sum of u32 weights for every entry addressable on a
+        // 64-bit host. Keep the counter wide through modulo, including wrap.
+        let total_weight: u128 = weighted.iter().map(|p| u128::from(p.weight)).sum();
 
         // Use atomic counter to deterministically rotate through weights
         let counter = self.weighted_counter.fetch_add(1, Ordering::Relaxed);
-        let target = (counter as u32) % total_weight;
+        let target = (counter as u128) % total_weight;
 
         // Find the proxy at this weight position
-        let mut cumulative: u32 = 0;
+        let mut cumulative: u128 = 0;
         for proxy in &weighted {
-            cumulative += proxy.weight;
+            cumulative += u128::from(proxy.weight);
             if target < cumulative {
                 return Some(proxy.id.clone());
             }
@@ -354,12 +363,97 @@ mod tests {
             match selected.as_deref() {
                 Some("a") => a_count += 1,
                 Some("b") => b_count += 1,
+                // ubs:ignore[rust.ownership.panic-macro] — test assertion rejects a selection outside the configured proxy set.
                 _ => panic!("Unexpected selection"),
             }
         }
 
         assert_eq!(a_count, 3);
         assert_eq!(b_count, 1);
+    }
+
+    #[test]
+    fn maximum_weights_cross_boundaries_and_counter_wrap_without_narrowing() {
+        let balancer = LoadBalancer::new();
+        let proxies = [
+            make_proxy("a", None, u32::MAX),
+            make_proxy("b", None, u32::MAX),
+        ];
+        let refs: Vec<_> = proxies.iter().collect();
+        balancer
+            .weighted_counter
+            .store(u32::MAX as usize - 1, Ordering::Relaxed);
+        assert_eq!(balancer.select_weighted(&refs).as_deref(), Some("a"));
+        assert_eq!(balancer.select_weighted(&refs).as_deref(), Some("b"));
+        balancer
+            .weighted_counter
+            .store(usize::MAX, Ordering::Relaxed);
+        assert!(balancer.select_weighted(&refs).is_some());
+        assert_eq!(balancer.select_weighted(&refs).as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn least_latency_starts_without_samples_and_excludes_invalid_samples() {
+        let balancer = LoadBalancer::new();
+        let proxies = [make_proxy("a", None, 100), make_proxy("b", None, 100)];
+        let state = StateStore::new_for_testing();
+        assert_eq!(
+            balancer
+                .select_proxy(LoadBalanceStrategy::LeastLatency, &proxies, &state, None)
+                .await
+                .as_deref(),
+            Some("a")
+        );
+        state
+            .record_health_check("b", true, Some(f64::MAX), None, 1)
+            .await;
+        assert_eq!(
+            balancer
+                .select_proxy(LoadBalanceStrategy::LeastLatency, &proxies, &state, None)
+                .await
+                .as_deref(),
+            Some("b")
+        );
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            let state = StateStore::new_for_testing();
+            state
+                .record_health_check("a", true, Some(invalid), None, 1)
+                .await;
+            state
+                .record_health_check("b", true, Some(10.0), None, 1)
+                .await;
+            assert_eq!(
+                balancer
+                    .select_proxy(LoadBalanceStrategy::LeastLatency, &proxies, &state, None)
+                    .await
+                    .as_deref(),
+                Some("b")
+            );
+        }
+        let state = StateStore::new_for_testing();
+        state
+            .record_health_check("a", true, Some(10.0), None, 1)
+            .await;
+        state
+            .record_health_check("b", true, Some(10.0), None, 1)
+            .await;
+        assert_eq!(
+            balancer
+                .select_proxy(LoadBalanceStrategy::LeastLatency, &proxies, &state, None)
+                .await
+                .as_deref(),
+            Some("a")
+        );
+        state
+            .record_health_check("a", false, None, Some("unavailable".into()), 1)
+            .await;
+        assert_eq!(
+            balancer
+                .select_proxy(LoadBalanceStrategy::LeastLatency, &proxies, &state, None)
+                .await
+                .as_deref(),
+            Some("b")
+        );
     }
 
     #[test]

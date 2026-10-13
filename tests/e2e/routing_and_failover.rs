@@ -70,6 +70,7 @@ const T2_WINDOW: Duration = Duration::from_secs(8);
 /// loudly instead of silently skipping.
 fn require_non_root() {
     if unsafe { libc::geteuid() } == 0 {
+        // ubs:ignore[rust.ownership.panic-macro] — deliberately fails when the rootless test's privilege control would be invalid.
         panic!("routing/failover seam tests must run as a non-root user");
     }
 }
@@ -132,7 +133,7 @@ fn activation_config(
          dns_refresh_secs = 3600\n\
          ping_interval_secs = 3600\n\
          ping_timeout_ms = 1000\n\
-         ipset_name = \"test-routing-ipset\"\n\
+         ipset_name = \"test_routing_ipset\"\n\
          chain_name = \"TEST_ROUTING_CHAIN\"\n\
          include_aws_ip_ranges = false\n\
          include_cloudflare_ip_ranges = false\n\
@@ -171,7 +172,7 @@ fn failover_config(primary_port: u16, secondary_port: u16, listen_port: u16) -> 
          dns_refresh_secs = 3600\n\
          ping_interval_secs = 3600\n\
          ping_timeout_ms = 1000\n\
-         ipset_name = \"test-failover-ipset\"\n\
+         ipset_name = \"test_failover_ipset\"\n\
          chain_name = \"TEST_FAILOVER_CHAIN\"\n\
          include_aws_ip_ranges = false\n\
          include_cloudflare_ip_ranges = false\n\
@@ -305,6 +306,7 @@ async fn drive_activation_case(active_id: &str) -> Result<ActivationOutcome> {
     let listener_result = wait_for_listener(listen_addr).await;
     if let Err(err) = listener_result {
         let _ = child.kill();
+        // ubs:ignore[rust.ownership.panic-macro] — fails activation proof if its actual daemon never started.
         panic!(
             "daemon failed to serve listener: {err:#}\n--- stderr ---\n{}",
             read_stderr(&stderr_path)
@@ -401,6 +403,85 @@ async fn activation_tracking_negative_alpha_companion() -> Result<()> {
     Ok(())
 }
 
+/// Observe which real loopback CONNECT server receives each byte-exact
+/// daemon tunnel. No health or ping samples exist in these cases.
+#[tokio::test]
+async fn daemon_load_balancing_routes_without_samples_and_with_boundary_weights() -> Result<()> {
+    require_non_root();
+    const CONNECTIONS: usize = 12;
+    for (strategy, alpha_weight, beta_weight, expected) in [
+        ("least_latency", 100, 100, (12, 0)),
+        ("round_robin", 100, 100, (6, 6)),
+        ("weighted", 3, 1, (9, 3)),
+        ("weighted", 0, 7, (0, 12)),
+        ("weighted", 0, 0, (12, 0)),
+        ("weighted", u32::MAX, u32::MAX, (12, 0)),
+    ] {
+        let alpha = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+        let beta = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+        let port = free_listen_port();
+        let home = activation_config("beta", alpha.port, beta.port, port)?;
+        let path = home._temp.path().join(".config/rust_proxy/config.toml");
+        let config = std::fs::read_to_string(&path)?
+            .replace(
+                "load_balance_strategy = \"single\"",
+                &format!("load_balance_strategy = \"{strategy}\""),
+            )
+            .replace(
+                "priority = 50",
+                &format!("priority = 50\nweight = {alpha_weight}"),
+            )
+            .replace(
+                "priority = 100",
+                &format!("priority = 100\nweight = {beta_weight}"),
+            );
+        std::fs::write(path, config)?;
+        let logs = TempDir::new()?;
+        let stderr_path = logs.path().join("daemon.stderr.log");
+        let mut child = spawn_daemon(&home, &stderr_path)?;
+        let addr = format!("127.0.0.1:{port}").parse()?;
+        let exercise = async {
+            wait_for_listener(addr).await?;
+            // Account for the readiness connection before setting the client
+            // denominator. It cannot count as one of the 12 echoed payloads.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while client_connect_count(&alpha) + client_connect_count(&beta) == 0 {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "readiness CONNECT missing"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let before = (client_connect_count(&alpha), client_connect_count(&beta));
+            for _ in 0..CONNECTIONS {
+                anyhow::ensure!(
+                    drive_tunnel(addr, Duration::from_secs(3)).await?,
+                    "{strategy} tunnel failed: {}",
+                    read_stderr(&stderr_path)
+                );
+                anyhow::ensure!(
+                    child.try_wait()?.is_none(),
+                    "daemon stopped under {strategy}"
+                );
+            }
+            let observed = (
+                client_connect_count(&alpha) - before.0,
+                client_connect_count(&beta) - before.1,
+            );
+            assert_eq!(
+                observed, expected,
+                "strategy={strategy}, weights={alpha_weight}:{beta_weight}"
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        let stopped = graceful_shutdown(&mut child);
+        exercise?;
+        anyhow::ensure!(stopped?.success(), "daemon stop failed");
+    }
+    Ok(())
+}
+
 /// T2: the activated primary fails CONNECTs (and therefore health probes)
 /// from startup. Within the bounded window the daemon must:
 ///   1. still route some client attempts to the primary BEFORE exclusion
@@ -445,6 +526,7 @@ async fn health_failure_excludes_and_failovers() -> Result<()> {
     let listener_result = wait_for_listener(listen_addr).await;
     if let Err(err) = listener_result {
         let _ = child.kill();
+        // ubs:ignore[rust.ownership.panic-macro] — fails failover proof if its actual daemon never started.
         panic!(
             "daemon failed to serve listener: {err:#}\n--- stderr ---\n{}",
             read_stderr(&stderr_path)

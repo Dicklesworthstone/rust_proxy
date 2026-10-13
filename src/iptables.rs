@@ -19,6 +19,19 @@ thread_local! {
     static SPAWN: Cell<SpawnFn> = const { Cell::new(real_spawn) };
 }
 
+#[cfg(test)]
+pub(crate) fn with_test_spawn<T>(spawn: SpawnFn, action: impl FnOnce() -> T) -> T {
+    struct Restore(SpawnFn);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPAWN.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = SPAWN.with(|slot| slot.replace(spawn));
+    let _restore = Restore(previous);
+    action()
+}
+
 fn dispatch(program: &str, args: &[&str], stdin_payload: Option<&str>) -> Result<String> {
     let spawn = SPAWN.with(Cell::get);
     spawn(program, args, stdin_payload)
@@ -28,8 +41,9 @@ fn real_spawn(program: &str, args: &[&str], stdin_payload: Option<&str>) -> Resu
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // ubs:ignore[rust.security.command-executable] — private callers choose literal iptables/ipset; config data is passed only as argv.
     let mut command = Command::new(program);
-    command.args(args);
+    command.args(args).env("LC_ALL", "C");
     if stdin_payload.is_some() {
         command.stdin(Stdio::piped());
     }
@@ -47,9 +61,65 @@ fn real_spawn(program: &str, args: &[&str], stdin_payload: Option<&str>) -> Resu
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Command failed: {} {:?}: {}", program, args, stderr.trim());
+        return Err(CommandFailure {
+            program: program.to_string(),
+            code: output.status.code(),
+            stderr: stderr.trim().to_string(),
+        }
+        .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Debug)]
+struct CommandFailure {
+    program: String,
+    code: Option<i32>,
+    stderr: String,
+}
+
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed (exit {:?}): {}",
+            self.program, self.code, self.stderr
+        )
+    }
+}
+impl std::error::Error for CommandFailure {}
+
+fn is_missing(err: &anyhow::Error, program: &str, jump: bool) -> bool {
+    let Some(failure) = err.downcast_ref::<CommandFailure>() else {
+        return false;
+    };
+    if failure.program != program || !matches!(failure.code, Some(1 | 2)) {
+        return false;
+    }
+    if program == "ipset" {
+        return failure
+            .stderr
+            .contains("The set with the given name does not exist");
+    }
+    failure
+        .stderr
+        .contains("No chain/target/match by that name")
+        || failure.stderr.contains("does not exist") && failure.stderr.contains("chain")
+        || jump
+            && failure
+                .stderr
+                .contains("Bad rule (does a matching rule exist in that chain?)")
+}
+
+fn remove_output_jumps(chain_name: &str) -> Result<()> {
+    for _ in 0..1024 {
+        match run("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", chain_name]) {
+            Ok(_) => {}
+            Err(err) if is_missing(&err, "iptables", true) => return Ok(()),
+            Err(err) => return Err(err.context("Failed removing OUTPUT jump")),
+        }
+    }
+    bail!("Refusing to report cleanup after removing 1024 duplicate OUTPUT jumps")
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<String> {
@@ -66,6 +136,7 @@ fn run_best_effort(cmd: &str, args: &[&str]) {
 }
 
 pub fn ensure_ipset(ipset_name: &str) -> Result<()> {
+    validate_ipset_name(ipset_name)?;
     run(
         "ipset",
         &["create", ipset_name, "hash:net", "family", "inet", "-exist"],
@@ -74,6 +145,11 @@ pub fn ensure_ipset(ipset_name: &str) -> Result<()> {
 }
 
 pub fn sync_ipset(ipset_name: &str, ips: &HashSet<String>) -> Result<()> {
+    validate_ipset_name(ipset_name)?;
+    anyhow::ensure!(
+        ipset_name.len() <= 27,
+        "ipset_name exceeds 27 bytes; atomic swap reserves four bytes for its temporary name"
+    );
     // Atomically update the ipset by creating a temp set, swapping, and
     // destroying the old one. This prevents a window where the set is empty
     // (after flush) which would leak traffic.
@@ -163,6 +239,32 @@ pub enum SelfExemption {
 /// chosen to be unlikely to collide with unrelated policy marks.
 pub const DIRECT_BYPASS_MARK: u32 = 0x5250_0001;
 
+pub fn validate_ipset_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 31
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        bail!("ipset_name must contain 1..31 ASCII letters, digits or underscores");
+    }
+    Ok(())
+}
+
+pub fn validate_chain_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 28
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        bail!("chain_name must contain 1..28 ASCII letters, digits or underscores");
+    }
+    if matches!(
+        name,
+        "INPUT" | "OUTPUT" | "FORWARD" | "PREROUTING" | "POSTROUTING"
+    ) {
+        bail!("chain_name '{name}' is a built-in system chain; choose a dedicated custom chain");
+    }
+    Ok(())
+}
+
 pub fn apply_rules(
     chain_name: &str,
     ipset_name: &str,
@@ -170,6 +272,8 @@ pub fn apply_rules(
     self_exempt: Option<SelfExemption>,
     exclude_dests: &HashSet<String>,
 ) -> Result<()> {
+    validate_chain_name(chain_name)?;
+    validate_ipset_name(ipset_name)?;
     // Create chain if missing.
     run_best_effort("iptables", &["-t", "nat", "-N", chain_name]);
     // Flush chain.
@@ -240,7 +344,7 @@ pub fn apply_rules(
     )?;
 
     // Ensure OUTPUT jumps to our chain (insert at top).
-    run_best_effort("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", chain_name]);
+    remove_output_jumps(chain_name)?;
     run(
         "iptables",
         &["-t", "nat", "-I", "OUTPUT", "1", "-j", chain_name],
@@ -250,11 +354,35 @@ pub fn apply_rules(
 }
 
 pub fn clear_rules(chain_name: &str, ipset_name: &str) -> Result<()> {
-    run_best_effort("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", chain_name]);
-    run_best_effort("iptables", &["-t", "nat", "-F", chain_name]);
-    run_best_effort("iptables", &["-t", "nat", "-X", chain_name]);
-    run_best_effort("ipset", &["destroy", ipset_name]);
+    validate_chain_name(chain_name)?;
+    validate_ipset_name(ipset_name)?;
+    let mut errors = Vec::new();
+    if let Err(err) = remove_output_jumps(chain_name) {
+        errors.push(err.to_string());
+    }
+    for (program, args) in [
+        ("iptables", vec!["-t", "nat", "-F", chain_name]),
+        ("iptables", vec!["-t", "nat", "-X", chain_name]),
+        ("ipset", vec!["destroy", ipset_name]),
+    ] {
+        if let Err(err) = run(program, &args) {
+            if !is_missing(&err, program, false) {
+                errors.push(err.to_string());
+            }
+        }
+    }
+    if !errors.is_empty() {
+        bail!("Firewall cleanup failed: {}", errors.join("; "));
+    }
     Ok(())
+}
+
+pub fn ipset_present(ipset_name: &str) -> Result<bool> {
+    match run("ipset", &["list", ipset_name]) {
+        Ok(_) => Ok(true),
+        Err(err) if is_missing(&err, "ipset", false) => Ok(false),
+        Err(err) => Err(err.context("Could not determine ipset presence")),
+    }
 }
 
 pub fn chain_present(chain_name: &str) -> bool {
@@ -301,10 +429,11 @@ pub fn parse_chain_rules(rules: &str) -> ChainSnapshot {
 pub fn chain_snapshot(chain_name: &str) -> Result<ChainSnapshot> {
     match dispatch("iptables", &["-t", "nat", "-S", chain_name], None) {
         Ok(out) => Ok(parse_chain_rules(&out)),
-        Err(_) => Ok(ChainSnapshot {
+        Err(err) if is_missing(&err, "iptables", false) => Ok(ChainSnapshot {
             present: false,
             redirect_ports: Vec::new(),
         }),
+        Err(err) => Err(err.context("Could not inspect firewall chain")),
     }
 }
 
@@ -319,6 +448,7 @@ mod tests {
     thread_local! {
         static CALLS: RefCell<Vec<Call>> = const { RefCell::new(Vec::new()) };
         static LIVE_STDOUT: RefCell<Option<String>> = const { RefCell::new(None) };
+        static DUPLICATE_JUMPS: Cell<usize> = const { Cell::new(0) };
     }
 
     fn capturing_spawn(
@@ -333,6 +463,14 @@ mod tests {
                 stdin_payload.map(str::to_string),
             ));
         });
+        if program == "iptables" && args.contains(&"-D") {
+            return Err(CommandFailure {
+                program: program.to_string(),
+                code: Some(1),
+                stderr: "Bad rule (does a matching rule exist in that chain?)".into(),
+            }
+            .into());
+        }
         Ok(LIVE_STDOUT
             .with(|out| out.borrow().clone())
             .unwrap_or_default())
@@ -598,12 +736,101 @@ mod tests {
     }
 
     #[test]
-    fn chain_snapshot_treats_spawn_failure_as_missing_chain() {
+    fn chain_snapshot_propagates_spawn_failure_instead_of_claiming_absence() {
         SPAWN.with(|spawn| {
             spawn.set(|_p: &str, _a: &[&str], _s: Option<&str>| bail!("no iptables here"))
         });
-        let snap = chain_snapshot("RP").unwrap();
-        assert!(!snap.present);
-        assert!(snap.redirect_ports.is_empty());
+        assert!(chain_snapshot("RP").is_err());
+    }
+
+    #[test]
+    fn cleanup_distinguishes_actual_absence_from_permission_and_tool_failure() {
+        with_test_spawn(
+            |program, _, _| {
+                Err(CommandFailure {
+                    program: program.into(),
+                    code: Some(1),
+                    stderr: if program == "ipset" {
+                        "The set with the given name does not exist".into()
+                    } else {
+                        "No chain/target/match by that name".into()
+                    },
+                }
+                .into())
+            },
+            || {
+                assert!(!chain_snapshot("absent").unwrap().present);
+                assert!(!ipset_present("absent").unwrap());
+                clear_rules("absent", "absent").unwrap();
+            },
+        );
+        for failure in [
+            "Permission denied (you must be root)",
+            "Could not fetch rule set generation id: Permission denied",
+            "No chain/target/match by that name: Permission denied",
+        ] {
+            let err = anyhow::Error::from(CommandFailure {
+                program: "iptables".into(),
+                code: Some(4),
+                stderr: failure.into(),
+            });
+            assert!(!is_missing(&err, "iptables", true));
+        }
+        with_test_spawn(
+            |_, _, _| bail!("Could not execute firewall tool"),
+            || {
+                assert!(chain_snapshot("RP").is_err());
+                assert!(ipset_present("RP").is_err());
+                assert!(clear_rules("RP", "RP").is_err());
+            },
+        );
+    }
+
+    #[test]
+    fn firewall_name_guards_prevent_system_chain_mutation_and_oversized_swap_names() {
+        install_capturing_spawn(None);
+        CALLS.with(|calls| calls.borrow_mut().clear());
+        for name in ["OUTPUT", "INPUT", "FORWARD", "PREROUTING", "POSTROUTING"] {
+            assert!(apply_rules(name, "safe_targets", 12345, None, &HashSet::new()).is_err());
+            assert!(clear_rules(name, "safe_targets").is_err());
+        }
+        assert!(sync_ipset(&"x".repeat(28), &HashSet::new()).is_err());
+        assert!(
+            calls().is_empty(),
+            "invalid names must fail before any command runs"
+        );
+        let maximum = "x".repeat(27);
+        assert_eq!(format!("{maximum}_tmp").len(), 31);
+        sync_ipset(&maximum, &set_of(&["198.51.100.1"])).unwrap();
+        assert_eq!(calls().len(), 2);
+        assert!(
+            validate_ipset_name(&"x".repeat(31)).is_ok(),
+            "existing maximum-length sets remain cleanable"
+        );
+    }
+
+    #[test]
+    fn apply_and_cleanup_remove_all_duplicate_output_jumps() {
+        fn duplicate_spawn(program: &str, args: &[&str], payload: Option<&str>) -> Result<String> {
+            if program == "iptables" && args.contains(&"-D") {
+                let remaining = DUPLICATE_JUMPS.with(Cell::get);
+                if remaining > 0 {
+                    DUPLICATE_JUMPS.with(|count| count.set(remaining - 1));
+                    return Ok(String::new());
+                }
+            }
+            if program == "iptables" && args.contains(&"-I") {
+                DUPLICATE_JUMPS.with(|count| count.set(count.get() + 1));
+            }
+            capturing_spawn(program, args, payload)
+        }
+        install_capturing_spawn(None);
+        DUPLICATE_JUMPS.with(|count| count.set(3));
+        with_test_spawn(duplicate_spawn, || {
+            apply_rules("RP", "rp_targets", 12345, None, &HashSet::new()).unwrap();
+            assert_eq!(DUPLICATE_JUMPS.with(Cell::get), 1);
+            clear_rules("RP", "rp_targets").unwrap();
+            assert_eq!(DUPLICATE_JUMPS.with(Cell::get), 0);
+        });
     }
 }

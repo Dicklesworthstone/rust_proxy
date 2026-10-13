@@ -112,7 +112,7 @@ pub async fn resolve_parallel_with_options(
         };
     }
 
-    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let semaphore = Arc::new(Semaphore::new(max_concurrent.max(1)));
 
     let futures: Vec<_> = domains
         .iter()
@@ -129,6 +129,9 @@ pub async fn resolve_parallel_with_options(
 
     let results = join_all(futures).await;
     let elapsed = start.elapsed();
+    crate::metrics::DNS_RESOLUTION_LATENCY
+        .with_label_values(&["batch"])
+        .observe(elapsed.as_secs_f64());
 
     let mut resolved = Vec::new();
     let mut failed = Vec::new();
@@ -136,6 +139,9 @@ pub async fn resolve_parallel_with_options(
     for (domain, result) in results {
         match result {
             Ok(ips) => {
+                crate::metrics::DNS_RESOLUTIONS
+                    .with_label_values(&["success"])
+                    .inc();
                 tracing::debug!(
                     domain,
                     ips = ?ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
@@ -144,6 +150,14 @@ pub async fn resolve_parallel_with_options(
                 resolved.push((domain, ips));
             }
             Err(e) => {
+                let result = if e.to_string().to_ascii_lowercase().contains("timeout") {
+                    "timeout"
+                } else {
+                    "failure"
+                };
+                crate::metrics::DNS_RESOLUTIONS
+                    .with_label_values(&[result])
+                    .inc();
                 tracing::warn!(domain, error = %e, "Failed to resolve domain");
                 failed.push((domain, e.to_string()));
             }

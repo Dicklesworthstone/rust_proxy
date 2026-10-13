@@ -7,6 +7,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 
 use crate::config::{AppConfig, DegradationPolicy, ProxyConfig};
 use crate::iptables::DIRECT_BYPASS_MARK;
@@ -16,6 +17,8 @@ use crate::state::{RuntimeState, StateStore};
 
 /// Timeout for each proxy attempt when using try_all degradation policy
 const TRY_ALL_TIMEOUT_PER_PROXY_SECS: u64 = 10;
+const CONNECT_HEADER_LIMIT: usize = 16 * 1024;
+const MAX_CONNECTIONS: usize = 256;
 
 /// Guard that tracks connection metrics with RAII pattern.
 ///
@@ -207,27 +210,42 @@ pub async fn run_proxy(
 /// a proxy for each incoming connection, enabling distribution across
 /// multiple healthy proxies.
 pub async fn run_proxy_with_load_balancing(
-    listen_port: u16,
+    listener: TcpListener,
     config_rx: tokio::sync::watch::Receiver<std::sync::Arc<AppConfig>>,
     state: Arc<StateStore>,
     runtime: Arc<RuntimeState>,
     load_balancer: Arc<LoadBalancer>,
     retry_config: RetryConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let config = config_rx.borrow().clone();
-    let addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind to {addr}"))?;
+    let addr = listener.local_addr()?;
     tracing::info!(
         "transparent proxy listening on {addr} (strategy: {:?})",
         config.settings.load_balance_strategy
     );
 
     let mut backoff = AcceptBackoff::new();
+    let mut connections = JoinSet::new();
+    let outcome = loop {
+        let accepted = tokio::select! {
+            biased;
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break Ok(());
+                }
+                continue;
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(err)) = result {
+                    tracing::warn!(error = %err, "Connection task failed");
+                }
+                continue;
+            }
+            accepted = listener.accept(), if connections.len() < MAX_CONNECTIONS => accepted,
+        };
 
-    loop {
-        let (client, client_addr) = match listener.accept().await {
+        let (client, client_addr) = match accepted {
             Ok(conn) => {
                 backoff.record_success();
                 conn
@@ -241,12 +259,19 @@ pub async fn run_proxy_with_load_balancing(
                     backoff_ms = delay.as_millis(),
                     "Accept error (transient, will retry)"
                 );
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break Ok(());
+                        }
+                    }
+                }
                 continue;
             }
             Err(e) => {
                 tracing::error!(error = %e, "Accept error (fatal, exiting)");
-                return Err(e.into());
+                break Err(e.into());
             }
         };
         // Hot-reload: snapshot the latest config for this connection.
@@ -254,7 +279,7 @@ pub async fn run_proxy_with_load_balancing(
         let state_clone = state.clone();
         let runtime_clone = runtime.clone();
         let lb_clone = load_balancer.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(err) = handle_connection_with_load_balancing(
                 client,
                 client_addr,
@@ -269,7 +294,25 @@ pub async fn run_proxy_with_load_balancing(
                 tracing::warn!("connection error: {err}");
             }
         });
+    };
+    // Stop accepting immediately, then allow established tunnels up to two
+    // seconds to finish. Remaining work is cancelled and joined before exit.
+    drop(listener);
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(result) = connections.join_next().await {
+            if let Err(err) = result {
+                tracing::warn!(error = %err, "Connection task failed while draining");
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::info!(remaining = connections.len(), "Tunnel drain budget expired");
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
+    outcome
 }
 
 /// Handle a single connection with load-balanced proxy selection.
@@ -305,166 +348,100 @@ async fn handle_connection_with_load_balancing(
         .await;
 
     // If no healthy proxy, apply degradation policy
-    let (proxy_id, upstream, mut upstream_socket) = match proxy_id {
-        Some(id) => {
-            // Find the proxy config
-            let proxy_cfg = config
-                .proxies
-                .iter()
-                .find(|p| p.id == id)
-                .ok_or_else(|| anyhow!("Selected proxy '{}' not found in config", id))?;
+    let (proxy_id, upstream, mut upstream_socket) =
+        match proxy_id {
+            Some(id) => {
+                // Find the proxy config
+                let proxy_cfg = config
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == id)
+                    .ok_or_else(|| anyhow!("Selected proxy '{}' not found in config", id))?;
 
-            // Create upstream proxy from config
-            let upstream = UpstreamProxy::from_config(proxy_cfg)?;
+                // Create upstream proxy from config
+                let upstream = UpstreamProxy::from_config(proxy_cfg)?;
 
-            tracing::debug!(
-                proxy = %id,
-                strategy = ?config.settings.load_balance_strategy,
-                client = %client_addr,
-                "Selected proxy for connection"
-            );
+                tracing::debug!(
+                    proxy = %id,
+                    strategy = ?config.settings.load_balance_strategy,
+                    client = %client_addr,
+                    "Selected proxy for connection"
+                );
 
-            // Connect to upstream
-            let upstream_socket =
-                match connect_with_retry(&upstream.host, upstream.port, &retry_config).await {
-                    Ok(socket) => socket,
-                    Err(e) => {
+                let (socket, trailer) =
+                    match try_proxy_connect(&upstream, &target_host, target_port, &retry_config)
+                        .await
+                    {
+                        Ok(connected) => connected,
+                        Err(err) => {
+                            if err.is::<tokio::time::error::Elapsed>() {
+                                metrics::record_request_timeout(&id);
+                            } else {
+                                metrics::record_request_error(&id);
+                            }
+                            return Err(err);
+                        }
+                    };
+                if !trailer.is_empty() {
+                    if let Err(e) = forward_trailer_to_client(&mut client, &trailer).await {
                         metrics::record_request_error(&id);
                         return Err(e);
                     }
-                };
+                }
 
-            // Build auth header and send CONNECT
-            let auth_header =
-                if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
-                    let token = Base64.encode(format!("{}:{}", user, pass));
-                    format!("Proxy-Authorization: Basic {}\r\n", token)
-                } else {
-                    String::new()
-                };
-
-            let connect_req = format!(
-                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
-                target_host, target_port, target_host, target_port, auth_header
-            );
-
-            let mut socket = upstream_socket;
-            if let Err(e) = socket.write_all(connect_req.as_bytes()).await {
-                metrics::record_request_error(&id);
-                return Err(e.into());
+                (id, upstream, socket)
             }
-            if let Err(e) = socket.flush().await {
-                metrics::record_request_error(&id);
-                return Err(e.into());
-            }
-
-            // Read and validate CONNECT response
-            let mut header_buf = Vec::with_capacity(4096);
-            let mut tmp = [0u8; 512];
-            let header_end = loop {
-                let n = match socket.read(&mut tmp).await {
-                    Ok(0) => {
-                        metrics::record_request_error(&id);
-                        return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
+            None => {
+                // No healthy proxy - apply degradation policy
+                match handle_degradation(
+                    &config,
+                    &state,
+                    &runtime,
+                    &target_host,
+                    target_port,
+                    &retry_config,
+                    &mut client,
+                )
+                .await
+                {
+                    Ok(Some((socket, id, upstream))) => {
+                        tracing::info!(
+                            proxy = %id,
+                            client = %client_addr,
+                            policy = ?config.settings.degradation_policy,
+                            "Degradation policy succeeded"
+                        );
+                        (id, upstream, socket)
                     }
-                    Ok(n) => n,
+                    Ok(None) => {
+                        // Degradation delay not yet elapsed - use fail_closed behavior
+                        tracing::warn!(
+                            client = %client_addr,
+                            delay_secs = config.settings.degradation_delay_secs,
+                            "Rejecting connection: no healthy proxy (within degradation delay)"
+                        );
+                        if let Err(err) = send_degradation_error(&mut client).await {
+                            tracing::debug!(error = %err, "Failed to send degradation response");
+                        }
+                        return Err(anyhow!(
+                            "No healthy proxy available (within degradation delay)"
+                        ));
+                    }
                     Err(e) => {
-                        metrics::record_request_error(&id);
-                        return Err(e.into());
+                        tracing::error!(
+                            client = %client_addr,
+                            error = %e,
+                            policy = ?config.settings.degradation_policy,
+                            "Degradation policy failed"
+                        );
+                        if let Err(err) = send_degradation_error(&mut client).await {
+                            tracing::debug!(error = %err, "Failed to send degradation response");
+                        }
+                        return Err(e);
                     }
-                };
-                header_buf.extend_from_slice(&tmp[..n]);
-                if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break pos + 4;
-                }
-                if header_buf.len() > 16 * 1024 {
-                    metrics::record_request_error(&id);
-                    return Err(anyhow!("Proxy CONNECT response too large"));
-                }
-            };
-
-            let header_bytes = &header_buf[..header_end];
-            let trailer = &header_buf[header_end..];
-            let header_text = String::from_utf8_lossy(header_bytes);
-            let status_line = header_text.lines().next().unwrap_or_default();
-            let status_code = status_line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|token| token.parse::<u16>().ok())
-                .ok_or_else(|| {
-                    metrics::record_request_error(&id);
-                    anyhow!("Proxy CONNECT invalid status line: {status_line}")
-                })?;
-            if !(200..300).contains(&status_code) {
-                metrics::record_request_error(&id);
-                return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
-            }
-
-            // Send any trailer data to client
-            if !trailer.is_empty() {
-                if let Err(e) = client.write_all(trailer).await {
-                    metrics::record_request_error(&id);
-                    return Err(e.into());
-                }
-                if let Err(e) = client.flush().await {
-                    metrics::record_request_error(&id);
-                    return Err(e.into());
                 }
             }
-
-            (id, upstream, socket)
-        }
-        None => {
-            // No healthy proxy - apply degradation policy
-            match handle_degradation(
-                &config,
-                &state,
-                &runtime,
-                &target_host,
-                target_port,
-                &retry_config,
-                &mut client,
-            )
-            .await
-            {
-                Ok(Some((socket, id, upstream))) => {
-                    tracing::info!(
-                        proxy = %id,
-                        client = %client_addr,
-                        policy = ?config.settings.degradation_policy,
-                        "Degradation policy succeeded"
-                    );
-                    (id, upstream, socket)
-                }
-                Ok(None) => {
-                    // Degradation delay not yet elapsed - use fail_closed behavior
-                    tracing::warn!(
-                        client = %client_addr,
-                        delay_secs = config.settings.degradation_delay_secs,
-                        "Rejecting connection: no healthy proxy (within degradation delay)"
-                    );
-                    if let Err(err) = send_degradation_error(&mut client).await {
-                        tracing::debug!(error = %err, "Failed to send degradation response");
-                    }
-                    return Err(anyhow!(
-                        "No healthy proxy available (within degradation delay)"
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!(
-                        client = %client_addr,
-                        error = %e,
-                        policy = ?config.settings.degradation_policy,
-                        "Degradation policy failed"
-                    );
-                    if let Err(err) = send_degradation_error(&mut client).await {
-                        tracing::debug!(error = %err, "Failed to send degradation response");
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    };
+        };
 
     // Create connection guard to track metrics (RAII pattern)
     // This will automatically decrement active connections and record duration on drop
@@ -841,26 +818,19 @@ async fn direct_connect(
 /// sk_buff at SYN time, which is exactly what keeps this flow out of the
 /// redirect that would otherwise loop it back into our listener.
 async fn connect_with_mark(addr: SocketAddr, mark: u32) -> Result<TcpStream> {
-    // Blocking connect offloaded to the blocking pool so the caller keeps its
-    // timeout semantics; the mark must be applied before connect(2) so the
-    // SYN itself carries it and escapes our own REDIRECT rule.
-    tokio::task::spawn_blocking(move || -> Result<TcpStream> {
-        use socket2::{Domain, Protocol, Socket, Type};
-
-        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
-            .context("Failed creating direct-connect socket")?;
-        sock.set_mark(mark)
-            .context("Failed setting SO_MARK on direct-connect socket")?;
-        sock.connect(&addr.into())
-            .context("Direct connect(2) failed")?;
-        sock.set_nonblocking(true)
-            .context("Failed setting non-blocking mode on direct-connect socket")?;
-        let std_stream = std::net::TcpStream::from(sock);
-        TcpStream::from_std(std_stream)
-            .context("Failed registering direct-connect socket with tokio")
-    })
-    .await
-    .context("Direct-connect blocking task panicked")?
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .context("Failed creating direct-connect socket")?;
+    sock.set_mark(mark)
+        .context("Failed setting SO_MARK on direct-connect socket")?;
+    sock.set_nonblocking(true)
+        .context("Failed setting non-blocking mode on direct-connect socket")?;
+    // A cancellable async connect releases the socket on timeout. A blocking
+    // pool connect would survive cancellation and could stall runtime shutdown.
+    tokio::net::TcpSocket::from_std_stream(std::net::TcpStream::from(sock))
+        .connect(addr)
+        .await
+        .context("Marked direct connect failed")
 }
 
 /// Probe whether this process may set SO_MARK (requires CAP_NET_ADMIN).
@@ -881,15 +851,28 @@ pub fn can_set_so_mark() -> bool {
 /// (`header_buf[header_end..]`). Callers MUST forward those bytes to the client
 /// before entering the tunnel copy phase; dropping them corrupts the stream
 /// whenever the upstream sends data immediately after establishing the tunnel.
-async fn try_proxy_connect(
+pub(crate) async fn try_proxy_connect(
+    upstream: &UpstreamProxy,
+    target_host: &str,
+    target_port: u16,
+    retry_config: &RetryConfig,
+) -> Result<(TcpStream, Vec<u8>)> {
+    tokio::time::timeout(
+        Duration::from_secs(TRY_ALL_TIMEOUT_PER_PROXY_SECS),
+        connect_tunnel_once(upstream, target_host, target_port, retry_config),
+    )
+    .await
+    .context("Proxy CONNECT establishment timed out (ten-second total budget)")?
+}
+
+async fn connect_tunnel_once(
     upstream: &UpstreamProxy,
     target_host: &str,
     target_port: u16,
     retry_config: &RetryConfig,
 ) -> Result<(TcpStream, Vec<u8>)> {
     // Connect to upstream proxy
-    let mut upstream_socket =
-        connect_with_retry(&upstream.host, upstream.port, retry_config).await?;
+    let mut upstream_socket = connect_with_retry(upstream, retry_config).await?;
 
     // Build auth header
     let auth_header = if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
@@ -908,48 +891,107 @@ async fn try_proxy_connect(
     upstream_socket.write_all(connect_req.as_bytes()).await?;
     upstream_socket.flush().await?;
 
-    // Read and validate response
+    let (status, trailer) = read_response_head(&mut upstream_socket).await?;
+    if !(200..300).contains(&status) {
+        return Err(anyhow!("Proxy CONNECT failed: HTTP status {status}"));
+    }
+    Ok((upstream_socket, trailer))
+}
+
+/// Read one bounded HTTP/1.x response head, preserving tunnel/body bytes that
+/// arrive in the same read. The cap applies to the head, not those early bytes.
+pub(crate) async fn read_response_head<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(u16, Vec<u8>)> {
     let mut header_buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 512];
     let header_end = loop {
-        let n = upstream_socket.read(&mut tmp).await?;
+        let n = stream.read(&mut tmp).await?;
         if n == 0 {
             return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
         }
+        let search_start = header_buf.len().saturating_sub(3);
         header_buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
+        if let Some(pos) = header_buf[search_start..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            let pos = search_start + pos;
+            let end = pos + 4;
+            if end > CONNECT_HEADER_LIMIT {
+                return Err(anyhow!("Proxy response header too large"));
+            }
+            break end;
         }
-        if header_buf.len() > 16 * 1024 {
-            return Err(anyhow!("Proxy CONNECT response too large"));
+        if header_buf.len() >= CONNECT_HEADER_LIMIT {
+            return Err(anyhow!("Proxy response header too large"));
         }
     };
 
     let header_bytes = &header_buf[..header_end];
-    let header_text = String::from_utf8_lossy(header_bytes);
-    let status_line = header_text.lines().next().unwrap_or_default();
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|token| token.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("Proxy CONNECT invalid status line: {status_line}"))?;
-
-    if !(200..300).contains(&status_code) {
-        return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
+    let status_end = header_bytes
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .context("Proxy response missing status-line terminator")?;
+    let status_line = &header_bytes[..status_end];
+    let invalid_control = |b: &u8| *b == 127 || *b < 32 && *b != b'\t';
+    if status_line.iter().any(invalid_control) {
+        return Err(anyhow!("Proxy response has control bytes in status line"));
     }
-
-    // Preserve any early bytes the proxy pipelined after the response header so
-    // the caller can relay them to the client (mirrors the primary path).
+    let mut fields = status_line
+        .split(|b| *b == b' ' || *b == b'\t')
+        .filter(|field| !field.is_empty());
+    let version = fields.next().unwrap_or_default();
+    let token = fields.next().unwrap_or_default();
+    if !matches!(version, b"HTTP/1.0" | b"HTTP/1.1")
+        || token.len() != 3
+        || !token.iter().all(u8::is_ascii_digit)
+    {
+        return Err(anyhow!(
+            "Proxy response invalid status line: {}",
+            String::from_utf8_lossy(status_line)
+        ));
+    }
+    let status_code = u16::from(token[0] - b'0') * 100
+        + u16::from(token[1] - b'0') * 10
+        + u16::from(token[2] - b'0');
+    if !(100..600).contains(&status_code) {
+        return Err(anyhow!("Proxy response invalid status code: {status_code}"));
+    }
+    for line in header_bytes[status_end + 2..header_end - 2].split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let line = line
+            .strip_suffix(b"\r")
+            .context("Proxy response header requires CRLF")?;
+        if line.iter().any(invalid_control) {
+            return Err(anyhow!("Proxy response has control bytes in header"));
+        }
+        let colon = line
+            .iter()
+            .position(|b| *b == b':')
+            .context("Proxy response has malformed header")?;
+        let name = &line[..colon];
+        if name.is_empty()
+            || !name
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
+        {
+            return Err(anyhow!("Proxy response has invalid header name"));
+        }
+    }
     let trailer = header_buf[header_end..].to_vec();
-
-    Ok((upstream_socket, trailer))
+    Ok((status_code, trailer))
 }
 
 /// Forward post-CONNECT-header bytes to the client, mirroring the primary path's
 /// trailer relay. A failure here means the client stream is broken; callers must
 /// treat the connection attempt as failed rather than entering the tunnel phase.
 async fn forward_trailer_to_client(client: &mut TcpStream, trailer: &[u8]) -> Result<()> {
-    debug_assert!(!trailer.is_empty());
+    if trailer.is_empty() {
+        return Ok(());
+    }
     client.write_all(trailer).await?;
     client.flush().await?;
     Ok(())
@@ -971,56 +1013,10 @@ async fn handle_connection(
     let target_host = original_dst_connect_host(*target.ip());
     let target_port = target.port();
 
-    let mut upstream_socket =
-        connect_with_retry(&upstream.host, upstream.port, &retry_config).await?;
-
-    let auth_header = if let (Some(user), Some(pass)) = (&upstream.username, &upstream.password) {
-        let token = Base64.encode(format!("{}:{}", user, pass));
-        format!("Proxy-Authorization: Basic {}\r\n", token)
-    } else {
-        String::new()
-    };
-
-    let connect_req = format!(
-        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
-        target_host, target_port, target_host, target_port, auth_header
-    );
-
-    upstream_socket.write_all(connect_req.as_bytes()).await?;
-    upstream_socket.flush().await?;
-
-    let mut header_buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 512];
-    let header_end = loop {
-        let n = upstream_socket.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(anyhow!("Upstream proxy closed connection during CONNECT"));
-        }
-        header_buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if header_buf.len() > 16 * 1024 {
-            return Err(anyhow!("Proxy CONNECT response too large"));
-        }
-    };
-
-    let header_bytes = &header_buf[..header_end];
-    let trailer = &header_buf[header_end..];
-    let header_text = String::from_utf8_lossy(header_bytes);
-    let status_line = header_text.lines().next().unwrap_or_default();
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|token| token.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("Proxy CONNECT invalid status line: {status_line}"))?;
-    if !(200..300).contains(&status_code) {
-        return Err(anyhow!("Proxy CONNECT failed: {status_line}"));
-    }
-
+    let (mut upstream_socket, trailer) =
+        try_proxy_connect(&upstream, &target_host, target_port, &retry_config).await?;
     if !trailer.is_empty() {
-        client.write_all(trailer).await?;
-        client.flush().await?;
+        forward_trailer_to_client(&mut client, &trailer).await?;
     }
 
     let (bytes_to_up, bytes_to_client) =
@@ -1033,12 +1029,18 @@ async fn handle_connection(
 }
 
 /// Connect to upstream with exponential backoff retry
-async fn connect_with_retry(host: &str, port: u16, config: &RetryConfig) -> Result<TcpStream> {
+async fn connect_with_retry(upstream: &UpstreamProxy, config: &RetryConfig) -> Result<TcpStream> {
+    let host = upstream.host.as_str();
+    let port = upstream.port;
     let mut last_error = None;
     let mut backoff_ms = config.initial_backoff_ms;
 
     for attempt in 0..=config.max_retries {
-        match TcpStream::connect((host, port)).await {
+        let connected =
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, port)))
+                .await
+                .context("Upstream TCP connect timed out")?;
+        match connected {
             Ok(stream) => {
                 if attempt > 0 {
                     tracing::info!(
@@ -1058,13 +1060,16 @@ async fn connect_with_retry(host: &str, port: u16, config: &RetryConfig) -> Resu
                         host,
                         port,
                         attempt + 1,
-                        config.max_retries + 1,
+                        u64::from(config.max_retries) + 1,
                         backoff_ms,
                         last_error.as_ref().unwrap()
                     );
+                    metrics::CONNECTION_RETRIES
+                        .with_label_values(&[&upstream.id])
+                        .inc();
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     // Exponential backoff: double the delay, capped at max_backoff_ms
-                    backoff_ms = (backoff_ms * 2).min(config.max_backoff_ms);
+                    backoff_ms = backoff_ms.saturating_mul(2).min(config.max_backoff_ms);
                 }
             }
         }
@@ -1074,7 +1079,7 @@ async fn connect_with_retry(host: &str, port: u16, config: &RetryConfig) -> Resu
         "Failed to connect to upstream {}:{} after {} attempts: {}",
         host,
         port,
-        config.max_retries + 1,
+        u64::from(config.max_retries) + 1,
         last_error.unwrap()
     ))
 }
@@ -1137,7 +1142,12 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
 
     let fd = stream.as_raw_fd();
     unsafe {
-        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        let mut addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: 0 },
+            sin_zero: [0; 8],
+        };
         let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
         if libc::getsockopt(
             fd,
@@ -1203,13 +1213,13 @@ mod tests {
             if let Ok((mut sock, _)) = listener.accept().await {
                 // Drain the CONNECT request up to end of headers.
                 let mut buf = [0u8; 4096];
-                let mut seen = 0usize;
-                while seen < 4096 {
+                let mut request = Vec::new();
+                while request.len() < 4096 {
                     match sock.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            seen += n;
-                            if buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                            request.extend_from_slice(&buf[..n]);
+                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
                                 break;
                             }
                         }
@@ -1227,7 +1237,7 @@ mod tests {
                 if hold_open {
                     // Hold the tunnel open so the stream stays usable.
                     let mut hold = [0u8; 64];
-                    while let Ok(0) | Err(_) = sock.read(&mut hold).await {}
+                    while matches!(sock.read(&mut hold).await, Ok(n) if n > 0) {}
                 }
                 // Dropping `sock` closes the connection.
             }
@@ -1253,6 +1263,149 @@ mod tests {
             }],
             ..AppConfig::default()
         }
+    }
+
+    /// Pins read_response_head's version/status/cap framing and
+    /// try_proxy_connect's 2xx gate and post-header byte preservation.
+    #[tokio::test]
+    async fn connect_response_table_covers_framing_status_and_header_boundaries() {
+        let mut cases = vec![
+            ("minimal", b"HTTP/1.1 200\r\n\r\n".to_vec(), true),
+            (
+                "opaque_text",
+                b"HTTP/1.1 200 Caf\xe9\r\nX-Text: \xff\r\n\r\n".to_vec(),
+                true,
+            ),
+            ("bare_lf", b"HTTP/1.1 200\nInjected\r\n\r\n".to_vec(), false),
+            ("http10", b"HTTP/1.0 204 No Content\r\n\r\n".to_vec(), true),
+            ("last2xx", b"HTTP/1.1 299 OK\r\n\r\n".to_vec(), true),
+            (
+                "407",
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n".to_vec(),
+                false,
+            ),
+            ("502", b"HTTP/1.1 502 Bad Gateway\r\n\r\n".to_vec(), false),
+            ("garbage", b"garbage 200\r\n\r\n".to_vec(), false),
+            (
+                "four_digit_status",
+                b"HTTP/1.1 2000\r\n\r\n".to_vec(),
+                false,
+            ),
+            ("invalid_version", b"HTTP/9.0 200\r\n\r\n".to_vec(), false),
+            ("invalid_status", b"HTTP/1.1 999\r\n\r\n".to_vec(), false),
+            (
+                "malformed_header",
+                b"HTTP/1.1 200\r\nmissing-colon\r\n\r\n".to_vec(),
+                false,
+            ),
+            (
+                "truncated",
+                b"HTTP/1.1 200\r\nX: unfinished".to_vec(),
+                false,
+            ),
+        ];
+        for (name, size, accepted) in [
+            ("exact_cap", CONNECT_HEADER_LIMIT, true),
+            ("over_cap_terminated", CONNECT_HEADER_LIMIT + 1, false),
+        ] {
+            let mut response = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+            response.resize(size - 4, b'x');
+            response.extend_from_slice(b"\r\n\r\n");
+            cases.push((name, response, accepted));
+        }
+        for (name, response, accepted) in cases {
+            let addr = spawn_scripted_proxy(&[(0, &response)], false).await;
+            let config = single_proxy_config(addr);
+            let upstream = UpstreamProxy::from_config(&config.proxies[0]).unwrap();
+            let result =
+                try_proxy_connect(&upstream, "target.invalid", 443, &RetryConfig::default()).await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "case={name}, error={:?}",
+                result.as_ref().err()
+            );
+            if let Ok((_, early)) = result {
+                assert!(early.is_empty(), "case={name}");
+            }
+        }
+        let addr = spawn_scripted_proxy(
+            &[
+                (0, b"HTTP/1.1 2"),
+                (10, b"00 OK\r\nX: value\r\n"),
+                (10, b"\r\nEARLY42"),
+            ],
+            true,
+        )
+        .await;
+        let config = single_proxy_config(addr);
+        let upstream = UpstreamProxy::from_config(&config.proxies[0]).unwrap();
+        let (mut stream, early) =
+            try_proxy_connect(&upstream, "target.invalid", 443, &RetryConfig::default())
+                .await
+                .unwrap();
+        // TCP may place early bytes in the next read, so collect both without
+        // treating a packet boundary as part of the HTTP contract.
+        let mut received = early;
+        while received.len() < 7 {
+            let mut bytes = [0; 7];
+            let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(n > 0);
+            received.extend_from_slice(&bytes[..n]);
+        }
+        assert_eq!(received, b"EARLY42");
+    }
+
+    #[tokio::test]
+    async fn silent_connect_peer_expires_the_shared_total_budget() {
+        let addr = spawn_scripted_proxy(&[(30_000, b"HTTP/1.1 200\r\n\r\n")], false).await;
+        let config = single_proxy_config(addr);
+        let upstream = UpstreamProxy::from_config(&config.proxies[0]).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(12),
+            try_proxy_connect(&upstream, "target.invalid", 443, &RetryConfig::default()),
+        )
+        .await
+        .expect("establishment must be bounded");
+        assert!(result.unwrap_err().is::<tokio::time::error::Elapsed>());
+    }
+
+    #[tokio::test]
+    async fn full_tcp_accept_queue_expires_connect_before_the_os_timeout() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        listener
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        listener.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap().as_socket().unwrap();
+        // Linux permits backlog + one completed handshake. Keep both pending
+        // without accepting: the next SYN has no application response deadline.
+        let mut queued = Vec::new();
+        for _ in 0..2 {
+            queued.push(
+                tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let config = single_proxy_config(addr);
+        let upstream = UpstreamProxy::from_config(&config.proxies[0]).unwrap();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(7),
+            try_proxy_connect(&upstream, "target.invalid", 443, &RetryConfig::default()),
+        )
+        .await
+        .expect("TCP connect must expire before the kernel's SYN retries");
+        assert!(result.unwrap_err().is::<tokio::time::error::Elapsed>());
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        drop(queued);
+        drop(listener);
     }
 
     #[test]
@@ -1817,8 +1970,51 @@ mod tests {
         let mut extra = [0u8; 1];
         match tokio::time::timeout(Duration::from_millis(150), client_peer.read(&mut extra)).await {
             Err(_) | Ok(Ok(0)) => {} // timed out or EOF: no extra bytes
+            // ubs:ignore[rust.ownership.panic-macro] — regression assertion rejects duplicated trailer bytes.
             Ok(Ok(n)) => panic!("unexpected extra bytes after trailer: {n}"),
+            // ubs:ignore[rust.ownership.panic-macro] — regression assertion fails on an unexpected transport error.
             Ok(Err(e)) => panic!("unexpected peer read error after trailer: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn degradation_accepts_successful_connect_without_early_bytes() {
+        for use_last in [false, true] {
+            let proxy_addr = spawn_scripted_proxy(
+                &[(0, &b"HTTP/1.1 200 Connection established\r\n\r\n"[..])],
+                true,
+            )
+            .await;
+            let config = single_proxy_config(proxy_addr);
+            let state = StateStore::new_for_testing();
+            state
+                .record_health_check("fake-proxy", true, None, None, 1)
+                .await;
+            let retry_config = RetryConfig::default();
+            let (mut client, mut client_peer) = loopback_pair().await;
+            let result = if use_last {
+                use_last_proxy(
+                    &config,
+                    &state,
+                    "example.com",
+                    443,
+                    &retry_config,
+                    &mut client,
+                )
+                .await
+            } else {
+                try_all_proxies(&config, "example.com", 443, &retry_config, &mut client).await
+            };
+            let (_socket, id, _) =
+                result.expect("ordinary CONNECT without early data must succeed");
+            assert_eq!(id, "fake-proxy");
+            let mut bytes = [0; 1];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), client_peer.read(&mut bytes),)
+                    .await
+                    .is_err(),
+                "empty trailer must not invent bytes or close the client"
+            );
         }
     }
 
@@ -1862,7 +2058,9 @@ mod tests {
         let mut probe = [0u8; 1];
         match tokio::time::timeout(Duration::from_millis(150), client_peer.read(&mut probe)).await {
             Err(_) => {} // timed out: zero bytes delivered
+            // ubs:ignore[rust.ownership.panic-macro] — planted negative fails if rejected CONNECT leaks bytes.
             Ok(Ok(n)) => panic!("client must receive zero bytes on failed CONNECT, got {n}"),
+            // ubs:ignore[rust.ownership.panic-macro] — test assertion rejects an unexpected transport error.
             Ok(Err(e)) => panic!("unexpected peer read error on failed CONNECT: {e}"),
         }
     }

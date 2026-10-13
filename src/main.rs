@@ -4,7 +4,7 @@ use base64::Engine as _;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
 use owo_colors::OwoColorize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -245,7 +245,7 @@ enum TargetCmd {
     /// Remove target domain
     Remove { domain: String },
     /// List target domains
-    List,
+    List(OutputArgs),
 }
 
 #[derive(Subcommand)]
@@ -313,8 +313,18 @@ struct ProxyRow {
     last_active: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async_main());
+    // Native DNS resolution uses Tokio's blocking pool. Its OS call can
+    // outlive an async lookup timeout; it must not hold process exit forever.
+    runtime.shutdown_timeout(Duration::from_secs(3));
+    result
+}
+
+async fn async_main() -> Result<()> {
     // Logs go to stderr: stdout stays clean for command output/piping, and
     // journald (the daemon's normal log sink) captures both streams.
     tracing_subscriber::fmt()
@@ -334,7 +344,12 @@ async fn main() -> Result<()> {
             proxy_cmd(command, &output)?
         }
         Commands::Targets { command } => {
-            let output = OutputDispatcher::from_flags(false, false, None);
+            let output = match &command {
+                TargetCmd::List(args) => {
+                    OutputDispatcher::from_flags(args.json, false, args.format.map(Into::into))
+                }
+                _ => OutputDispatcher::from_flags(false, false, None),
+            };
             targets_cmd(command, &output)?
         }
         Commands::List(args) => {
@@ -547,40 +562,73 @@ fn proxy_cmd(cmd: ProxyCmd, _output: &OutputDispatcher) -> Result<()> {
     Ok(())
 }
 
-fn targets_cmd(cmd: TargetCmd, _output: &OutputDispatcher) -> Result<()> {
+fn targets_cmd(cmd: TargetCmd, output: &OutputDispatcher) -> Result<()> {
     let mut config = AppConfig::load()?;
     match cmd {
         TargetCmd::Add { domain, provider } => {
-            if config.targets.iter().any(|d| d.domain() == domain.as_str()) {
+            let domain = config::canonical_target_domain(&domain)?;
+            if config.targets.iter().any(|d| {
+                config::canonical_target_domain(d.domain()).ok().as_deref() == Some(domain.as_str())
+            }) {
                 bail!("Target already exists: {}", domain);
             }
-            let provider = match provider {
-                Some(value) => Provider::from(value),
-                None => infer_provider(&domain).ok_or_else(|| {
-                    anyhow::anyhow!("Provider is required for nonstandard domain. Use --provider.")
-                })?,
+            let provider = provider
+                .map(Provider::from)
+                .or_else(|| infer_provider(&domain));
+            let target = match provider {
+                Some(provider) => TargetSpec::Detailed {
+                    domain: domain.clone(),
+                    provider,
+                },
+                None => TargetSpec::Simple(domain.clone()),
             };
-            config
-                .targets
-                .push(TargetSpec::Detailed { domain, provider });
+            config.targets.push(target);
             config.save()?;
-            println!("Target added.");
+            if output.mode().is_json() {
+                output.print_json(&serde_json::json!({"added": true, "domain": domain, "provider": provider.map(|p| p.as_str())}));
+            } else {
+                output.print_rich("[green]Target added.[/]");
+            }
         }
         TargetCmd::Remove { domain } => {
+            let domain = config::canonical_target_domain(&domain)?;
             let before = config.targets.len();
-            config.targets.retain(|d| d.domain() != domain.as_str());
+            config.targets.retain(|d| {
+                config::canonical_target_domain(d.domain()).ok().as_deref() != Some(domain.as_str())
+            });
             if config.targets.len() == before {
                 bail!("Target not found: {}", domain);
             }
             config.save()?;
-            println!("Target removed.");
+            if output.mode().is_json() {
+                output.print_json(&serde_json::json!({"removed": true, "domain": domain}));
+            } else {
+                output.print_rich("[green]Target removed.[/]");
+            }
         }
-        TargetCmd::List => {
+        TargetCmd::List(_) => {
+            if output.mode().is_json() {
+                let targets: Vec<_> = config
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        serde_json::json!({
+                            "domain": target.domain(),
+                            "provider": target.provider().map(|p| p.as_str()),
+                        })
+                    })
+                    .collect();
+                output.print_json(&targets);
+                return Ok(());
+            }
             let mut rows = Vec::new();
             for target in &config.targets {
                 rows.push(TargetRow {
                     domain: target.domain().to_string(),
-                    provider: target.provider().as_str().to_string(),
+                    provider: target
+                        .provider()
+                        .map_or("custom", |p| p.as_str())
+                        .to_string(),
                 });
             }
             let mut table = Table::new(rows);
@@ -869,15 +917,21 @@ async fn activate_cmd(
 
 fn deactivate_cmd(keep_rules: bool, _output: &OutputDispatcher) -> Result<()> {
     let mut config = AppConfig::load()?;
-    config.active_proxy = None;
-    config.save()?;
-
-    let rules_present = iptables::chain_present(&config.settings.chain_name)
-        || ipset_present(&config.settings.ipset_name);
+    let rules_present = if keep_rules {
+        false
+    } else {
+        let chain = iptables::chain_snapshot(&config.settings.chain_name)?.present;
+        let set = iptables::ipset_present(&config.settings.ipset_name)?;
+        chain || set
+    };
 
     match deactivate_action(rules_present, iptables::require_root().is_ok(), keep_rules) {
         DeactivateAction::ProceedClear => {
-            iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
+            if rules_present {
+                iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
+            }
+            config.active_proxy = None;
+            config.save()?;
             println!("Proxy routing deactivated.");
         }
         DeactivateAction::WarnRemains => {
@@ -892,6 +946,8 @@ fn deactivate_cmd(keep_rules: bool, _output: &OutputDispatcher) -> Result<()> {
             std::process::exit(1);
         }
         DeactivateAction::NoteKept => {
+            config.active_proxy = None;
+            config.save()?;
             println!("Proxy routing deactivated (rules intentionally kept).");
         }
     }
@@ -918,15 +974,6 @@ enum DeactivateAction {
     WarnRemains,
     /// --keep-rules: no removal attempted; success with an explicit note.
     NoteKept,
-}
-
-/// True when the named ipset exists (complements `iptables::chain_present`).
-fn ipset_present(ipset_name: &str) -> bool {
-    std::process::Command::new("ipset")
-        .args(["list", ipset_name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// What `cleanup-stale` should do given what it found. Pure for tests.
@@ -2139,7 +2186,8 @@ fn is_daemon_running(port: u16) -> bool {
 async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatcher) -> Result<()> {
     let config = AppConfig::load()?;
 
-    let domain = extract_domain(url);
+    let domain = config::canonical_target_domain(&extract_domain(url))?;
+    let verbose = verbose && !output.mode().is_json();
 
     if verbose {
         println!("[1/5] Parsing URL...");
@@ -2153,9 +2201,13 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
         let mut found = false;
         let mut provider: Option<String> = None;
         for target in &config.targets {
-            if target.domain().eq_ignore_ascii_case(&domain) {
+            if config::canonical_target_domain(target.domain())
+                .ok()
+                .as_deref()
+                == Some(domain.as_str())
+            {
                 found = true;
-                provider = Some(target.provider().as_str().to_string());
+                provider = target.provider().map(|p| p.as_str().to_string());
                 break;
             }
         }
@@ -3291,7 +3343,7 @@ async fn reload_config_once(
     config_tx: &tokio::sync::watch::Sender<Arc<AppConfig>>,
     path: &std::path::Path,
 ) -> bool {
-    let new_config = match load_config_for_reload(path) {
+    let mut new_config = match load_config_for_reload(path) {
         Ok(config) => config,
         Err(err) => {
             tracing::warn!(
@@ -3320,6 +3372,23 @@ async fn reload_config_once(
             "setting '{field}' requires daemon restart to take effect"
         );
     }
+    // Keep the published snapshot consistent with the sockets and firewall
+    // objects this process actually owns. Requested restart values remain on
+    // disk and are picked up by the next daemon; refresh must not use them now.
+    new_config.settings.listen_port = old.settings.listen_port;
+    new_config
+        .settings
+        .chain_name
+        .clone_from(&old.settings.chain_name);
+    new_config
+        .settings
+        .ipset_name
+        .clone_from(&old.settings.ipset_name);
+    new_config
+        .settings
+        .metrics_bind
+        .clone_from(&old.settings.metrics_bind);
+    new_config.settings.metrics_port = old.settings.metrics_port;
     if old.active_proxy != new_config.active_proxy {
         // RuntimeState has no reset API for the failback origin, so the new
         // active proxy is picked up by consumers but not written back into
@@ -3336,13 +3405,79 @@ async fn reload_config_once(
     }
 }
 
+/// Resources acquired by this daemon only. Kept outside spawned tasks so an
+/// early startup error also rolls back while the exclusive owner lock is held.
+struct DaemonResources {
+    _ownership: Option<state::DaemonOwnership>,
+    chain_name: String,
+    ipset_name: String,
+    firewall_started: bool,
+    pid_written: bool,
+}
+
+impl DaemonResources {
+    fn cleanup(&mut self) -> Result<()> {
+        let result = if self.firewall_started {
+            self.firewall_started = false;
+            iptables::clear_rules(&self.chain_name, &self.ipset_name)
+        } else {
+            Ok(())
+        };
+        if self.pid_written {
+            self.pid_written = false;
+            let path = std::path::Path::new(state::DEFAULT_PID_PATH);
+            if state::read_pidfile(path) == Some(std::process::id()) {
+                state::remove_pidfile(path);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for DaemonResources {
+    fn drop(&mut self) {
+        if let Err(err) = self.cleanup() {
+            tracing::error!(error = %err, "Failed to roll back owned daemon resources");
+        }
+    }
+}
+
 async fn run_daemon() -> Result<()> {
     // Runtime-gated test mode: the production binary behaves identically unless
     // the operator explicitly opts in via RUST_PROXY_TEST_MODE=1.
     let test_mode = std::env::var("RUST_PROXY_TEST_MODE").as_deref() == Ok("1");
     if !test_mode {
         iptables::require_root()?;
-
+    } else {
+        tracing::info!("test mode: skipping root privilege requirement");
+    }
+    let config = AppConfig::load()?;
+    let watch_config_path = config::config_path()?;
+    let report = validation::validate_config(&config, &watch_config_path);
+    if report.has_errors() {
+        bail!(
+            "Invalid daemon configuration ({} errors); run `rust_proxy check` for details",
+            report.error_count()
+        );
+    }
+    // Register all stop/reload handlers before publishing any owned state.
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut resources = DaemonResources {
+        _ownership: if test_mode {
+            None
+        } else {
+            Some(state::DaemonOwnership::acquire(std::path::Path::new(
+                state::DEFAULT_LOCK_PATH,
+            ))?)
+        },
+        chain_name: config.settings.chain_name.clone(),
+        ipset_name: config.settings.ipset_name.clone(),
+        firewall_started: false,
+        pid_written: false,
+    };
+    if !test_mode {
         // Single-daemon guarantee + crash detection: a pidfile holding a
         // live pid means another daemon owns the firewall rules; a dead one
         // means a predecessor crashed and likely left stale state behind.
@@ -3361,12 +3496,7 @@ async fn run_daemon() -> Result<()> {
             ),
             state::PidfileDecision::Start => {}
         }
-        state::write_pidfile(&pid_path, std::process::id())
-            .with_context(|| format!("Failed writing pidfile {}", pid_path.display()))?;
-    } else {
-        tracing::info!("test mode: skipping root privilege requirement");
     }
-    let config = AppConfig::load()?;
 
     // Initialize metrics registry (safe to call even if already initialized)
     if let Err(e) = metrics::init_metrics() {
@@ -3377,7 +3507,6 @@ async fn run_daemon() -> Result<()> {
     // latest validated snapshot per tick / per accept instead of pinning a
     // static Arc<AppConfig>.
     let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(config.clone()));
-    let watch_config_path = config::config_path()?;
     tracing::info!(
         path = %watch_config_path.display(),
         "config hot-reload enabled: watching configuration file for changes (SIGHUP forces a reload)"
@@ -3431,7 +3560,11 @@ async fn run_daemon() -> Result<()> {
     // total outage degraded into an empty exclude set plus a warning, and the
     // daemon started with NO upstream excludes -- every upstream connection
     // was then redirected back into this proxy (self-redirect loop).
-    let upstream_report = dns::resolve_parallel(&upstream_hosts).await;
+    let upstream_report = tokio::select! {
+        report = dns::resolve_parallel(&upstream_hosts) => report,
+        _ = sigint.recv() => return Ok(()),
+        _ = sigterm.recv() => return Ok(()),
+    };
     if upstream_report.total_failure() {
         bail!(
             "DNS resolution failed for ALL {} upstream proxy host(s): {}. \
@@ -3471,7 +3604,6 @@ async fn run_daemon() -> Result<()> {
     if let Some(ref id) = active_id {
         state.record_activated(id, chrono::Utc::now()).await;
     }
-    state.clone().start_flush_loop(Duration::from_secs(5));
 
     // Create load balancer
     let load_balancer = Arc::new(LoadBalancer::new());
@@ -3492,14 +3624,47 @@ async fn run_daemon() -> Result<()> {
             );
         }
     }
-    let mut initial_targets: HashSet<String> = HashSet::new();
+    // Binding is an awaited startup step: a live REDIRECT can never precede a
+    // successfully bound local listener. OUTPUT interception needs loopback only.
+    let listen_addr = std::net::SocketAddr::from(([127, 0, 0, 1], config.settings.listen_port));
+    let listener = tokio::net::TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("Failed to bind to {listen_addr}"))?;
+    let metrics_addr = if config.settings.metrics_enabled && !test_mode {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::lookup_host((
+                    config.settings.metrics_bind.as_str(),
+                    config.settings.metrics_port,
+                )),
+            )
+            .await
+            .context("Metrics bind resolution timed out")??
+            .next()
+            .context("Metrics bind resolved to no addresses")?,
+        )
+    } else {
+        None
+    };
+    let mut target_inventory = RouteInventory::default();
     if test_mode {
         tracing::info!("test mode: skipping firewall mutations (ipset/iptables)");
     } else {
+        state::write_pidfile(
+            std::path::Path::new(state::DEFAULT_PID_PATH),
+            std::process::id(),
+        )?;
+        resources.pid_written = true;
+        resources.firewall_started = true;
         iptables::ensure_ipset(&config.settings.ipset_name)?;
 
-        initial_targets = build_target_entries(&config).await?;
-        iptables::sync_ipset(&config.settings.ipset_name, &initial_targets)?;
+        let outcomes = tokio::select! {
+            outcomes = target_source_outcomes(&config) => outcomes,
+            _ = sigint.recv() => return resources.cleanup(),
+            _ = sigterm.recv() => return resources.cleanup(),
+        };
+        commit_target_outcomes(&config, &mut target_inventory, outcomes)?;
 
         // Staleness surfacing: rules surviving from a previous run mean the
         // last exit was ungraceful (the pidfile guard above has already told
@@ -3560,57 +3725,32 @@ async fn run_daemon() -> Result<()> {
         )?;
         runtime_state.set_firewall_context(true, bypass_mark).await;
     }
-    let refresh_rx = config_rx.clone();
+    let flush_task = state.clone().start_flush_loop(Duration::from_secs(5));
+    let mut refresh_rx = config_rx.clone();
     let refresh_task = if test_mode {
         tracing::info!("test mode: skipping DNS/ipset refresh task");
         None
     } else {
         Some(tokio::spawn(async move {
-            // so even the first refresh keeps the stale ipset on total failure.
-            let mut seen: HashSet<String> = initial_targets.clone();
             loop {
-                // Per-tick pickup: borrow the latest validated snapshot so
-                // target lists, include flags, and refresh cadence follow
-                // hot-reloads each cycle.
-                let cfg = refresh_rx.borrow().clone();
-                tokio::time::sleep(Duration::from_secs(cfg.settings.dns_refresh_secs)).await;
-                match refresh_target_entries(
-                    &cfg.targets,
-                    cfg.settings.include_aws_ip_ranges,
-                    cfg.settings.include_cloudflare_ip_ranges,
-                    cfg.settings.include_google_ip_ranges,
-                )
-                .await
-                {
-                    Ok(entries) => {
-                        // Fail-open hazard: refresh_target_entries collapses every
-                        // DNS outcome into a bare entry set (resolve_ipv4 is an
-                        // Ok-only wrapper), so a total resolver outage surfaces as
-                        // an EMPTY entry set. Syncing that would wipe the live
-                        // ipset and silently unroute every target until DNS
-                        // recovers. When the fresh set is empty but the previous
-                        // one was not, re-probe with the report-aware API and keep
-                        // the stale ipset for this cycle on total failure.
-                        let total_failure = entries.is_empty() && !seen.is_empty() && {
-                            let domains: Vec<String> =
-                                cfg.targets.iter().map(|t| t.domain().to_string()).collect();
-                            dns::resolve_parallel(&domains).await.total_failure()
-                        };
-                        if total_failure {
-                            tracing::warn!(
-                            kept = seen.len(),
-                            "Total DNS failure while refreshing targets; keeping stale ipset rather than emptying it"
-                        );
-                        } else if let Err(err) =
-                            iptables::sync_ipset(&cfg.settings.ipset_name, &entries)
-                        {
-                            tracing::warn!("ipset sync failed: {err}");
-                        } else if seen != entries {
-                            tracing::info!("ipset refreshed: {} targets", entries.len());
-                            seen = entries;
-                        }
+                let delay = Duration::from_secs(refresh_rx.borrow().settings.dns_refresh_secs);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = refresh_rx.changed() => {
+                        if changed.is_err() { break; }
                     }
-                    Err(err) => tracing::warn!("target refresh failed: {err}"),
+                }
+                let cfg = refresh_rx.borrow_and_update().clone();
+                let outcomes = target_source_outcomes(&cfg).await;
+                // A change arriving during DNS/feed IO supersedes this generation.
+                if !Arc::ptr_eq(&cfg, &refresh_rx.borrow()) {
+                    continue;
+                }
+                match commit_target_outcomes(&cfg, &mut target_inventory, outcomes) {
+                    Ok(count) => tracing::info!(entries = count, "Target routes refreshed"),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Target refresh failed; keeping live ipset")
+                    }
                 }
             }
         }))
@@ -3648,7 +3788,7 @@ async fn run_daemon() -> Result<()> {
 
     // Health check task (only if enabled). Consumes the config bus so
     // health_check_* settings and the proxy set update live on reload.
-    let health_task = if config.settings.health_check_enabled {
+    let mut health_task = if config.settings.health_check_enabled {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let health_config_rx = config_rx.clone();
         let health_state = state.clone();
@@ -3675,33 +3815,19 @@ async fn run_daemon() -> Result<()> {
     // Proxy task: consumes the config bus; each accepted connection
     // snapshots the latest validated config (hot-reload pickup).
     let runtime_arc = Arc::new(runtime_state.clone());
-    let proxy_task = tokio::spawn(proxy::run_proxy_with_load_balancing(
-        config.settings.listen_port,
+    let (proxy_shutdown_tx, proxy_shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut proxy_task = tokio::spawn(proxy::run_proxy_with_load_balancing(
+        listener,
         config_rx.clone(),
         state.clone(),
         runtime_arc,
         load_balancer,
         retry_config,
+        proxy_shutdown_rx,
     ));
 
     // Metrics server task (only if enabled)
-    let metrics_task = if config.settings.metrics_enabled && !test_mode {
-        let metrics_bind = format!(
-            "{}:{}",
-            config.settings.metrics_bind, config.settings.metrics_port
-        );
-        let metrics_addr = match metrics_bind.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                tracing::warn!(
-                    bind = %metrics_bind,
-                    error = %e,
-                    "Invalid metrics bind address (continuing without metrics)"
-                );
-                // Use a dummy address - server will fail gracefully
-                "0.0.0.0:0".parse().unwrap()
-            }
-        };
+    let mut metrics_task = if let Some(metrics_addr) = metrics_addr {
         let metrics_path = config.settings.metrics_path.clone();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Some((
@@ -3740,54 +3866,100 @@ async fn run_daemon() -> Result<()> {
         }
     });
 
-    // SIGHUP forces an immediate re-read of the config regardless of fs events.
-    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(err) => bail!("Failed to install SIGHUP handler: {err}"),
-    };
-
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Shutdown signal received");
-        }
-        _ = sighup.recv() => {
-            tracing::info!("SIGHUP received: reloading configuration");
-            let _swapped = reload_config_once(&config_tx, &watch_config_path).await;
-        }
-        res = proxy_task => {
-            match res {
-                Ok(Ok(())) => tracing::info!("Proxy task completed"),
-                Ok(Err(err)) => tracing::error!("Proxy error: {err}"),
-                Err(err) => tracing::error!("Proxy task panicked: {err}"),
+    let mut proxy_finished = false;
+    let mut health_finished = false;
+    let mut metrics_finished = false;
+    let outcome = loop {
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT received: shutting down");
+                break Ok(());
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received: shutting down");
+                break Ok(());
+            }
+            _ = sighup.recv() => {
+                tracing::info!("SIGHUP received: reloading configuration");
+                reload_config_once(&config_tx, &watch_config_path).await;
+            }
+            result = &mut proxy_task => {
+                proxy_finished = true;
+                break match result {
+                    Ok(Ok(())) => Err(anyhow::anyhow!("Proxy listener stopped unexpectedly")),
+                    Ok(Err(err)) => Err(err.context("Proxy listener failed")),
+                    Err(err) => Err(anyhow::anyhow!("Proxy task failed: {err}")),
+                };
+            }
+            result = async {
+                if let Some((task, _)) = &mut health_task { task.await }
+                else { std::future::pending().await }
+            } => {
+                health_finished = true;
+                break Err(anyhow::anyhow!("Health task stopped unexpectedly: {result:?}"));
+            }
+            result = async {
+                if let Some((task, _)) = &mut metrics_task { task.await }
+                else { std::future::pending().await }
+            } => {
+                metrics_finished = true;
+                break Err(anyhow::anyhow!("Metrics task stopped unexpectedly: {result:?}"));
             }
         }
-    }
-
+    };
+    let _ = proxy_shutdown_tx.send(true);
     watcher_task.abort();
-
+    let _ = watcher_task.await;
     if let Some(refresh_task) = refresh_task {
         refresh_task.abort();
+        let _ = refresh_task.await;
     }
     if let Some(ping_task) = ping_task {
         ping_task.abort();
+        let _ = ping_task.await;
     }
     if let Some((task, shutdown_tx)) = health_task {
         let _ = shutdown_tx.send(true);
-        task.abort();
+        if !health_finished {
+            task.abort();
+            let _ = task.await;
+        }
     }
     if let Some((task, shutdown_tx)) = metrics_task {
         let _ = shutdown_tx.send(true);
-        task.abort();
+        if !metrics_finished {
+            task.abort();
+            let _ = task.await;
+        }
     }
-    if !test_mode {
-        iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
-        state::remove_pidfile(&std::path::PathBuf::from(state::DEFAULT_PID_PATH));
+    let proxy_stop = if proxy_finished {
+        Ok(())
     } else {
+        match tokio::time::timeout(Duration::from_secs(3), &mut proxy_task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => Err(anyhow::anyhow!("Proxy task failed during shutdown: {err}")),
+            Err(_) => {
+                proxy_task.abort();
+                let _ = proxy_task.await;
+                Err(anyhow::anyhow!(
+                    "Proxy shutdown exceeded its three-second budget"
+                ))
+            }
+        }
+    };
+    flush_task.abort();
+    let _ = flush_task.await;
+    let cleanup_result = resources.cleanup();
+    if !test_mode && cleanup_result.is_ok() {
+        tracing::info!("Owned firewall and pidfile cleanup completed");
+    } else if test_mode {
         tracing::info!("test mode: skipping iptables cleanup");
     }
-    state.flush().await?;
-
-    Ok(())
+    let flush_result = state.flush().await;
+    outcome
+        .and(proxy_stop)
+        .and(cleanup_result)
+        .and(flush_result)
 }
 
 async fn ping_proxy(host: &str, port: u16, timeout_ms: u64) -> Result<f64> {
@@ -3833,48 +4005,412 @@ fn build_proxy_rows(config: &AppConfig, state: &State) -> Vec<ProxyRow> {
     rows
 }
 
-async fn build_target_entries(config: &AppConfig) -> Result<HashSet<String>> {
-    refresh_target_entries(
-        &config.targets,
-        config.settings.include_aws_ip_ranges,
-        config.settings.include_cloudflare_ip_ranges,
-        config.settings.include_google_ip_ranges,
-    )
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum RouteSource {
+    Domain(String),
+    Provider(&'static str),
+}
+
+impl RouteSource {
+    fn label(&self) -> String {
+        match self {
+            Self::Domain(domain) => format!("dns:{domain}"),
+            Self::Provider(provider) => format!("provider:{provider}"),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SourceRoutes {
+    entries: HashSet<String>,
+    last_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct RouteInventory {
+    sources: HashMap<RouteSource, SourceRoutes>,
+}
+
+type SourceOutcome = (RouteSource, Result<HashSet<String>>);
+
+impl RouteInventory {
+    fn apply(&mut self, outcomes: Vec<SourceOutcome>) -> HashSet<String> {
+        let enabled: HashSet<_> = outcomes.iter().map(|(source, _)| source.clone()).collect();
+        self.sources.retain(|source, _| enabled.contains(source));
+        for (source, outcome) in outcomes {
+            let label = source.label();
+            let cached = self.sources.entry(source).or_default();
+            match outcome {
+                Ok(entries) if !entries.is_empty() => {
+                    cached.entries = entries;
+                    cached.last_success_at = Some(chrono::Utc::now());
+                    cached.last_error = None;
+                }
+                outcome => {
+                    let error = outcome.err().map_or_else(
+                        || "No usable IPv4 addresses".to_string(),
+                        |err| err.to_string(),
+                    );
+                    tracing::warn!(source = %label, error = %error, kept = cached.entries.len(), last_success_at = ?cached.last_success_at, "Routing source failed; retaining its last-good entries");
+                    cached.last_error = Some(error);
+                }
+            }
+        }
+        self.sources
+            .values()
+            .flat_map(|source| source.entries.iter().cloned())
+            .collect()
+    }
+
+    /// Publish freshness only after the corresponding routing generation is
+    /// installed. A failed ipset swap must not advertise an unapplied recovery
+    /// or remove the metrics for sources still present in the live inventory.
+    fn publish_metrics(&self, previous: &Self) {
+        for source in previous.sources.keys() {
+            if !self.sources.contains_key(source) {
+                let _ = metrics::ROUTE_SOURCE_STALE.remove_label_values(&[&source.label()]);
+            }
+        }
+        for (source, routes) in &self.sources {
+            metrics::ROUTE_SOURCE_STALE
+                .with_label_values(&[&source.label()])
+                .set(if routes.last_error.is_some() {
+                    1.0
+                } else {
+                    0.0
+                });
+        }
+    }
+}
+
+/// All source outcomes belong to one generation; a nonempty feed cannot hide
+/// a target lookup failure, and a second DNS lookup cannot change its meaning.
+async fn target_source_outcomes(config: &AppConfig) -> Vec<SourceOutcome> {
+    target_source_outcomes_with_resolver(config, |domains| async move {
+        dns::resolve_parallel(&domains).await
+    })
     .await
 }
 
-async fn refresh_target_entries(
-    domains: &[TargetSpec],
-    include_aws: bool,
-    include_cloudflare: bool,
-    include_google: bool,
-) -> Result<HashSet<String>> {
-    let domains: Vec<String> = domains.iter().map(|d| d.domain().to_string()).collect();
-    let mut entries = dns::resolve_ipv4(&domains).await?;
-    if include_aws {
-        match ip_ranges::fetch_aws_ipv4().await {
-            Ok(prefixes) => entries.extend(prefixes),
-            Err(err) => tracing::warn!("AWS IP ranges fetch failed: {err}"),
+async fn target_source_outcomes_with_resolver<F, R>(
+    config: &AppConfig,
+    resolver: R,
+) -> Vec<SourceOutcome>
+where
+    R: FnOnce(Vec<String>) -> F,
+    F: std::future::Future<Output = dns::DnsResolutionReport>,
+{
+    let domains: Vec<_> = config
+        .targets
+        .iter()
+        .map(|target| {
+            config::canonical_target_domain(target.domain())
+                .unwrap_or_else(|_| target.domain().to_string())
+        })
+        .collect();
+    let (report, aws, cloudflare, google) = tokio::join!(
+        resolver(domains.clone()),
+        async {
+            if config.settings.include_aws_ip_ranges {
+                Some(ip_ranges::fetch_aws_ipv4().await)
+            } else {
+                None
+            }
+        },
+        async {
+            if config.settings.include_cloudflare_ip_ranges {
+                Some(ip_ranges::fetch_cloudflare_ipv4().await)
+            } else {
+                None
+            }
+        },
+        async {
+            if config.settings.include_google_ip_ranges {
+                Some(ip_ranges::fetch_google_ipv4().await)
+            } else {
+                None
+            }
+        },
+    );
+    let mut outcomes = Vec::new();
+    for domain in domains {
+        let outcome = report
+            .resolved
+            .iter()
+            .find(|(host, _)| host == &domain)
+            .map(|(_, ips)| {
+                ips.iter()
+                    .filter_map(|ip| match ip {
+                        std::net::IpAddr::V4(ip) => Some(ip.to_string()),
+                        std::net::IpAddr::V6(_) => None,
+                    })
+                    .collect()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DNS lookup failed for {domain}: {}",
+                    report
+                        .failed
+                        .iter()
+                        .find(|(host, _)| host == &domain)
+                        .map_or("missing resolution outcome", |(_, error)| error.as_str())
+                )
+            });
+        outcomes.push((RouteSource::Domain(domain), outcome));
+    }
+    for (name, result) in [("aws", aws), ("cloudflare", cloudflare), ("google", google)] {
+        if let Some(result) = result {
+            outcomes.push((RouteSource::Provider(name), result));
         }
     }
-    if include_cloudflare {
-        match ip_ranges::fetch_cloudflare_ipv4().await {
-            Ok(prefixes) => entries.extend(prefixes),
-            Err(err) => tracing::warn!("Cloudflare IP ranges fetch failed: {err}"),
-        }
+    outcomes
+}
+
+fn commit_target_outcomes(
+    config: &AppConfig,
+    inventory: &mut RouteInventory,
+    outcomes: Vec<SourceOutcome>,
+) -> Result<usize> {
+    let mut candidate = inventory.clone();
+    let entries = candidate.apply(outcomes);
+    if !config.targets.is_empty()
+        && !candidate.sources.iter().any(|(source, routes)| {
+            matches!(source, RouteSource::Domain(_)) && !routes.entries.is_empty()
+        })
+    {
+        bail!("No configured target has usable IPv4 coverage; refusing to publish provider-only routing");
     }
-    if include_google {
-        match ip_ranges::fetch_google_ipv4().await {
-            Ok(prefixes) => entries.extend(prefixes),
-            Err(err) => tracing::warn!("Google IP ranges fetch failed: {err}"),
-        }
-    }
-    Ok(entries)
+    iptables::sync_ipset(&config.settings.ipset_name, &entries)?;
+    candidate.publish_metrics(inventory);
+    metrics::IPSET_SIZE.set(entries.len() as f64);
+    *inventory = candidate;
+    Ok(entries.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static ROUTE_RESTORES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn capture_route_commands(program: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
+        assert_eq!(program, "ipset");
+        match args[0] {
+            "list" => Ok("Name: controlled_routes\nMembers:\n".to_string()),
+            "restore" => {
+                ROUTE_RESTORES
+                    .with(|records| records.borrow_mut().push(stdin.unwrap().to_string()));
+                Ok(String::new())
+            }
+            // ubs:ignore[rust.ownership.panic-macro] — test backend rejects an unexpected production command rather than fabricating success.
+            command => panic!("unexpected ipset command: {command}"),
+        }
+    }
+
+    fn route_set(entries: &[&str]) -> HashSet<String> {
+        entries.iter().map(|entry| entry.to_string()).collect()
+    }
+
+    struct RouteLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for RouteLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_total_dns_failure_retains_ipset_entries_warning_and_metric() {
+        let config = AppConfig {
+            targets: vec![TargetSpec::Simple("controlled-refresh.invalid".into())],
+            settings: Settings {
+                ipset_name: "controlled_routes".into(),
+                include_aws_ip_ranges: false,
+                include_cloudflare_ip_ranges: false,
+                include_google_ip_ranges: false,
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
+        let mut inventory = RouteInventory::default();
+        ROUTE_RESTORES.with(|records| records.borrow_mut().clear());
+        let first = target_source_outcomes_with_resolver(&config, |domains| async move {
+            dns::DnsResolutionReport {
+                resolved: vec![(domains[0].clone(), vec!["198.51.100.7".parse().unwrap()])],
+                failed: vec![],
+                total_domains: 1,
+                elapsed: Duration::ZERO,
+            }
+        })
+        .await;
+        iptables::with_test_spawn(capture_route_commands, || {
+            commit_target_outcomes(&config, &mut inventory, first)
+        })
+        .unwrap();
+        let failed = target_source_outcomes_with_resolver(&config, |domains| async move {
+            dns::DnsResolutionReport {
+                resolved: vec![],
+                failed: vec![(domains[0].clone(), "controlled resolver outage".into())],
+                total_domains: 1,
+                elapsed: Duration::ZERO,
+            }
+        })
+        .await;
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || RouteLogWriter(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            iptables::with_test_spawn(capture_route_commands, || {
+                commit_target_outcomes(&config, &mut inventory, failed)
+            })
+            .unwrap();
+        });
+        ROUTE_RESTORES.with(|records| {
+            let records = records.borrow();
+            assert_eq!(records.len(), 2);
+            assert_eq!(
+                records[0], records[1],
+                "failed DNS must not empty the live set"
+            );
+            assert!(records[1].contains("add controlled_routes_tmp 198.51.100.7 -exist"));
+        });
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("Routing source failed; retaining its last-good entries"),
+            "{logs}"
+        );
+        assert!(logs.contains("controlled resolver outage"), "{logs}");
+        assert_eq!(
+            metrics::ROUTE_SOURCE_STALE
+                .with_label_values(&["dns:controlled-refresh.invalid"])
+                .get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn per_source_failures_keep_coverage_and_explicit_removal_drops_only_that_source() {
+        let a = RouteSource::Domain("a.invalid".into());
+        let b = RouteSource::Domain("b.invalid".into());
+        let aws = RouteSource::Provider("aws");
+        let cf = RouteSource::Provider("cloudflare");
+        let mut inventory = RouteInventory::default();
+        inventory.apply(vec![
+            (a.clone(), Ok(route_set(&["198.51.100.1"]))),
+            (b.clone(), Ok(route_set(&["198.51.100.2"]))),
+            (aws.clone(), Ok(route_set(&["203.0.113.0/24"]))),
+            (cf.clone(), Ok(route_set(&["192.0.2.0/24"]))),
+        ]);
+        let entries = inventory.apply(vec![
+            (a.clone(), Ok(HashSet::new())),
+            (b.clone(), Ok(route_set(&["198.51.100.3"]))),
+            (aws.clone(), Err(anyhow::anyhow!("feed outage"))),
+            (cf, Ok(route_set(&["192.0.2.0/24"]))),
+        ]);
+        assert_eq!(
+            entries,
+            route_set(&[
+                "198.51.100.1",
+                "198.51.100.3",
+                "203.0.113.0/24",
+                "192.0.2.0/24"
+            ])
+        );
+        assert!(inventory.sources[&a].last_error.is_some());
+        assert!(inventory.sources[&aws].last_error.is_some());
+        assert!(inventory.sources[&b].last_error.is_none());
+        let entries = inventory.apply(vec![(a.clone(), Err(anyhow::anyhow!("DNS outage")))]);
+        assert_eq!(entries, route_set(&["198.51.100.1"]));
+        assert_eq!(inventory.sources.len(), 1);
+        let entries = inventory.apply(vec![(b, Ok(route_set(&["198.51.100.9"])))]);
+        assert_eq!(entries, route_set(&["198.51.100.9"]));
+        assert!(!inventory.sources.contains_key(&a));
+    }
+
+    #[test]
+    fn provider_success_cannot_make_unresolved_startup_target_routing_ready() {
+        let config = AppConfig {
+            targets: vec![TargetSpec::Simple("unresolved-startup.invalid".into())],
+            ..AppConfig::default()
+        };
+        let mut inventory = RouteInventory::default();
+        let result = commit_target_outcomes(
+            &config,
+            &mut inventory,
+            vec![
+                (
+                    RouteSource::Domain("unresolved-startup.invalid".into()),
+                    Err(anyhow::anyhow!("DNS outage")),
+                ),
+                (
+                    RouteSource::Provider("aws"),
+                    Ok(route_set(&["203.0.113.0/24"])),
+                ),
+            ],
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No configured target has usable IPv4 coverage"));
+        assert!(inventory.sources.is_empty());
+    }
+
+    #[test]
+    fn failed_ipset_update_keeps_committed_inventory_and_freshness_metric() {
+        fn reject_restore(program: &str, args: &[&str], _: Option<&str>) -> Result<String> {
+            assert_eq!(program, "ipset");
+            assert!(matches!(args[0], "list" | "restore"));
+            bail!("controlled ipset publication failure");
+        }
+        let domain = "failed-publication.invalid";
+        let source = RouteSource::Domain(domain.into());
+        let config = AppConfig {
+            targets: vec![TargetSpec::Simple(domain.into())],
+            settings: Settings {
+                ipset_name: "controlled_routes".into(),
+                ..Settings::default()
+            },
+            ..AppConfig::default()
+        };
+        let mut inventory = RouteInventory::default();
+        for outcome in [
+            Ok(route_set(&["198.51.100.17"])),
+            Err(anyhow::anyhow!("controlled DNS outage")),
+        ] {
+            iptables::with_test_spawn(capture_route_commands, || {
+                commit_target_outcomes(&config, &mut inventory, vec![(source.clone(), outcome)])
+            })
+            .unwrap();
+        }
+        let stale = metrics::ROUTE_SOURCE_STALE.with_label_values(&[&source.label()]);
+        assert_eq!(stale.get(), 1.0);
+        let result = iptables::with_test_spawn(reject_restore, || {
+            commit_target_outcomes(
+                &config,
+                &mut inventory,
+                vec![(source.clone(), Ok(route_set(&["198.51.100.18"])))],
+            )
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("controlled ipset publication failure"));
+        assert_eq!(
+            inventory.sources[&source].entries,
+            route_set(&["198.51.100.17"])
+        );
+        assert!(inventory.sources[&source].last_error.is_some());
+        assert_eq!(stale.get(), 1.0, "unapplied recovery must remain stale");
+    }
 
     // =========================================================================
     // Scope A: machine-mode payloads must be free of ANSI escapes
@@ -4073,6 +4609,7 @@ mod tests {
                 "ipset_name" => modified.ipset_name = format!("{}_x", modified.ipset_name),
                 "metrics_bind" => modified.metrics_bind = "0.0.0.0".to_string(),
                 "metrics_port" => modified.metrics_port += 1,
+                // ubs:ignore[rust.ownership.panic-macro] — unit test must fail if a restart-required field lacks a case.
                 other => panic!("unhandled restart-required setting: {other}"),
             }
             assert_eq!(
@@ -4081,6 +4618,41 @@ mod tests {
                 "changing {expected} must be classified restart-required"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reload_pins_owned_socket_and_firewall_identity_but_applies_live_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = AppConfig::default();
+        let mut requested = original.clone();
+        requested.settings.listen_port += 1;
+        requested.settings.chain_name = "NEXT_CHAIN".into();
+        requested.settings.ipset_name = "next_targets".into();
+        requested.settings.metrics_bind = "127.0.0.2".into();
+        requested.settings.metrics_port += 1;
+        requested.settings.dns_refresh_secs = 900;
+        std::fs::write(&path, toml::to_string(&requested).unwrap()).unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(Arc::new(original.clone()));
+        assert!(reload_config_once(&sender, &path).await);
+        let applied = receiver.borrow().clone();
+        assert_eq!(applied.settings.listen_port, original.settings.listen_port);
+        assert_eq!(applied.settings.chain_name, original.settings.chain_name);
+        assert_eq!(applied.settings.ipset_name, original.settings.ipset_name);
+        assert_eq!(
+            applied.settings.metrics_bind,
+            original.settings.metrics_bind
+        );
+        assert_eq!(
+            applied.settings.metrics_port,
+            original.settings.metrics_port
+        );
+        assert_eq!(applied.settings.dns_refresh_secs, 900);
+        assert_eq!(
+            load_config_for_reload(&path).unwrap().settings.listen_port,
+            requested.settings.listen_port,
+            "pending restart values remain on disk"
+        );
     }
 
     #[test]

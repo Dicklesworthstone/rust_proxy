@@ -278,7 +278,7 @@ impl StateStore {
         state.save(&self.path)
     }
 
-    pub fn start_flush_loop(self: Arc<Self>, interval: Duration) {
+    pub fn start_flush_loop(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
         tokio::spawn(async move {
             let mut next = Instant::now() + interval;
@@ -289,7 +289,7 @@ impl StateStore {
                 }
                 next += interval;
             }
-        });
+        })
     }
 }
 
@@ -559,6 +559,42 @@ pub struct DegradationStatus {
 /// a leftover file with a dead pid proves the previous run died).
 pub const DEFAULT_PID_PATH: &str = "/run/rust_proxy.pid";
 
+/// The lock inode stays in place across restarts. Removing a locked file would
+/// let a second process lock a different inode and become a second owner.
+pub const DEFAULT_LOCK_PATH: &str = "/run/rust_proxy.lock";
+
+pub struct DaemonOwnership {
+    _lock: fs::File,
+}
+
+impl DaemonOwnership {
+    pub fn acquire(path: &std::path::Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("Failed opening daemon ownership lock {}", path.display()))?;
+        // SAFETY: the descriptor belongs to a live File. flock does not borrow
+        // memory, and closing this File releases ownership even after a crash.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Cannot acquire daemon ownership at {}; another daemon may be running",
+                    path.display()
+                )
+            });
+        }
+        Ok(Self { _lock: lock })
+    }
+}
+
 /// What to do about an existing pidfile before starting a daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PidfileDecision {
@@ -589,13 +625,21 @@ where
 /// "no usable record").
 pub fn read_pidfile(path: &std::path::Path) -> Option<u32> {
     let content = std::fs::read_to_string(path).ok()?;
-    content.trim().parse::<u32>().ok()
+    content
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32)
 }
 
 /// Atomically write our pid: temp file + rename in the same directory, so a
 /// concurrent reader never sees a torn write.
 pub fn write_pidfile(path: &std::path::Path, pid: u32) -> anyhow::Result<()> {
     use std::io::Write;
+    anyhow::ensure!(
+        pid > 0 && pid <= i32::MAX as u32,
+        "Pidfile requires a positive process ID"
+    );
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
@@ -621,9 +665,15 @@ pub fn remove_pidfile(path: &std::path::Path) {
 /// for a live process we lack permission to signal — that still counts as
 /// alive.
 pub fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
     // SAFETY: kill(2) with signal 0 performs permission/liveness checks only;
     // no signal is delivered and no state is mutated.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let rc = unsafe { libc::kill(pid, 0) };
     if rc == 0 {
         return true;
     }
@@ -957,10 +1007,33 @@ mod tests {
         let path = dir.path().join("garbage.pid");
         std::fs::write(&path, "not-a-pid\n").unwrap();
         assert_eq!(read_pidfile(&path), None);
+        for invalid in ["0", "4294967295", "2147483648", "-1"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                read_pidfile(&path),
+                None,
+                "a process-group selector is never a PID"
+            );
+        }
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
     }
 
     #[test]
     fn test_process_alive_self_is_true() {
         assert!(process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn daemon_ownership_is_exclusive_and_recovers_after_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        let first = DaemonOwnership::acquire(&path).unwrap();
+        assert!(DaemonOwnership::acquire(&path).is_err());
+        drop(first);
+        let second = DaemonOwnership::acquire(&path).unwrap();
+        assert!(DaemonOwnership::acquire(&path).is_err());
+        drop(second);
+        assert!(path.exists(), "the ownership inode must never be unlinked");
     }
 }

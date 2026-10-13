@@ -95,3 +95,170 @@ async fn test_list_toon_roundtrip() {
 
     harness.cleanup().await;
 }
+
+/// Different requested state directories must isolate actual CLI writes even
+/// when both processes inherit the same HOME and XDG defaults.
+#[tokio::test]
+async fn explicit_state_directories_isolate_cli_activation_and_statistics() -> anyhow::Result<()> {
+    let first = TestHarness::new().await?;
+    let second = TestHarness::new().await?;
+    for (harness, id) in [(&first, "isolated-first"), (&second, "isolated-second")] {
+        for args in [
+            vec!["proxy", "add", id, "http://127.0.0.1:12345"],
+            vec!["activate", id],
+        ] {
+            let result = harness.run_command(&args);
+            assert!(result.success, "{args:?}: {}", result.stderr);
+        }
+        assert!(harness.state_dir.join("state.json").is_file());
+    }
+    let first_stats = first.run_command(&["list", "--json"]).json()?["stats"].clone();
+    let second_stats = second.run_command(&["list", "--json"]).json()?["stats"].clone();
+    assert_eq!(first_stats["proxies"].as_object().unwrap().len(), 1);
+    assert_eq!(second_stats["proxies"].as_object().unwrap().len(), 1);
+    assert!(first_stats["proxies"]["isolated-first"]["activated_at"].is_string());
+    assert!(first_stats["proxies"]["isolated-second"].is_null());
+    assert!(second_stats["proxies"]["isolated-second"]["activated_at"].is_string());
+    assert!(second_stats["proxies"]["isolated-first"].is_null());
+    Ok(())
+}
+
+/// Real CLI mutations and diagnostics; the no-DNS path establishes config
+/// identity only. Kernel interception is qualified separately.
+#[tokio::test]
+async fn custom_domain_onboarding_has_truthful_provider_and_canonical_identity(
+) -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    for args in [
+        vec!["init"],
+        vec!["proxy", "add", "customer-proxy", "http://127.0.0.1:12345"],
+        vec!["targets", "add", "Customer.Example.Invalid."],
+        vec!["activate", "customer-proxy"],
+        vec![
+            "targets",
+            "add",
+            "hinted.example.invalid",
+            "--provider",
+            "cloudflare",
+        ],
+        vec!["targets", "add", "API.OpenAI.com."],
+    ] {
+        let result = harness.run_command(&args);
+        assert!(result.success, "{args:?}: {}", result.stderr);
+    }
+    let check = harness.run_command(&["check", "--json"]);
+    assert!(check.success, "{} {}", check.stdout, check.stderr);
+    check.json()?;
+
+    let listed = harness.run_command(&["targets", "list", "--json"]);
+    assert!(listed.success, "{}", listed.stderr);
+    let targets = listed.json()?;
+    assert_eq!(targets[0]["domain"], "customer.example.invalid");
+    assert!(targets[0]["provider"].is_null());
+    assert_eq!(targets[1]["provider"], "cloudflare");
+    assert_eq!(targets[2]["provider"], "openai");
+
+    let test = harness.run_command(&[
+        "test",
+        "Customer.Example.Invalid.",
+        "--json",
+        "--verbose",
+        "--no-dns",
+    ]);
+    assert!(test.success, "{}", test.stderr);
+    let decision = test.json()?;
+    assert_eq!(decision["domain"], "customer.example.invalid");
+    assert_eq!(decision["would_proxy"], true);
+    assert!(decision["routing_decision"]["target_provider"].is_null());
+    assert_eq!(decision["active_proxy"]["id"], "customer-proxy");
+
+    let toon = harness.run_command(&["targets", "list", "--format", "toon"]);
+    assert!(toon.success, "{}", toon.stderr);
+    assert_eq!(toon_rust::try_decode(&toon.stdout, None)?, targets.into());
+
+    let before = std::fs::read(&harness.config_path)?;
+    for domain in [
+        "CUSTOMER.EXAMPLE.INVALID",
+        "https://bad.invalid",
+        "bad.invalid:443",
+        "bad..invalid",
+        "*.bad.invalid",
+        "bad.invalid/path",
+    ] {
+        let result = harness.run_command(&["targets", "add", domain]);
+        assert!(!result.success, "accepted {domain}");
+        assert_eq!(
+            std::fs::read(&harness.config_path)?,
+            before,
+            "failed mutation changed config"
+        );
+    }
+    let removed = harness.run_command(&["targets", "remove", "CUSTOMER.EXAMPLE.INVALID."]);
+    assert!(removed.success, "{}", removed.stderr);
+    let direct = harness.run_command(&["test", "customer.example.invalid", "--json", "--no-dns"]);
+    assert_eq!(direct.json()?["would_proxy"], false);
+    Ok(())
+}
+
+/// Fault-injected executables prove CLI error classification and config
+/// preservation. They do not establish kernel rule removal.
+#[tokio::test]
+async fn deactivate_reports_permission_failure_and_accepts_confirmed_absence() -> anyhow::Result<()>
+{
+    use std::os::unix::fs::PermissionsExt;
+    let harness = TestHarness::new().await?;
+    let added = harness.run_command(&["proxy", "add", "upstream", "http://127.0.0.1:12345"]);
+    assert!(added.success, "{}", added.stderr);
+    let activated = harness.run_command(&["activate", "upstream"]);
+    assert!(activated.success, "{}", activated.stderr);
+    let before = std::fs::read(&harness.config_path)?;
+    let bin_dir = harness.temp_dir.path().join("fault-tools");
+    std::fs::create_dir(&bin_dir)?;
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+            .arg("deactivate")
+            .env("RUST_PROXY_CONFIG", &harness.config_path)
+            .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+            .env("PATH", &bin_dir)
+            .output()
+    };
+    for (name, message, code) in [
+        (
+            "iptables",
+            "Could not fetch rule set generation id: Permission denied",
+            4,
+        ),
+        ("ipset", "Permission denied", 1),
+    ] {
+        let path = bin_dir.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{message}' >&2\nexit {code}\n"),
+        )?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let denied = run()?;
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("Permission denied"));
+    assert!(!String::from_utf8_lossy(&denied.stdout).contains("deactivated"));
+    assert_eq!(std::fs::read(&harness.config_path)?, before);
+    for (name, message) in [
+        ("iptables", "No chain/target/match by that name."),
+        ("ipset", "The set with the given name does not exist"),
+    ] {
+        std::fs::write(
+            bin_dir.join(name),
+            format!("#!/bin/sh\nprintf '%s\\n' '{message}' >&2\nexit 1\n"),
+        )?;
+    }
+    let absent = run()?;
+    assert!(
+        absent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&absent.stderr)
+    );
+    assert!(String::from_utf8_lossy(&absent.stdout).contains("deactivated"));
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
+    assert!(config.get("active_proxy").is_none());
+    Ok(())
+}

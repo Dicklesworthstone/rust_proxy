@@ -234,60 +234,88 @@ impl TargetSpec {
         }
     }
 
-    pub fn provider(&self) -> Provider {
+    pub fn provider(&self) -> Option<Provider> {
         match self {
-            TargetSpec::Detailed { provider, .. } => *provider,
-            TargetSpec::Simple(domain) => infer_provider(domain).unwrap_or(Provider::Google),
+            TargetSpec::Detailed { provider, .. } => Some(*provider),
+            TargetSpec::Simple(domain) => infer_provider(domain),
         }
     }
 }
 
-pub fn infer_provider(domain: &str) -> Option<Provider> {
-    let domain = domain.to_ascii_lowercase();
-    if domain.ends_with("anthropic.com")
-        || domain.ends_with("claude.ai")
-        || domain.ends_with("claude.com")
+/// One identity for CLI mutations, validation and routing diagnostics. A target
+/// is an ASCII DNS hostname, without a URL, port, wildcard or path.
+pub fn canonical_target_domain(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let domain = trimmed
+        .strip_suffix('.')
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label.as_bytes()[0].is_ascii_alphanumeric()
+                || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                || !label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
     {
+        anyhow::bail!("Invalid target domain '{input}': use an ASCII hostname without a scheme, port, wildcard or path");
+    }
+    Ok(domain)
+}
+
+pub fn infer_provider(domain: &str) -> Option<Provider> {
+    let domain = canonical_target_domain(domain).ok()?;
+    let matches = |suffix: &str| {
+        domain == suffix
+            || domain
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    };
+    if matches("anthropic.com") || matches("claude.ai") || matches("claude.com") {
         return Some(Provider::Anthropic);
     }
-    if domain.ends_with("openai.com")
-        || domain.ends_with("chatgpt.com")
-        || domain.ends_with("oaistatic.com")
-        || domain.ends_with("oaiusercontent.com")
-        || domain.ends_with("sora.com")
-        || domain.ends_with("openaicdn.com")
-        || domain.ends_with("openai.dev")
+    if matches("openai.com")
+        || matches("chatgpt.com")
+        || matches("oaistatic.com")
+        || matches("oaiusercontent.com")
+        || matches("sora.com")
+        || matches("openaicdn.com")
+        || matches("openai.dev")
     {
         return Some(Provider::Openai);
     }
-    if domain.ends_with("amazon.com")
-        || domain.ends_with("amazonaws.com")
-        || domain.ends_with("aws.amazon.com")
-        || domain.ends_with("awsstatic.com")
-        || domain.ends_with("cloudfront.net")
-        || domain.ends_with("awsapps.com")
+    if matches("amazon.com")
+        || matches("amazonaws.com")
+        || matches("aws.amazon.com")
+        || matches("awsstatic.com")
+        || matches("cloudfront.net")
+        || matches("awsapps.com")
     {
         return Some(Provider::Amazon);
     }
-    if domain.ends_with("cloudflare.com")
-        || domain.ends_with("cloudflareinsights.com")
-        || domain.ends_with("cloudflareaccess.com")
-        || domain.ends_with("cloudflarestatus.com")
+    if matches("cloudflare.com")
+        || matches("cloudflareinsights.com")
+        || matches("cloudflareaccess.com")
+        || matches("cloudflarestatus.com")
     {
         return Some(Provider::Cloudflare);
     }
-    if domain.ends_with("vercel.com") || domain.ends_with("vercel.app") {
+    if matches("vercel.com") || matches("vercel.app") {
         return Some(Provider::Vercel);
     }
-    if domain.ends_with("supabase.com") || domain.ends_with("supabase.co") {
+    if matches("supabase.com") || matches("supabase.co") {
         return Some(Provider::Supabase);
     }
-    if domain.ends_with("google.com")
-        || domain.ends_with("gstatic.com")
-        || domain.ends_with("googleapis.com")
-        || domain.ends_with("ggpht.com")
-        || domain.ends_with("googleusercontent.com")
-        || domain.ends_with("withgoogle.com")
+    if matches("google.com")
+        || matches("gstatic.com")
+        || matches("googleapis.com")
+        || matches("ggpht.com")
+        || matches("googleusercontent.com")
+        || matches("withgoogle.com")
     {
         return Some(Provider::Google);
     }
@@ -1085,6 +1113,14 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
+    // Match the explicit config-path override with a separately selectable
+    // state directory. Operators and concurrent CLI tests must not share the
+    // default stats file when they request an isolated state location.
+    if let Some(path) = std::env::var_os("RUST_PROXY_STATE_DIR") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
     let proj = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME)
         .context("Failed to resolve project dirs")?;
     let dir = proj.state_dir().context("Failed to resolve state dir")?;
@@ -1789,7 +1825,7 @@ fn diff_settings(old: &Settings, new: &Settings, diff: &mut ConfigDiff) {
 pub(crate) mod tests {
     use super::*;
 
-    /// Serialize env-var mutations; RUST_PROXY_CONFIG is process-global.
+    /// Serialize path-override mutations; environment variables are process-global.
     /// pub(crate) so other modules' tests (util service-file round trip)
     /// share it.
     pub(crate) static CONFIG_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -1825,6 +1861,29 @@ pub(crate) mod tests {
         let state = state_dir().unwrap();
         std::env::remove_var("RUST_PROXY_CONFIG");
         assert!(!state.ends_with("rp-test-state-probe"));
+    }
+
+    #[test]
+    fn state_directory_override_wins_and_empty_value_uses_xdg_default() {
+        let _guard = CONFIG_ENV_LOCK.lock();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("RUST_PROXY_STATE_DIR", value),
+                    None => std::env::remove_var("RUST_PROXY_STATE_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("RUST_PROXY_STATE_DIR"));
+        std::env::set_var("RUST_PROXY_STATE_DIR", "/tmp/rp-private-state");
+        assert_eq!(state_dir().unwrap(), PathBuf::from("/tmp/rp-private-state"));
+        std::env::set_var("RUST_PROXY_STATE_DIR", "");
+        let default = state_dir().unwrap();
+        assert!(default.is_absolute());
+        assert_ne!(default, PathBuf::from("/tmp/rp-private-state"));
+        std::env::remove_var("RUST_PROXY_STATE_DIR");
+        assert_eq!(state_dir().unwrap(), default);
     }
 
     #[test]
@@ -1929,19 +1988,53 @@ pub(crate) mod tests {
             provider: Provider::Anthropic,
         };
         assert_eq!(target.domain(), "api.anthropic.com");
-        assert_eq!(target.provider(), Provider::Anthropic);
+        assert_eq!(target.provider(), Some(Provider::Anthropic));
     }
 
     #[test]
     fn test_target_spec_simple_infers_provider() {
         let target = TargetSpec::Simple("api.openai.com".to_string());
-        assert_eq!(target.provider(), Provider::Openai);
+        assert_eq!(target.provider(), Some(Provider::Openai));
     }
 
     #[test]
-    fn test_target_spec_simple_defaults_to_google() {
+    fn test_target_spec_simple_unknown_has_no_provider() {
         let target = TargetSpec::Simple("unknown.example.org".to_string());
-        assert_eq!(target.provider(), Provider::Google);
+        assert_eq!(target.provider(), None);
+    }
+
+    #[test]
+    fn target_identity_and_provider_suffix_boundaries() {
+        assert_eq!(
+            canonical_target_domain("  Customer.Example.Invalid.  ").unwrap(),
+            "customer.example.invalid"
+        );
+        for bad in [
+            "",
+            ".",
+            "example..com",
+            "example.com..",
+            "https://example.com",
+            "example.com:443",
+            "*.example.com",
+            "-example.com",
+            "example-.com",
+            "éxample.com",
+            "example.com/path",
+            "example.com@evil.invalid",
+        ] {
+            assert!(canonical_target_domain(bad).is_err(), "accepted {bad}");
+        }
+        assert!(canonical_target_domain(&format!("{}.com", "a".repeat(64))).is_err());
+        assert_eq!(infer_provider("api.OPENAI.com."), Some(Provider::Openai));
+        for domain in [
+            "notopenai.com",
+            "openaicom.invalid",
+            "fakegoogle.com",
+            "notvercel.app",
+        ] {
+            assert_eq!(infer_provider(domain), None, "false provider for {domain}");
+        }
     }
 
     #[test]
