@@ -178,7 +178,12 @@ async fn check_proxy_get(upstream: &UpstreamProxy, url: &str) -> Result<()> {
         if !early.is_empty() {
             anyhow::bail!("Unexpected bytes before health-check TLS ClientHello");
         }
-        let native = rustls_native_certs::load_native_certs();
+        // Native trust loading performs filesystem I/O. Keep the async probe's
+        // deadline and the daemon's signal supervisor runnable even if it stalls.
+        // The executable also bounds blocking-pool shutdown to three seconds.
+        let native = tokio::task::spawn_blocking(rustls_native_certs::load_native_certs)
+            .await
+            .context("Native health TLS trust loader failed")?;
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
         for cert in native.certs {
             roots
@@ -479,6 +484,17 @@ mod tests {
     use base64::Engine as _;
     use tokio::io::AsyncReadExt;
 
+    struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
     async fn read_request<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<String> {
         let mut bytes = Vec::new();
         while !bytes.ends_with(b"\r\n\r\n") {
@@ -523,15 +539,6 @@ mod tests {
         let env_pass = "RUST_PROXY_HEALTH_SOURCE_TEST_PASS";
         let old_user = std::env::var_os(env_user);
         let old_pass = std::env::var_os(env_pass);
-        struct RestoreEnv(&'static str, Option<std::ffi::OsString>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(value) => std::env::set_var(self.0, value),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
         let _user_guard = RestoreEnv(env_user, old_user);
         let _pass_guard = RestoreEnv(env_pass, old_pass);
         std::env::set_var(env_user, "env-user");

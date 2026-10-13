@@ -7,6 +7,95 @@ use crate::common::fixtures;
 use crate::common::mock_proxy::{MockBehavior, MockProxy};
 use crate::common::TestHarness;
 
+/// Child-only trust environment: never affect concurrent feed-client tests.
+/// The trust FIFO has no writer or fixture timeout. Only the product's probe
+/// deadline and bounded runtime shutdown can produce the asserted result.
+#[tokio::test]
+async fn stalled_native_trust_read_cannot_block_health_deadline() -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let harness = TestHarness::new().await?;
+    let work = tempfile::tempdir()?.keep();
+    let fifo = work.join("stalled-trust.pem");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes())?;
+    // SAFETY: live NUL-terminated test-owned pathname and ordinary mode bits.
+    anyhow::ensure!(
+        unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == 0,
+        "failed creating private trust FIFO"
+    );
+    let empty_roots = work.join("empty-trust-dir");
+    std::fs::create_dir(&empty_roots)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    assert!(
+        harness
+            .run_command(&["proxy", "add", "trust-probe", &url])
+            .success
+    );
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
+    let settings = config["settings"].as_table_mut().unwrap();
+    settings.insert(
+        "health_check_target".into(),
+        "GET https://localhost/health".into(),
+    );
+    settings.insert("health_check_timeout_ms".into(), 200.into());
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let endpoint = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await?;
+            request.push(byte[0]);
+            anyhow::ensure!(
+                request.len() <= 16 * 1024,
+                "trust probe request exceeded fixture cap"
+            );
+        }
+        anyhow::ensure!(
+            request.starts_with(b"CONNECT localhost:443 HTTP/1.1\r\n"),
+            "trust fixture did not receive CONNECT"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 Established\r\n\r\n")
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+        .args(["check", "--json", "--test-connectivity"])
+        .env("RUST_PROXY_CONFIG", &harness.config_path)
+        .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+        .env("SSL_CERT_FILE", &fifo)
+        .env("SSL_CERT_DIR", &empty_roots)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() < Duration::from_secs(6) => {
+                tokio::time::sleep(Duration::from_millis(25)).await
+            }
+            outcome => {
+                let _ = child.kill();
+                let output = child.wait_with_output()?;
+                endpoint.abort();
+                anyhow::bail!("trust probe exceeded product lifetime or failed polling: {outcome:?}; stderr: {}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
+    }
+    let output = child.wait_with_output()?;
+    assert!(output.status.success(), "trust probe CLI failed");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["connectivity"][0]["status"], "timeout");
+    assert_eq!(report["connectivity"][0]["error"], "Connection timeout");
+    assert!(start.elapsed() < Duration::from_secs(6));
+    tokio::time::timeout(Duration::from_secs(1), endpoint).await???;
+    Ok(())
+}
+
 #[tokio::test]
 async fn proxy_credentials_are_redacted_without_modifying_persisted_configuration(
 ) -> anyhow::Result<()> {
