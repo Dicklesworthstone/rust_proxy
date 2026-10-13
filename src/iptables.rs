@@ -101,14 +101,13 @@ fn is_missing(err: &anyhow::Error, program: &str, jump: bool) -> bool {
             .stderr
             .contains("The set with the given name does not exist");
     }
-    failure
-        .stderr
-        .contains("No chain/target/match by that name")
-        || failure.stderr.contains("does not exist") && failure.stderr.contains("chain")
-        || jump
-            && failure
-                .stderr
-                .contains("Bad rule (does a matching rule exist in that chain?)")
+    let stderr = failure.stderr.to_ascii_lowercase();
+    if stderr.contains("permission denied") || stderr.contains("operation not permitted") {
+        return false;
+    }
+    stderr.contains("no chain/target/match by that name")
+        || stderr.contains("does not exist") && stderr.contains("chain")
+        || jump && stderr.contains("bad rule (does a matching rule exist in that chain?)")
 }
 
 fn remove_output_jumps(chain_name: &str) -> Result<()> {
@@ -358,16 +357,23 @@ pub fn clear_rules(chain_name: &str, ipset_name: &str) -> Result<()> {
     validate_ipset_name(ipset_name)?;
     let mut errors = Vec::new();
     if let Err(err) = remove_output_jumps(chain_name) {
-        errors.push(err.to_string());
+        errors.push(format!("{err:#}"));
     }
-    for (program, args) in [
+    let temporary_name = format!("{ipset_name}_tmp");
+    let mut commands = vec![
         ("iptables", vec!["-t", "nat", "-F", chain_name]),
         ("iptables", vec!["-t", "nat", "-X", chain_name]),
         ("ipset", vec!["destroy", ipset_name]),
-    ] {
+    ];
+    // A failed restore or interrupted swap may leave this owned scratch set.
+    // Older maximum-length primary names could never have a valid scratch name.
+    if ipset_name.len() <= 27 {
+        commands.push(("ipset", vec!["destroy", temporary_name.as_str()]));
+    }
+    for (program, args) in commands {
         if let Err(err) = run(program, &args) {
             if !is_missing(&err, program, false) {
-                errors.push(err.to_string());
+                errors.push(format!("{err:#}"));
             }
         }
     }
@@ -731,6 +737,7 @@ mod tests {
                     v(&["-t", "nat", "-X", "RUST_PROXY_CHAIN"]),
                 ),
                 ("ipset".into(), v(&["destroy", "rust_proxy_set"])),
+                ("ipset".into(), v(&["destroy", "rust_proxy_set_tmp"])),
             ]
         );
     }
@@ -775,6 +782,21 @@ mod tests {
                 stderr: failure.into(),
             });
             assert!(!is_missing(&err, "iptables", true));
+        }
+        for code in [1, 2] {
+            let missing = anyhow::Error::from(CommandFailure {
+                program: "iptables".into(),
+                code: Some(code),
+                stderr: "iptables v1.8.11 (nf_tables): Chain 'RP' does not exist".into(),
+            });
+            assert!(is_missing(&missing, "iptables", true));
+            assert!(is_missing(&missing, "iptables", false));
+            let denied = anyhow::Error::from(CommandFailure {
+                program: "iptables".into(),
+                code: Some(code),
+                stderr: "Chain 'RP' does not exist: Permission denied".into(),
+            });
+            assert!(!is_missing(&denied, "iptables", true));
         }
         with_test_spawn(
             |_, _, _| bail!("Could not execute firewall tool"),

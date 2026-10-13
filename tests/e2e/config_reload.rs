@@ -9,8 +9,8 @@
 //!    last-known-good configuration and logs why.
 //!
 //! NO-CLAIM: `RUST_PROXY_TEST_MODE=1` skips all firewall mutations, so the
-//! ipset-sync leg of reload pickup is NOT exercised here (that behavior is
-//! pinned by unit golden tests over `sync_ipset`). The observable used is
+//! ipset-sync leg of reload pickup is NOT exercised here; command-generation
+//! unit tests do not establish that runtime leg. The observable used is
 //! which upstream mock serves each tunneled connection, which exercises the
 //! exact per-accept `config_rx.borrow()` snapshot the production path uses.
 
@@ -35,6 +35,7 @@ const RELOAD_BUDGET: Duration = Duration::from_secs(10);
 
 fn require_non_root() {
     if unsafe { libc::geteuid() } == 0 {
+        // ubs:ignore[rust.ownership.panic-macro] — deliberately fails when the rootless privilege negative control would be invalid.
         panic!("test-seam reload tests must run as a non-root user");
     }
 }
@@ -146,25 +147,23 @@ async fn wait_for_listener(addr: std::net::SocketAddr) -> Result<()> {
     }
 }
 
-/// One tunnel attempt through the listener; returns when the echo round trip
-/// completes or errors/times out (callers treat both as "attempted").
-async fn tunnel_attempt(addr: std::net::SocketAddr) {
-    let mut client = match TcpStream::connect(addr).await {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if client.write_all(PAYLOAD).await.is_err() {
-        return;
-    }
-    let _ = client.flush().await;
+/// Require useful byte-exact traffic; a failed attempt is never a success.
+async fn tunnel_attempt(addr: std::net::SocketAddr) -> Result<()> {
+    let mut client = TcpStream::connect(addr).await?;
+    client.write_all(PAYLOAD).await?;
+    client.flush().await?;
     let mut echoed = vec![0u8; PAYLOAD.len()];
-    let _ = tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut echoed)).await;
+    tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut echoed)).await??;
+    anyhow::ensure!(echoed == PAYLOAD, "reload tunnel corrupted the payload");
+    Ok(())
 }
 
 fn assert_alive(child: &mut Child, context: &str) {
     match child.try_wait() {
         Ok(None) => {}
+        // ubs:ignore[rust.ownership.panic-macro] — fails the test if the supervised daemon exited before the required phase.
         Ok(Some(status)) => panic!("daemon exited unexpectedly ({context}): {status}"),
+        // ubs:ignore[rust.ownership.panic-macro] — fails the test when process status cannot be checked.
         Err(err) => panic!("daemon wait failed ({context}): {err}"),
     }
 }
@@ -185,6 +184,7 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
     let mut child = ChildGuard(spawn_daemon(&home, &stderr_path)?);
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse()?;
     if let Err(err) = wait_for_listener(listen_addr).await {
+        // ubs:ignore[rust.ownership.panic-macro] — preserves the startup failure assertion and its actual daemon diagnostics.
         panic!(
             "daemon failed to boot: {err:#}\n--- stderr ---\n{}",
             read_stderr(&stderr_path)
@@ -192,14 +192,21 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
     }
 
     // Baseline: traffic reaches mock-a only.
-    tunnel_attempt(listen_addr).await;
+    tunnel_attempt(listen_addr)
+        .await
+        .with_context(|| format!("baseline tunnel failed\n{}", read_stderr(&stderr_path)))?;
     tokio::time::timeout(Duration::from_secs(5), async {
         while mock_a.get_requests().is_empty() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .context("baseline CONNECT never reached mock-a")?;
+    .with_context(|| {
+        format!(
+            "baseline CONNECT never reached mock-a\n{}",
+            read_stderr(&stderr_path)
+        )
+    })?;
     assert!(mock_b.get_requests().is_empty());
 
     // Edit the config on disk: swap the proxy set to mock-b.
@@ -214,12 +221,15 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
     while mock_b.get_requests().is_empty() {
         assert_alive(&mut child.0, "while awaiting reload pickup");
         if tokio::time::Instant::now() >= deadline {
+            // ubs:ignore[rust.ownership.panic-macro] — fails the reload acceptance test at its unchanged deadline.
             panic!(
                 "hot-reloaded proxy set never took effect\n--- stderr ---\n{}",
                 read_stderr(&stderr_path)
             );
         }
-        tunnel_attempt(listen_addr).await;
+        tunnel_attempt(listen_addr).await.with_context(|| {
+            format!("tunnel failed during reload\n{}", read_stderr(&stderr_path))
+        })?;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -264,7 +274,9 @@ async fn invalid_config_edit_keeps_last_known_good() -> Result<()> {
 
     // Daemon alive, still serving, routed to the original proxy.
     assert_alive(&mut child.0, "after invalid config edit");
-    tunnel_attempt(listen_addr).await;
+    tunnel_attempt(listen_addr)
+        .await
+        .with_context(|| format!("last-good tunnel failed\n{}", read_stderr(&stderr_path)))?;
     tokio::time::timeout(Duration::from_secs(5), async {
         while mock_a.get_requests().is_empty() {
             tokio::time::sleep(Duration::from_millis(50)).await;

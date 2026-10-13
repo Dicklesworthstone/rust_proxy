@@ -79,14 +79,12 @@ impl ConfigWatcher {
         )
         .context("Failed to create file watcher")?;
 
-        // Watch the config file's parent directory if the file doesn't exist yet,
-        // otherwise watch the file directly. This handles the case where the file
-        // might be deleted and recreated (common with atomic saves).
-        let watch_path = if config_path.exists() {
-            config_path
-        } else {
-            config_path.parent().unwrap_or(Path::new("."))
-        };
+        // Atomic saves replace the file inode. Watch its parent throughout;
+        // watching the old file would stop observing the next replacement.
+        let watch_path = config_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
 
         watcher
             .watch(watch_path, RecursiveMode::NonRecursive)
@@ -296,6 +294,34 @@ mod tests {
         // Should still succeed by watching the parent directory
         let watcher = ConfigWatcher::new(&config_path);
         assert!(watcher.is_ok());
+    }
+
+    #[test]
+    fn live_notify_backend_survives_repeated_atomic_config_replacement() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        fs::write(&path, "generation = 0\n").unwrap();
+        let mut watcher =
+            ConfigWatcher::with_options(&path, Duration::from_millis(50), Duration::ZERO).unwrap();
+        for generation in 1..=3 {
+            let replacement = temp_dir.path().join(format!("replacement-{generation}"));
+            fs::write(&replacement, format!("generation = {generation}\n")).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut observed = false;
+            while Instant::now() < deadline {
+                if watcher.poll() {
+                    observed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(observed, "atomic replacement {generation} was not observed");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("generation = {generation}\n")
+            );
+        }
     }
 
     fn modify_event(path: &Path) -> Result<Event, notify::Error> {

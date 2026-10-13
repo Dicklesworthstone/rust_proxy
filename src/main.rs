@@ -3451,8 +3451,18 @@ async fn run_daemon() -> Result<()> {
     } else {
         tracing::info!("test mode: skipping root privilege requirement");
     }
-    let config = AppConfig::load()?;
     let watch_config_path = config::config_path()?;
+    // Subscribe before reading the startup snapshot or advertising a listener.
+    // Otherwise an edit after that read but before the spawned watcher starts
+    // can be lost for the lifetime of the daemon.
+    let mut config_watcher =
+        watcher::ConfigWatcher::new(&watch_config_path).with_context(|| {
+            format!(
+                "Failed watching configuration before startup: {}",
+                watch_config_path.display()
+            )
+        })?;
+    let config = AppConfig::load()?;
     let report = validation::validate_config(&config, &watch_config_path);
     if report.has_errors() {
         bail!(
@@ -3848,19 +3858,9 @@ async fn run_daemon() -> Result<()> {
     let watcher_tx = config_tx.clone();
     let watcher_path = watch_config_path.clone();
     let watcher_task = tokio::spawn(async move {
-        let mut watcher = match watcher::ConfigWatcher::new(&watcher_path) {
-            Ok(w) => w,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "Failed to create config file watcher; hot-reload disabled until restart"
-                );
-                return;
-            }
-        };
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if watcher.poll() {
+            if config_watcher.poll() {
                 reload_config_once(&watcher_tx, &watcher_path).await;
             }
         }
