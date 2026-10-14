@@ -672,10 +672,70 @@ fn list_cmd(output: &OutputDispatcher) -> Result<()> {
 }
 
 fn status_cmd(output: &OutputDispatcher) -> Result<()> {
-    let config = AppConfig::load()?;
+    let config_path = config::config_path()?;
+    let observed = state::observe_runtime(&config_path);
+    let configured = load_config_for_reload(&config_path);
+    let configured_error = configured.as_ref().err().map(ToString::to_string);
+    let configured = configured.ok();
+    let live = observed.snapshot.as_ref().filter(|_| observed.ready());
+    let config = live
+        .map(|snapshot| snapshot.applied.config.clone())
+        .or_else(|| configured.clone());
     let state_path = state::state_path()?;
     let state = State::load(&state_path)?;
-    let rules_active = iptables::chain_present(&config.settings.chain_name);
+    let inspected = observed
+        .snapshot
+        .as_ref()
+        .map(|snapshot| &snapshot.applied.config)
+        .or(config.as_ref());
+    let rules_active = if observed
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.test_mode)
+    {
+        Some(false)
+    } else {
+        inspected.and_then(|inspected| {
+            iptables::routing_rules_active(
+                &inspected.settings.chain_name,
+                &inspected.settings.ipset_name,
+                inspected.settings.listen_port,
+            )
+            .ok()
+        })
+    };
+    let Some(config) = config else {
+        if output.mode().is_json() {
+            output.print_json(&serde_json::json!({
+                "active_proxy": null,
+                "configured_proxy": null,
+                "applied_proxy": null,
+                "effective_proxy": null,
+                "configured_config_error": configured_error,
+                "daemon_running": false,
+                "daemon": observed,
+                "rules_active": rules_active,
+                "targets": null,
+                "proxy_health": [],
+                "stats": state,
+            }));
+        } else {
+            println!(
+                "Configured file unavailable: {}",
+                configured_error.as_deref().unwrap_or("not initialized")
+            );
+            println!("Daemon: {}", observed.status);
+            println!(
+                "Rules active: {}",
+                match rules_active {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unavailable",
+                }
+            );
+        }
+        return Ok(());
+    };
 
     if output.mode().is_json() {
         // Build health info for JSON output
@@ -683,7 +743,7 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
             .proxies
             .iter()
             .map(|p| {
-                let stats = state.proxies.get(&p.id);
+                let stats = live.and_then(|snapshot| snapshot.proxy_health.get(&p.id)).or_else(|| if live.is_none() { state.proxies.get(&p.id) } else { None });
                 serde_json::json!({
                     "id": p.id,
                     "status": stats.map(|s| s.health_status.to_string()).unwrap_or_else(|| "unknown".to_string()),
@@ -699,20 +759,28 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
             .collect();
 
         let active_health = config.active_proxy.as_ref().and_then(|id| {
-            state.proxies.get(id).map(|stats| {
-                serde_json::json!({
-                    "status": stats.health_status.to_string(),
-                    "last_check": stats.last_health_check,
-                    "latency_ms": stats.ping_avg_ms,
-                    "consecutive_failures": stats.consecutive_failures,
+            live.and_then(|snapshot| snapshot.proxy_health.get(id))
+                .or_else(|| {
+                    if live.is_none() {
+                        state.proxies.get(id)
+                    } else {
+                        None
+                    }
                 })
-            })
+                .map(|stats| {
+                    serde_json::json!({
+                        "status": stats.health_status.to_string(),
+                        "last_check": stats.last_health_check,
+                        "latency_ms": stats.ping_avg_ms,
+                        "consecutive_failures": stats.consecutive_failures,
+                    })
+                })
         });
 
         // Build load balancing info
         let load_balancing = serde_json::json!({
             "strategy": format!("{:?}", config.settings.load_balance_strategy).to_lowercase(),
-            "note": "Selection stats only available when daemon is running"
+            "selections": live.map(|snapshot| &snapshot.selections),
         });
 
         // Build degradation policy info
@@ -720,12 +788,20 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
             "policy": format!("{:?}", config.settings.degradation_policy).to_lowercase(),
             "delay_secs": config.settings.degradation_delay_secs,
             "allow_direct_fallback": config.settings.allow_direct_fallback,
-            "note": "Live degradation status only available when daemon is running"
+            "active": live.map(|snapshot| snapshot.runtime.degradation_active),
         });
 
         let payload = serde_json::json!({
             "active_proxy": config.active_proxy,
+            "active_proxy_source": if live.is_some() { "applied" } else { "configured" },
+            "configured_proxy": configured.as_ref().and_then(|config| config.active_proxy.as_ref()),
+            "configured_config_error": configured_error,
+            "applied_proxy": live.and_then(|snapshot| snapshot.applied.config.active_proxy.as_ref()),
+            "effective_proxy": live.and_then(|snapshot| snapshot.runtime.effective_proxy.as_ref()),
+            "daemon_running": observed.ready(),
+            "daemon": observed,
             "active_proxy_health": active_health,
+            "proxy_health_source": if live.is_some() { "live_runtime" } else { "persisted_history" },
             "rules_active": rules_active,
             "health_check_enabled": config.settings.health_check_enabled,
             "auto_failover": config.settings.auto_failover,
@@ -745,11 +821,70 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
         .active_proxy
         .clone()
         .unwrap_or_else(|| "-".to_string());
-    println!("Active proxy: {}", active);
+    println!(
+        "Configured proxy: {}",
+        configured
+            .as_ref()
+            .and_then(|config| config.active_proxy.as_deref())
+            .unwrap_or("-")
+    );
+    println!(
+        "Applied proxy: {}",
+        if live.is_some() {
+            active.as_str()
+        } else {
+            "unavailable"
+        }
+    );
+    println!("Daemon: {}", observed.status);
+    if let Some(snapshot) = live {
+        println!(
+            "Effective proxy: {}",
+            snapshot.runtime.effective_proxy.as_deref().unwrap_or("-")
+        );
+        println!(
+            "Applied configuration generation: {}",
+            snapshot.applied.config_generation
+        );
+        println!(
+            "Routing generation: {} ({} ipset entries)",
+            snapshot.applied.routing_generation, snapshot.applied.ipset_entry_count
+        );
+        println!("Last reload: {}", snapshot.applied.last_reload_result);
+        for source in &snapshot.applied.sources {
+            println!(
+                "Source {}: {} entries, {}, last success {}",
+                source.source,
+                source.entry_count,
+                if source.stale { "stale" } else { "fresh" },
+                source
+                    .last_success_at
+                    .map_or_else(|| "unavailable".into(), |time| time.to_rfc3339())
+            );
+        }
+        if !snapshot.applied.pending_restart_fields.is_empty() {
+            println!(
+                "Pending restart: {}",
+                snapshot.applied.pending_restart_fields.join(", ")
+            );
+        }
+    }
+    if let Some(error) = configured_error {
+        println!("Configured file unavailable: {error}");
+    }
 
     // Show active proxy health if available
     if let Some(ref active_id) = config.active_proxy {
-        if let Some(stats) = state.proxies.get(active_id) {
+        let stats = live
+            .and_then(|snapshot| snapshot.proxy_health.get(active_id))
+            .or_else(|| {
+                if live.is_none() {
+                    state.proxies.get(active_id)
+                } else {
+                    None
+                }
+            });
+        if let Some(stats) = stats {
             let health_str = format_health_status(stats.health_status);
             let last_check = format_time_ago(stats.last_health_check);
             let latency = stats
@@ -763,7 +898,14 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
         }
     }
 
-    println!("Rules active: {}", if rules_active { "yes" } else { "no" });
+    println!(
+        "Rules active: {}",
+        match rules_active {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unavailable",
+        }
+    );
     println!("Targets: {}", config.targets.len());
 
     // Show load balancing configuration
@@ -791,6 +933,16 @@ fn status_cmd(output: &OutputDispatcher) -> Result<()> {
     println!(
         "Degradation: {} (delay: {}s)",
         degradation_str, config.settings.degradation_delay_secs
+    );
+    println!(
+        "Degradation active: {}",
+        live.map_or("unavailable", |snapshot| {
+            if snapshot.runtime.degradation_active {
+                "yes"
+            } else {
+                "no"
+            }
+        })
     );
 
     // Show health summary if health checks are enabled and there are proxies
@@ -2258,13 +2410,15 @@ async fn find_provider_match(
     None
 }
 
-/// Check if daemon is running by attempting to connect to the listen port
-fn is_daemon_running(port: u16) -> bool {
-    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-}
-
 async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatcher) -> Result<()> {
-    let config = AppConfig::load()?;
+    let config_path = config::config_path()?;
+    let observed = state::observe_runtime(&config_path);
+    let live = observed.snapshot.as_ref().filter(|_| observed.ready());
+    let config = if let Some(snapshot) = live {
+        snapshot.applied.config.clone()
+    } else {
+        load_config_for_reload(&config_path)?
+    };
 
     let domain = config::canonical_target_domain(&extract_domain(url)?)?;
     let verbose = verbose && !output.mode().is_json();
@@ -2356,22 +2510,21 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
     };
 
     // Check daemon status
-    let daemon_running = is_daemon_running(config.settings.listen_port);
+    let daemon_running = observed.ready();
 
     if verbose {
         println!("[4/5] Checking daemon status...");
         if daemon_running {
             println!("      {} Daemon is running", "✓".green());
         } else {
-            println!("      Daemon is not running");
-            println!("      (ipset rules not active until daemon runs)");
+            println!("      Daemon observation: {}", observed.status);
         }
         println!();
     }
 
     // Check provider IP ranges
     let mut provider_range_matches = Vec::new();
-    if !no_dns && !resolved_ips.is_empty() {
+    if live.is_none() && !no_dns && !resolved_ips.is_empty() {
         if verbose {
             println!("[5/5] Checking provider IP ranges...");
         }
@@ -2412,7 +2565,10 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
     }
 
     // Get active proxy info
-    let active_proxy = config.active_proxy.as_ref().and_then(|id| {
+    let selected_id = live
+        .and_then(|snapshot| snapshot.runtime.effective_proxy.as_ref())
+        .or(config.active_proxy.as_ref());
+    let active_proxy = selected_id.and_then(|id| {
         config
             .proxies
             .iter()
@@ -2421,7 +2577,39 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
     });
 
     // Determine final routing decision
-    let would_proxy = domain_in_targets || !provider_range_matches.is_empty();
+    let live_ipset_match = live
+        .filter(|snapshot| !snapshot.test_mode && !resolved_ips.is_empty())
+        .and_then(|snapshot| {
+            let settings = &snapshot.applied.config.settings;
+            let active = iptables::routing_rules_active(
+                &settings.chain_name,
+                &settings.ipset_name,
+                settings.listen_port,
+            )
+            .ok()?;
+            if !active {
+                return Some(false);
+            }
+            let members = iptables::ipset_members(&settings.ipset_name).ok()?;
+            let excluded = iptables::destination_exclusions(&settings.chain_name).ok()?;
+            Some(resolved_ips.iter().any(|ip| {
+                !excluded
+                    .iter()
+                    .any(|entry| ip == entry || ip_in_cidr(ip, entry))
+                    && members
+                        .iter()
+                        .any(|entry| ip == entry || ip_in_cidr(ip, entry))
+            }))
+        });
+    let would_proxy =
+        live_ipset_match.unwrap_or(domain_in_targets || !provider_range_matches.is_empty());
+    let prediction_basis = if live_ipset_match.is_some() {
+        "live_ipset"
+    } else if daemon_running {
+        "applied_config_prediction"
+    } else {
+        "configured_config_prediction"
+    };
 
     let decision = RoutingDecision {
         input: displayed_input,
@@ -2438,9 +2626,22 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
 
     // Output
     if output.mode().is_json() {
-        output_test_json(&decision, output)?;
+        let mut payload = test_decision_payload(&decision);
+        payload["daemon"] = serde_json::to_value(&observed)?;
+        payload["prediction_basis"] = prediction_basis.into();
+        payload["live_ipset_match"] = serde_json::json!(live_ipset_match);
+        payload["applied_proxy"] = serde_json::json!(live.and_then(|snapshot| snapshot
+            .applied
+            .config
+            .active_proxy
+            .as_ref()));
+        payload["effective_proxy"] =
+            serde_json::json!(live.and_then(|snapshot| snapshot.runtime.effective_proxy.as_ref()));
+        output.print_json(&payload);
     } else {
         output_test_standard(&decision, verbose);
+        println!("Routing basis: {prediction_basis}");
+        println!("Daemon observation: {}", observed.status);
     }
 
     Ok(())
@@ -2473,12 +2674,6 @@ fn test_decision_payload(decision: &RoutingDecision) -> serde_json::Value {
         "daemon_running": decision.daemon_running,
         "suggestions": build_suggestions(decision)
     })
-}
-
-fn output_test_json(decision: &RoutingDecision, output: &OutputDispatcher) -> Result<()> {
-    let payload = test_decision_payload(decision);
-    output.print_json(&payload);
-    Ok(())
 }
 
 fn output_test_standard(decision: &RoutingDecision, verbose: bool) {
@@ -3411,7 +3606,10 @@ fn load_config_for_reload(path: &std::path::Path) -> Result<AppConfig> {
 ///
 /// Invalid configs are rejected with a warning and the last-known-good
 /// snapshot stays live.
-fn prepare_config_reload(old: &AppConfig, path: &std::path::Path) -> Option<AppConfig> {
+fn prepare_config_reload(
+    old: &AppConfig,
+    path: &std::path::Path,
+) -> Option<(AppConfig, Vec<String>)> {
     let mut new_config = match load_config_for_reload(path) {
         Ok(config) => config,
         Err(err) => {
@@ -3434,7 +3632,8 @@ fn prepare_config_reload(old: &AppConfig, path: &std::path::Path) -> Option<AppC
         return None;
     }
 
-    for field in changed_restart_required_settings(&old.settings, &new_config.settings) {
+    let pending = changed_restart_required_settings(&old.settings, &new_config.settings);
+    for field in &pending {
         tracing::warn!(
             setting = field,
             "setting '{field}' requires daemon restart to take effect"
@@ -3463,7 +3662,7 @@ fn prepare_config_reload(old: &AppConfig, path: &std::path::Path) -> Option<AppC
         .clone_from(&old.settings.metrics_path);
     new_config.settings.metrics_enabled = old.settings.metrics_enabled;
 
-    Some(new_config)
+    Some((new_config, pending.into_iter().map(str::to_owned).collect()))
 }
 
 /// One owner serializes watcher/HUP reloads and periodic routing refresh.
@@ -3540,8 +3739,9 @@ async fn routing_owner_loop(
             }
         };
         let cfg = if reload {
-            let Some(requested) = prepare_config_reload(&old, &path) else {
+            let Some((requested, _)) = prepare_config_reload(&old, &path) else {
                 metrics::record_config_reload(false);
+                context.runtime.record_reload_rejected().await;
                 continue;
             };
             Arc::new(requested)
@@ -3580,21 +3780,25 @@ async fn routing_owner_loop(
         let latest = prepare_config_reload(&old, &path);
         if latest
             .as_ref()
-            .is_some_and(|latest| !latest.settings.routing_enabled)
+            .is_some_and(|(latest, _)| !latest.settings.routing_enabled)
         {
             return Ok(RoutingOwnerExit::Deactivated);
         }
-        if let Some(latest) = latest {
+        let pending_restart = if let Some((latest, pending)) = latest {
             // Compare validated, pinned values without exposing serialized
             // credentials. An editor/CLI change cannot commit a stale stage.
             if toml::to_string(&latest)? != toml::to_string(cfg.as_ref())? {
                 pending_reload = true;
                 continue;
             }
+            pending
         } else if reload {
             metrics::record_config_reload(false);
+            context.runtime.record_reload_rejected().await;
             continue; // requested stage was superseded by an invalid edit
-        }
+        } else {
+            context.runtime.pending_restart_fields().await
+        };
         let generation = context.runtime.configuration_gate().write_owned().await;
         let (firewall_active, mark) = context.runtime.firewall_context().await;
         if firewall_active
@@ -3608,6 +3812,7 @@ async fn routing_owner_loop(
             tracing::warn!("Direct fallback reload requires SO_MARK; keeping applied generation");
             if reload {
                 metrics::record_config_reload(false);
+                context.runtime.record_reload_rejected().await;
             }
             continue;
         }
@@ -3624,6 +3829,7 @@ async fn routing_owner_loop(
                     tracing::warn!(%error, "Routing refresh rejected; keeping applied configuration");
                     if reload {
                         metrics::record_config_reload(false);
+                        context.runtime.record_reload_rejected().await;
                     }
                     continue;
                 }
@@ -3638,6 +3844,7 @@ async fn routing_owner_loop(
             ) {
                 if reload {
                     metrics::record_config_reload(false);
+                    context.runtime.record_reload_rejected().await;
                 }
                 if error.is::<RoutingCommitFatal>() {
                     return Err(error);
@@ -3646,6 +3853,21 @@ async fn routing_owner_loop(
                 continue;
             }
         }
+        let sources = targets
+            .snapshot_sources()
+            .into_iter()
+            .chain(upstreams.snapshot_sources())
+            .collect();
+        context
+            .runtime
+            .record_applied_config(
+                &cfg,
+                pending_restart,
+                sources,
+                targets.entries().len(),
+                reload,
+            )
+            .await;
         if reload {
             let changed = changed_observation_ids(&old, &cfg);
             context.state.invalidate_observations(&changed).await;
@@ -3687,6 +3909,31 @@ async fn routing_owner_loop(
         drop(generation);
         drop(mutation);
     }
+}
+
+async fn publish_live_runtime(
+    runtime: &RuntimeState,
+    state: &StateStore,
+    balancer: &load_balancer::LoadBalancer,
+    identity: &state::ProcessIdentity,
+    config_path: &std::path::Path,
+    test_mode: bool,
+) -> Result<()> {
+    let generation = runtime.configuration_gate().read_owned().await;
+    let snapshot = runtime
+        .capture_live_snapshot(
+            identity.clone(),
+            config_path.to_owned(),
+            state,
+            balancer.get_stats(),
+            test_mode,
+        )
+        .await?;
+    drop(generation);
+    let path = state::runtime_snapshot_path()?;
+    tokio::task::spawn_blocking(move || state::publish_runtime_snapshot(&path, &snapshot))
+        .await??;
+    Ok(())
 }
 
 /// Resources acquired by this daemon only. Kept outside spawned tasks so an
@@ -3976,6 +4223,22 @@ async fn run_daemon() -> Result<()> {
         routing_self_exempt = self_exempt;
         upstream_inventory.publish_metrics(&RouteInventory::default());
     }
+    let initial_sources = target_inventory
+        .snapshot_sources()
+        .into_iter()
+        .chain(upstream_inventory.snapshot_sources())
+        .collect();
+    runtime_state
+        .record_applied_config(
+            &config,
+            Vec::new(),
+            initial_sources,
+            target_inventory.entries().len(),
+            false,
+        )
+        .await;
+    let identity = state::ProcessIdentity::current()?;
+    let observation_config_path = util::publication_path(&watch_config_path)?;
     let flush_task = state.clone().start_flush_loop(Duration::from_secs(5));
     let (reload_requests, reload_rx) = tokio::sync::mpsc::channel(1);
     let mut routing_task = tokio::spawn(routing_owner_loop(
@@ -4064,7 +4327,7 @@ async fn run_daemon() -> Result<()> {
         config_rx.clone(),
         state.clone(),
         runtime_arc,
-        load_balancer,
+        load_balancer.clone(),
         proxy_shutdown_rx,
     ));
 
@@ -4094,6 +4357,30 @@ async fn run_daemon() -> Result<()> {
             if config_watcher.poll() {
                 let _ = watcher_requests.try_send(());
             }
+        }
+    });
+
+    runtime_state.set_ready(true).await;
+    let observed_runtime = runtime_state.clone();
+    let observed_state = state.clone();
+    let observed_balancer = load_balancer.clone();
+    let observed_identity = identity.clone();
+    let observed_path = observation_config_path.clone();
+    let observation_task = tokio::spawn(async move {
+        loop {
+            if let Err(error) = publish_live_runtime(
+                &observed_runtime,
+                &observed_state,
+                &observed_balancer,
+                &observed_identity,
+                &observed_path,
+                test_mode,
+            )
+            .await
+            {
+                tracing::warn!(%error, "Live runtime observation unavailable");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
@@ -4148,6 +4435,9 @@ async fn run_daemon() -> Result<()> {
         }
     };
     let _ = proxy_shutdown_tx.send(true);
+    observation_task.abort();
+    let _ = observation_task.await;
+    runtime_state.set_ready(false).await;
     watcher_task.abort();
     let _ = watcher_task.await;
     if !routing_finished {
@@ -4196,6 +4486,19 @@ async fn run_daemon() -> Result<()> {
         tracing::info!("test mode: skipping iptables cleanup");
     }
     let flush_result = state.flush().await;
+    let stopped_publication = publish_live_runtime(
+        &runtime_state,
+        &state,
+        &load_balancer,
+        &identity,
+        &observation_config_path,
+        test_mode,
+    );
+    match tokio::time::timeout(Duration::from_secs(1), stopped_publication).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "Stopped runtime observation unavailable"),
+        Err(_) => tracing::warn!("Stopped runtime observation exceeded its one-second budget"),
+    }
     outcome
         .and(proxy_stop)
         .and(cleanup_result)
@@ -4277,6 +4580,21 @@ struct RouteInventory {
 type SourceOutcome = (RouteSource, Result<HashSet<String>>);
 
 impl RouteInventory {
+    fn snapshot_sources(&self) -> Vec<state::RoutingSourceSnapshot> {
+        let mut sources: Vec<_> = self
+            .sources
+            .iter()
+            .map(|(source, cached)| state::RoutingSourceSnapshot {
+                source: source.label(),
+                entry_count: cached.entries.len(),
+                last_success_at: cached.last_success_at,
+                stale: cached.last_error.is_some(),
+            })
+            .collect();
+        sources.sort_by(|a, b| a.source.cmp(&b.source));
+        sources
+    }
+
     fn apply(&mut self, outcomes: Vec<SourceOutcome>) -> HashSet<String> {
         let enabled: HashSet<_> = outcomes.iter().map(|(source, _)| source.clone()).collect();
         self.sources.retain(|source, _| enabled.contains(source));
@@ -5339,7 +5657,7 @@ mod tests {
         requested.settings.metrics_enabled = !original.settings.metrics_enabled;
         requested.settings.dns_refresh_secs = 900;
         std::fs::write(&path, toml::to_string(&requested).unwrap()).unwrap();
-        let applied = prepare_config_reload(&original, &path).unwrap();
+        let applied = prepare_config_reload(&original, &path).unwrap().0;
         assert_eq!(applied.settings.listen_port, original.settings.listen_port);
         assert_eq!(applied.settings.chain_name, original.settings.chain_name);
         assert_eq!(applied.settings.ipset_name, original.settings.ipset_name);

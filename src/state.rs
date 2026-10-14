@@ -199,6 +199,251 @@ pub fn state_path() -> Result<PathBuf> {
     Ok(dir.join("state.json"))
 }
 
+/// A display projection of the applied configuration. Credentials are never
+/// published, and this projection must never be used to restart the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppliedRoutingSnapshot {
+    pub config: crate::config::AppConfig,
+    pub config_generation: u64,
+    pub routing_generation: u64,
+    pub pending_restart_fields: Vec<String>,
+    pub last_reload_result: String,
+    pub last_reload_at: Option<DateTime<Utc>>,
+    pub ipset_entry_count: usize,
+    pub sources: Vec<RoutingSourceSnapshot>,
+}
+
+fn display_health_origin(raw: &str) -> String {
+    url::Url::parse(raw)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "[invalid health URL]".into())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingSourceSnapshot {
+    pub source: String,
+    pub entry_count: usize,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub boot_id: String,
+}
+
+impl ProcessIdentity {
+    pub fn current() -> Result<Self> {
+        Ok(Self {
+            pid: std::process::id(),
+            start_ticks: process_start_ticks(std::process::id())?,
+            boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+                .trim()
+                .into(),
+        })
+    }
+
+    fn matches_live_process(&self) -> Result<bool> {
+        if fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim() != self.boot_id {
+            return Ok(false);
+        }
+        match process_start_ticks(self.pid) {
+            Ok(ticks) => Ok(ticks == self.start_ticks),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn process_start_ticks(pid: u32) -> Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    // comm may contain spaces and parentheses. Fields following its final ')'
+    // begin at field3; starttime is field22, hence index19 in this suffix.
+    stat.rsplit_once(')')
+        .context("Process stat has no command delimiter")?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .context("Process stat has no start time")?
+        .parse()
+        .context("Invalid process start time")
+}
+
+pub fn boot_time_nanos() -> Result<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: time is a valid writable timespec; CLOCK_BOOTTIME is monotonic
+    // across these processes and includes suspend, unlike wall-clock time.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    u64::try_from(time.tv_sec)?
+        .checked_mul(1_000_000_000)
+        .and_then(|secs| secs.checked_add(u64::try_from(time.tv_nsec).ok()?))
+        .context("Boot clock exceeds representable snapshot age")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveRuntimeSnapshot {
+    pub schema_version: u32,
+    pub identity: ProcessIdentity,
+    pub config_path: PathBuf,
+    pub sequence: u64,
+    pub captured_at: DateTime<Utc>,
+    pub captured_boot_nanos: u64,
+    pub ready: bool,
+    pub test_mode: bool,
+    pub applied: AppliedRoutingSnapshot,
+    pub runtime: RuntimeStateSnapshot,
+    pub proxy_health: HashMap<String, ProxyStats>,
+    pub selections: crate::load_balancer::SelectionStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeObservation {
+    pub status: String,
+    pub age_ms: Option<u64>,
+    pub snapshot: Option<LiveRuntimeSnapshot>,
+}
+
+impl RuntimeObservation {
+    pub fn ready(&self) -> bool {
+        self.status == "ready"
+    }
+}
+
+pub fn runtime_snapshot_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("runtime.json"))
+}
+
+pub fn publish_runtime_snapshot(path: &Path, snapshot: &LiveRuntimeSnapshot) -> Result<()> {
+    let _lock = crate::util::PersistenceLock::acquire(path)?;
+    if let Ok(bytes) = fs::read(path) {
+        if let Ok(previous) = serde_json::from_slice::<LiveRuntimeSnapshot>(&bytes) {
+            // A cancelled old worker must not overwrite a newer process or a
+            // stopped snapshot. Process start ticks and sequence are ordered
+            // within one boot; wall-clock corrections cannot invert them.
+            if previous.identity.boot_id == snapshot.identity.boot_id
+                && (previous.identity.start_ticks > snapshot.identity.start_ticks
+                    || previous.identity == snapshot.identity
+                        && previous.sequence >= snapshot.sequence)
+            {
+                return Ok(());
+            }
+        }
+    }
+    crate::util::atomic_write(path, serde_json::to_string_pretty(snapshot)?.as_bytes())
+}
+
+pub fn observe_runtime(config_path: &Path) -> RuntimeObservation {
+    match runtime_snapshot_path() {
+        Ok(path) => observe_runtime_at(config_path, &path),
+        Err(_) => RuntimeObservation {
+            status: "unavailable".into(),
+            age_ms: None,
+            snapshot: None,
+        },
+    }
+}
+
+fn observe_runtime_at(config_path: &Path, runtime_path: &Path) -> RuntimeObservation {
+    let observation = || -> Result<RuntimeObservation> {
+        let bytes = match fs::read(runtime_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RuntimeObservation {
+                    status: "absent".into(),
+                    age_ms: None,
+                    snapshot: None,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let snapshot: LiveRuntimeSnapshot = serde_json::from_slice(&bytes)?;
+        let expected = crate::util::publication_path(config_path)?;
+        if snapshot.schema_version != 1 || snapshot.config_path != expected {
+            return Ok(RuntimeObservation {
+                status: "foreign".into(),
+                age_ms: None,
+                snapshot: None,
+            });
+        }
+        if !snapshot.identity.matches_live_process()? {
+            return Ok(RuntimeObservation {
+                status: "dead".into(),
+                age_ms: None,
+                snapshot: Some(snapshot),
+            });
+        }
+        let age = boot_time_nanos()?.checked_sub(snapshot.captured_boot_nanos);
+        let status = if age.is_none_or(|age| age > 5_000_000_000) {
+            "stale"
+        } else if !snapshot.ready {
+            "stopped"
+        } else if process_owns_listener(
+            snapshot.identity.pid,
+            snapshot.applied.config.settings.listen_port,
+        )? {
+            "ready"
+        } else {
+            "listener_missing"
+        };
+        Ok(RuntimeObservation {
+            status: status.into(),
+            age_ms: age.map(|age| age / 1_000_000),
+            snapshot: Some(snapshot),
+        })
+    };
+    observation().unwrap_or(RuntimeObservation {
+        status: "unavailable".into(),
+        age_ms: None,
+        snapshot: None,
+    })
+}
+
+fn process_owns_listener(pid: u32, port: u16) -> Result<bool> {
+    let mut sockets = std::collections::HashSet::new();
+    for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let entry = entry?;
+        // A concurrently closing descriptor can disappear after enumeration.
+        let link = match fs::read_link(entry.path()) {
+            Ok(link) => link,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        {
+            if let Some(inode) = link
+                .to_str()
+                .and_then(|link| link.strip_prefix("socket:["))
+                .and_then(|link| link.strip_suffix(']'))
+            {
+                sockets.insert(inode.to_owned());
+            }
+        }
+    }
+    let local = format!("0100007F:{port:04X}");
+    Ok(fs::read_to_string(format!("/proc/{pid}/net/tcp"))?
+        .lines()
+        .skip(1)
+        .any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.len() > 9
+                && fields[1].eq_ignore_ascii_case(&local)
+                && fields[3] == "0A"
+                && sockets.contains(fields[9])
+        }))
+}
+
 fn add_ping_sample(stats: &mut ProxyStats, ms: f64, at: DateTime<Utc>) {
     let count = stats.ping_samples.saturating_add(1);
     stats.ping_avg_ms = Some(
@@ -443,6 +688,9 @@ impl StateStore {
 /// This manages dynamic proxy switching for failover/failback.
 #[derive(Debug, Clone)]
 struct RuntimeStateInner {
+    applied: Option<AppliedRoutingSnapshot>,
+    ready: bool,
+    observation_sequence: u64,
     /// Currently effective proxy (may differ from config during failover)
     effective_proxy: Option<String>,
     /// Original active proxy from config (for failback)
@@ -479,6 +727,9 @@ impl RuntimeState {
         Self {
             configuration_gate: Arc::new(RwLock::new(())),
             inner: Arc::new(RwLock::new(RuntimeStateInner {
+                applied: None,
+                ready: false,
+                observation_sequence: 0,
                 effective_proxy: active_proxy.clone(),
                 original_proxy: active_proxy,
                 failover_at: None,
@@ -494,6 +745,113 @@ impl RuntimeState {
 
     pub fn configuration_gate(&self) -> Arc<RwLock<()>> {
         self.configuration_gate.clone()
+    }
+
+    pub async fn record_applied_config(
+        &self,
+        config: &crate::config::AppConfig,
+        pending_restart_fields: Vec<String>,
+        sources: Vec<RoutingSourceSnapshot>,
+        ipset_entry_count: usize,
+        reload: bool,
+    ) {
+        let mut projected = config.clone();
+        for proxy in &mut projected.proxies {
+            *proxy = proxy.redacted();
+            proxy.auth = crate::config::ProxyAuth::default();
+            proxy.health_check_url = proxy.health_check_url.as_deref().map(display_health_origin);
+        }
+        if let crate::config::HealthCheckTarget::Get { url } =
+            &mut projected.settings.health_check_target
+        {
+            *url = display_health_origin(url);
+        }
+        let mut inner = self.inner.write().await;
+        let previous = inner.applied.as_ref();
+        let first = previous.is_none();
+        inner.applied = Some(AppliedRoutingSnapshot {
+            config: projected,
+            config_generation: previous
+                .map_or(0, |previous| previous.config_generation)
+                .saturating_add(u64::from(first || reload)),
+            routing_generation: previous
+                .map_or(0, |previous| previous.routing_generation)
+                .saturating_add(1),
+            pending_restart_fields,
+            last_reload_result: if reload {
+                "applied".into()
+            } else {
+                previous.map_or_else(
+                    || "never".into(),
+                    |previous| previous.last_reload_result.clone(),
+                )
+            },
+            last_reload_at: if reload {
+                Some(Utc::now())
+            } else {
+                previous.and_then(|previous| previous.last_reload_at)
+            },
+            ipset_entry_count,
+            sources,
+        });
+    }
+
+    pub async fn record_reload_rejected(&self) {
+        if let Some(applied) = &mut self.inner.write().await.applied {
+            applied.last_reload_result = "rejected".into();
+            applied.last_reload_at = Some(Utc::now());
+        }
+    }
+
+    pub async fn set_ready(&self, ready: bool) {
+        self.inner.write().await.ready = ready;
+    }
+
+    pub async fn pending_restart_fields(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .await
+            .applied
+            .as_ref()
+            .map(|applied| applied.pending_restart_fields.clone())
+            .unwrap_or_default()
+    }
+
+    pub async fn capture_live_snapshot(
+        &self,
+        identity: ProcessIdentity,
+        config_path: PathBuf,
+        state: &StateStore,
+        selections: crate::load_balancer::SelectionStats,
+        test_mode: bool,
+    ) -> Result<LiveRuntimeSnapshot> {
+        let mut health = state.live.read().await.clone();
+        let mut inner = self.inner.write().await;
+        let applied = inner
+            .applied
+            .clone()
+            .context("Runtime configuration not initialized")?;
+        health.retain(|id, _| applied.config.proxies.iter().any(|proxy| proxy.id == *id));
+        // The public surface publishes typed health observations, never opaque
+        // transport error text that could carry credentials or a health path.
+        for stats in health.values_mut() {
+            stats.last_failure_reason = None;
+        }
+        inner.observation_sequence = inner.observation_sequence.saturating_add(1);
+        Ok(LiveRuntimeSnapshot {
+            schema_version: 1,
+            identity,
+            config_path,
+            sequence: inner.observation_sequence,
+            captured_at: Utc::now(),
+            captured_boot_nanos: boot_time_nanos()?,
+            ready: inner.ready,
+            test_mode,
+            applied,
+            runtime: runtime_status_snapshot(&inner),
+            proxy_health: health,
+            selections,
+        })
     }
 
     pub async fn routing_snapshot(&self) -> Self {
@@ -690,20 +1048,24 @@ impl RuntimeState {
     #[allow(dead_code)] // Will be used by status command
     pub async fn get_status_snapshot(&self) -> RuntimeStateSnapshot {
         let inner = self.inner.read().await;
-        RuntimeStateSnapshot {
-            effective_proxy: inner.effective_proxy.clone(),
-            original_proxy: inner.original_proxy.clone(),
-            is_failed_over: inner.failover_at.is_some(),
-            failover_at: inner.failover_at,
-            last_switch_at: inner.last_switch_at,
-            degradation_active: inner.degradation_active,
-            all_unhealthy_since: inner.all_unhealthy_since,
-        }
+        runtime_status_snapshot(&inner)
+    }
+}
+
+fn runtime_status_snapshot(inner: &RuntimeStateInner) -> RuntimeStateSnapshot {
+    RuntimeStateSnapshot {
+        effective_proxy: inner.effective_proxy.clone(),
+        original_proxy: inner.original_proxy.clone(),
+        is_failed_over: inner.failover_at.is_some(),
+        failover_at: inner.failover_at,
+        last_switch_at: inner.last_switch_at,
+        degradation_active: inner.degradation_active,
+        all_unhealthy_since: inner.all_unhealthy_since,
     }
 }
 
 /// Snapshot of runtime state for display purposes
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // Will be used by status command
 pub struct RuntimeStateSnapshot {
     pub effective_proxy: Option<String>,
@@ -856,6 +1218,184 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn live_fixture(config_path: &Path, port: u16) -> Result<LiveRuntimeSnapshot> {
+        let runtime = RuntimeState::new(Some("live-observer".into()));
+        let config = crate::config::AppConfig {
+            active_proxy: Some("live-observer".into()),
+            settings: crate::config::Settings {
+                listen_port: port,
+                ..crate::config::Settings::default()
+            },
+            ..crate::config::AppConfig::default()
+        };
+        runtime
+            .record_applied_config(&config, Vec::new(), Vec::new(), 0, false)
+            .await;
+        runtime.set_ready(true).await;
+        runtime
+            .capture_live_snapshot(
+                ProcessIdentity::current()?,
+                crate::util::publication_path(config_path)?,
+                &StateStore::new_for_testing(),
+                crate::load_balancer::LoadBalancer::new().get_stats(),
+                true,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn live_observer_checks_real_listener_birth_config_and_freshness() -> Result<()> {
+        let work = tempfile::tempdir()?.keep();
+        let config = work.join("config.toml");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let snapshot = live_fixture(&config, listener.local_addr()?.port()).await?;
+        let path = work.join("live.json");
+        assert_eq!(observe_runtime_at(&config, &path).status, "absent");
+        publish_runtime_snapshot(&path, &snapshot)?;
+        assert_eq!(observe_runtime_at(&config, &path).status, "ready");
+        assert!(observe_runtime_at(&config, &path).ready());
+        assert_eq!(
+            observe_runtime_at(&work.join("different.toml"), &path).status,
+            "foreign"
+        );
+        let mut reused = snapshot.clone();
+        reused.identity.start_ticks += 1;
+        let reused_path = work.join("reused.json");
+        publish_runtime_snapshot(&reused_path, &reused)?;
+        assert_eq!(observe_runtime_at(&config, &reused_path).status, "dead");
+        let mut stale = snapshot.clone();
+        stale.captured_boot_nanos = boot_time_nanos()?
+            .checked_sub(6_000_000_000)
+            .unwrap_or(u64::MAX);
+        let stale_path = work.join("stale.json");
+        publish_runtime_snapshot(&stale_path, &stale)?;
+        assert_eq!(observe_runtime_at(&config, &stale_path).status, "stale");
+        drop(listener);
+        assert_eq!(
+            observe_runtime_at(&config, &path).status,
+            "listener_missing"
+        );
+        assert!(!observe_runtime_at(&config, &path).ready());
+        let malformed = work.join("malformed.json");
+        fs::write(&malformed, b"{invalid")?;
+        assert_eq!(
+            observe_runtime_at(&config, &malformed).status,
+            "unavailable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_publisher_cannot_resurrect_a_stopped_snapshot() -> Result<()> {
+        let work = tempfile::tempdir()?.keep();
+        let config = work.join("config.toml");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let snapshot = live_fixture(&config, listener.local_addr()?.port()).await?;
+        let path = work.join("runtime.json");
+        let mut stopped = snapshot.clone();
+        stopped.ready = false;
+        stopped.sequence += 1;
+        publish_runtime_snapshot(&path, &stopped)?;
+        publish_runtime_snapshot(&path, &snapshot)?;
+        let observed = observe_runtime_at(&config, &path);
+        assert_eq!(observed.status, "stopped");
+        assert_eq!(observed.snapshot.unwrap().sequence, stopped.sequence);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_strips_auth_and_health_paths_and_preserves_generations(
+    ) -> Result<()> {
+        let runtime = RuntimeState::new(Some("public-observer".into()));
+        let config = crate::config::AppConfig {
+            proxies: vec![crate::config::ProxyConfig {
+                id: "public-observer".into(),
+                url: "http://public-user:public-password@127.0.0.1:12345".into(),
+                auth: crate::config::ProxyAuth { username: Some("public-config-user".into()), password: Some("public-config-password".into()), username_env: Some("PUBLIC_OBSERVER_USER".into()), password_env: Some("PUBLIC_OBSERVER_PASSWORD".into()) },
+                health_check_url: Some("https://public-user:public-password@health.invalid/private-health-path?private-key=123".into()),
+                priority: None,
+                weight: 100,
+            }],
+            settings: crate::config::Settings {
+                health_check_target: crate::config::HealthCheckTarget::Get {
+                    url: "https://global-user:global-password@global.invalid/global-private-path?global-private-key=123".into(),
+                },
+                ..crate::config::Settings::default()
+            },
+            ..crate::config::AppConfig::default()
+        };
+        runtime
+            .record_applied_config(&config, vec!["listen_port".into()], Vec::new(), 1, false)
+            .await;
+        runtime.record_reload_rejected().await;
+        let state = StateStore::new_for_testing();
+        state
+            .record_health_check(
+                "public-observer",
+                false,
+                None,
+                Some("opaque-private-error".into()),
+                1,
+            )
+            .await;
+        let snapshot = runtime
+            .capture_live_snapshot(
+                ProcessIdentity::current()?,
+                PathBuf::from("/tmp/public-observer-config"),
+                &state,
+                crate::load_balancer::LoadBalancer::new().get_stats(),
+                true,
+            )
+            .await?;
+        let text = serde_json::to_string(&snapshot)?;
+        for private in [
+            "public-user",
+            "public-password",
+            "public-config-user",
+            "public-config-password",
+            "PUBLIC_OBSERVER_USER",
+            "PUBLIC_OBSERVER_PASSWORD",
+            "private-health-path",
+            "private-key",
+            "global-user",
+            "global-password",
+            "global-private-path",
+            "global-private-key",
+            "opaque-private-error",
+        ] {
+            assert!(
+                !text.contains(private),
+                "published credential/path token {private}"
+            );
+        }
+        assert_eq!(
+            snapshot.applied.config.proxies[0]
+                .health_check_url
+                .as_deref(),
+            Some("https://health.invalid")
+        );
+        assert_eq!(snapshot.applied.config_generation, 1);
+        assert_eq!(snapshot.applied.routing_generation, 1);
+        assert_eq!(snapshot.applied.last_reload_result, "rejected");
+        runtime
+            .record_applied_config(&config, Vec::new(), Vec::new(), 2, true)
+            .await;
+        let next = runtime
+            .capture_live_snapshot(
+                ProcessIdentity::current()?,
+                PathBuf::from("/tmp/public-observer-config"),
+                &StateStore::new_for_testing(),
+                crate::load_balancer::LoadBalancer::new().get_stats(),
+                true,
+            )
+            .await?;
+        assert_eq!(next.applied.config_generation, 2);
+        assert_eq!(next.applied.routing_generation, 2);
+        assert_eq!(next.applied.last_reload_result, "applied");
+        assert!(next.applied.pending_restart_fields.is_empty());
+        Ok(())
+    }
 
     fn store_at(path: PathBuf) -> Result<StateStore> {
         let initial = State::load(&path)?;

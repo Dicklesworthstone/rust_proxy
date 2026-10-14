@@ -260,13 +260,40 @@ rust_proxy list --format toon
 ```
 
 ### `rust_proxy status`
-Show active proxy + rule status.
+Show the configured preference, applied preference, effective failover proxy,
+and routing rule status. The daemon publishes a credential-free observation
+once per second. Status checks its PID, process start identity, boot identity,
+snapshot age and ownership of the applied listener before reporting readiness.
+Observations older than five seconds are stale; absent, dead, foreign and
+unavailable observations remain explicit.
 
 ```bash
 rust_proxy status
 rust_proxy status --json
 rust_proxy status --format toon
 ```
+
+Live output includes configuration and routing generations, source freshness,
+pending restart fields, the last reload result, health and selection observations.
+An invalid file does not hide the running daemon's last applied configuration.
+Offline output still shows available configuration and historical statistics.
+`rules_active` requires the applied ipset, OUTPUT jump and matching REDIRECT;
+it is unavailable when the CLI cannot inspect the firewall.
+
+### `rust_proxy test`
+
+Inspect how an IPv4 TCP destination would be routed.
+
+```bash
+rust_proxy test https://api.openai.com --json
+rust_proxy test api.openai.com --no-dns --verbose
+```
+
+With a verified live daemon and successful DNS resolution, the command inspects
+the applied ipset and destination exclusions. The `prediction_basis` field
+distinguishes that observation from an applied or configured prediction.
+`--no-dns` uses configuration and cannot establish actual IP membership.
+This command predicts interception; it does not establish an application tunnel.
 
 ### Output formats
 Machine output supports JSON or TOON.
@@ -317,6 +344,10 @@ Config file location (precedence order):
 
 State file location (not affected by `RUST_PROXY_CONFIG`):
 - `~/.local/state/rust_proxy/state.json`
+- The live observation is in `runtime.json` in the same directory.
+- `RUST_PROXY_STATE_DIR` overrides that directory. Daemon and diagnostic CLI
+  runs need the same config path and readable state directory to share a live
+  observation; generated service units set both paths explicitly.
 
 Example config (copy-paste ready):
 

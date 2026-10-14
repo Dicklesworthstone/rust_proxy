@@ -434,10 +434,6 @@ pub fn ipset_present(ipset_name: &str) -> Result<bool> {
     }
 }
 
-pub fn chain_present(chain_name: &str) -> bool {
-    dispatch("iptables", &["-t", "nat", "-S", chain_name], None).is_ok()
-}
-
 /// What `iptables -t nat -S <chain>` says about rules left by a previous run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainSnapshot {
@@ -486,10 +482,83 @@ pub fn chain_snapshot(chain_name: &str) -> Result<ChainSnapshot> {
     }
 }
 
+/// Existence alone is not routing: require the owned OUTPUT jump, matching
+/// ipset and the TCP REDIRECT to the actually applied listener port.
+pub fn routing_rules_active(chain: &str, ipset: &str, port: u16) -> Result<bool> {
+    validate_chain_name(chain)?;
+    validate_ipset_name(ipset)?;
+    if !ipset_present(ipset)? {
+        return Ok(false);
+    }
+    let port = port.to_string();
+    for args in [
+        vec!["-t", "nat", "-C", "OUTPUT", "-j", chain],
+        vec![
+            "-t",
+            "nat",
+            "-C",
+            chain,
+            "-p",
+            "tcp",
+            "-m",
+            "set",
+            "--match-set",
+            ipset,
+            "dst",
+            "-j",
+            "REDIRECT",
+            "--to-ports",
+            &port,
+        ],
+    ] {
+        match run("iptables", &args) {
+            Ok(_) => {}
+            Err(error) if is_missing(&error, "iptables", true) => return Ok(false),
+            Err(error) => return Err(error.context("Could not verify applied routing rules")),
+        }
+    }
+    Ok(true)
+}
+
+/// Destination RETURNs ahead of our REDIRECT exempt loopback and upstream
+/// addresses even when a target shares that IP. Read the applied chain rather
+/// than resolving the requested proxy configuration again.
+pub fn destination_exclusions(chain: &str) -> Result<HashSet<String>> {
+    validate_chain_name(chain)?;
+    let rules = dispatch("iptables", &["-t", "nat", "-S", chain], None)?;
+    Ok(parse_destination_exclusions(&rules))
+}
+
+fn parse_destination_exclusions(rules: &str) -> HashSet<String> {
+    let mut excluded = HashSet::new();
+    for line in rules.lines().filter(|line| line.starts_with("-A ")) {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.windows(2).any(|pair| pair == ["-j", "REDIRECT"]) {
+            break;
+        }
+        if tokens.windows(2).any(|pair| pair == ["-j", "RETURN"]) {
+            if let Some(pair) = tokens.windows(2).find(|pair| pair[0] == "-d") {
+                excluded.insert(pair[1].to_owned());
+            }
+        }
+    }
+    excluded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn diagnostic_exclusions_respect_destination_returns_before_redirect() {
+        let rules = "-N LIVE\n-A LIVE -d 127.0.0.0/8 -j RETURN\n-A LIVE -m mark --mark 0x1234 -j RETURN\n-A LIVE -d 192.0.2.10/32 -p tcp -j RETURN\n-A LIVE -p tcp -m set --match-set targets dst -j REDIRECT --to-ports 12345\n-A LIVE -d 192.0.2.20/32 -j RETURN\n";
+        assert_eq!(
+            parse_destination_exclusions(rules),
+            HashSet::from(["127.0.0.0/8".into(), "192.0.2.10/32".into()])
+        );
+        assert!(parse_destination_exclusions("-N EMPTY\n").is_empty());
+    }
 
     /// Captured spawn: (program, argv, stdin payload).
     type Call = (String, Vec<String>, Option<String>);

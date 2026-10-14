@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 /// Statistics about proxy selections (ephemeral, resets on daemon restart).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SelectionStats {
     /// Number of times each proxy was selected
     pub selections: HashMap<String, u64>,

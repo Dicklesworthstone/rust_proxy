@@ -229,6 +229,598 @@ impl Drop for ManagedDaemon {
     }
 }
 
+const RUNTIME_SECRETS: &[&str] = &[
+    "runtime-user-secret",
+    "runtime-password-secret",
+    "global-health-path-secret",
+    "global-health-query-secret",
+    "proxy-health-path-secret",
+    "proxy-health-query-secret",
+];
+
+fn runtime_config_path(home: &TestHome) -> PathBuf {
+    home._temp.path().join(".config/rust_proxy/config.toml")
+}
+
+fn runtime_snapshot_path(home: &TestHome) -> PathBuf {
+    home._temp.path().join(".state/rust_proxy/runtime.json")
+}
+
+fn runtime_boot_nanos() -> Result<u64> {
+    let mut clock = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock is writable; CLOCK_BOOTTIME is read without changing
+    // process or system clocks. Only negative-fixture age is refreshed here.
+    anyhow::ensure!(
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut clock) } == 0,
+        "read boot clock: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(u64::try_from(clock.tv_sec)? * 1_000_000_000 + u64::try_from(clock.tv_nsec)?)
+}
+
+/// Keep the real daemon streams and fixtures for failed-gate diagnosis. These
+/// observations use the rootless seam, never live kernel routing.
+fn spawn_runtime_daemon(home: &TestHome) -> Result<ManagedDaemon> {
+    let child = Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+        .arg("daemon")
+        .env("HOME", home._temp.path())
+        .env("XDG_CONFIG_HOME", home._temp.path().join(".config"))
+        .env("XDG_STATE_HOME", home._temp.path().join(".state"))
+        .env("RUST_PROXY_CONFIG", runtime_config_path(home))
+        .env(
+            "RUST_PROXY_STATE_DIR",
+            home._temp.path().join(".state/rust_proxy"),
+        )
+        .env("RUST_PROXY_TEST_MODE", "1")
+        .env("RUST_PROXY_TEST_ORIGINAL_DST", ORIGINAL_DST)
+        .env("RUST_LOG", "debug")
+        .stdout(std::fs::File::create(
+            home._temp.path().join("runtime-daemon.stdout.log"),
+        )?)
+        .stderr(std::fs::File::create(
+            home._temp.path().join("runtime-daemon.stderr.log"),
+        )?)
+        .spawn()
+        .context("spawn observed rootless daemon")?;
+    Ok(ManagedDaemon(child))
+}
+
+fn runtime_cli_raw(home: &TestHome, args: &[&str]) -> Result<std::process::Output> {
+    let output = Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+        .args(args)
+        .env("HOME", home._temp.path())
+        .env("XDG_CONFIG_HOME", home._temp.path().join(".config"))
+        .env("XDG_STATE_HOME", home._temp.path().join(".state"))
+        .env("RUST_PROXY_CONFIG", runtime_config_path(home))
+        .env(
+            "RUST_PROXY_STATE_DIR",
+            home._temp.path().join(".state/rust_proxy"),
+        )
+        .env_remove("RUST_PROXY_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .output()?;
+    eprintln!(
+        "RUNTIME CLI {args:?}: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for bytes in [&output.stdout, &output.stderr] {
+        assert!(!bytes.contains(&0x1b), "machine CLI emitted an ANSI escape");
+        for secret in RUNTIME_SECRETS {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains(secret),
+                "machine CLI emitted {secret}"
+            );
+        }
+    }
+    Ok(output)
+}
+
+fn runtime_cli(home: &TestHome, args: &[&str]) -> Result<serde_json::Value> {
+    let output = runtime_cli_raw(home, args)?;
+    assert_eq!(output.status.code(), Some(0), "{args:?}");
+    // Both decoders receive every stdout byte: prose, prefixes and trailing
+    // non-machine content cannot be trimmed away to manufacture a pass.
+    if args.contains(&"toon") {
+        Ok(toon_rust::try_decode(std::str::from_utf8(&output.stdout)?, None)?.into())
+    } else {
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
+async fn wait_runtime(
+    home: &TestHome,
+    daemon: &mut ManagedDaemon,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        anyhow::ensure!(daemon.0.try_wait()?.is_none(), "observed daemon exited");
+        let status = runtime_cli(home, &["status", "--json"])?;
+        if predicate(&status) {
+            return Ok(status);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "runtime state never reached the requested observation: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn runtime_signal(daemon: &ManagedDaemon, signal: &str) -> Result<()> {
+    let output = Command::new("kill")
+        .args([signal, &daemon.0.id().to_string()])
+        .output()?;
+    eprintln!(
+        "runtime control {signal}: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(output.status.success(), "process control failed");
+    Ok(())
+}
+
+async fn assert_runtime_tunnels(
+    address: SocketAddr,
+    selected: &MockProxy,
+    excluded: &MockProxy,
+) -> Result<()> {
+    let before = (
+        client_connect_count(selected),
+        client_connect_count(excluded),
+    );
+    for _ in 0..3 {
+        anyhow::ensure!(
+            drive_tunnel(address, Duration::from_secs(3)).await?,
+            "observed serving proxy did not echo the complete payload"
+        );
+    }
+    assert_eq!(client_connect_count(selected), before.0 + 3);
+    assert_eq!(client_connect_count(excluded), before.1);
+    Ok(())
+}
+
+fn assert_runtime_not_ready(home: &TestHome, expected: &str) -> Result<()> {
+    for args in [
+        vec!["status", "--json"],
+        vec!["status", "--format", "toon"],
+        vec![
+            "test",
+            "seam-routing-test.invalid",
+            "--no-dns",
+            "--json",
+            "--verbose",
+        ],
+        vec![
+            "test",
+            "seam-routing-test.invalid",
+            "--no-dns",
+            "--format",
+            "toon",
+            "--verbose",
+        ],
+    ] {
+        let output = runtime_cli(home, &args)?;
+        assert_eq!(output["daemon_running"], false);
+        assert_eq!(output["daemon"]["status"], expected);
+        if args[0] == "test" {
+            assert_eq!(output["prediction_basis"], "configured_config_prediction");
+            assert!(output["live_ipset_match"].is_null());
+        } else {
+            assert!(output["effective_proxy"].is_null());
+            assert!(output["applied_proxy"].is_null());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_observation_failover_recovery_matches_byte_exact_recipients() -> Result<()> {
+    use base64::Engine as _;
+    require_non_root();
+    let token = base64::engine::general_purpose::STANDARD
+        .encode("runtime-user-secret:runtime-password-secret");
+    let primary = MockProxy::new(
+        0,
+        MockBehavior::AuthenticatedTunnelEcho {
+            token: token.clone(),
+        },
+    )
+    .await?;
+    let secondary = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let port = free_listen_port();
+    let mut home = failover_config(primary.port, secondary.port, port)?;
+    home._temp.disable_cleanup(true);
+    eprintln!("runtime failover fixtures: {}", home._temp.path().display());
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(runtime_config_path(&home))?)?;
+    config["settings"]["auto_failback"] = true.into();
+    config["settings"]
+        .as_table_mut()
+        .context("settings fixture")?
+        .insert("failback_delay_secs".into(), 1.into());
+    config["proxies"][0]["url"] = format!(
+        "http://runtime-user-secret:runtime-password-secret@127.0.0.1:{}",
+        primary.port
+    )
+    .into();
+    std::fs::write(runtime_config_path(&home), toml::to_string(&config)?)?;
+    let mut daemon = spawn_runtime_daemon(&home)?;
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let initial = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon_running"] == true && status["effective_proxy"] == "primary"
+    })
+    .await?;
+    assert_eq!(initial["configured_proxy"], "primary");
+    assert_eq!(initial["applied_proxy"], "primary");
+    assert_eq!(
+        initial["daemon"]["snapshot"]["identity"]["pid"],
+        daemon.0.id()
+    );
+    assert_eq!(initial["daemon"]["snapshot"]["test_mode"], true);
+    assert_eq!(initial["rules_active"], false);
+    assert_runtime_tunnels(address, &primary, &secondary).await?;
+
+    primary.set_behavior(MockBehavior::Failing {
+        error: MockError::AuthRequired,
+    });
+    let failed_over = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon_running"] == true && status["effective_proxy"] == "secondary"
+    })
+    .await?;
+    assert_eq!(failed_over["configured_proxy"], "primary");
+    assert_eq!(failed_over["applied_proxy"], "primary");
+    assert_eq!(failed_over["proxy_health_source"], "live_runtime");
+    assert_eq!(
+        failed_over["daemon"]["snapshot"]["runtime"]["original_proxy"],
+        "primary"
+    );
+    assert_eq!(
+        failed_over["daemon"]["snapshot"]["runtime"]["is_failed_over"],
+        true
+    );
+    assert_runtime_tunnels(address, &secondary, &primary).await?;
+    for args in [
+        vec![
+            "test",
+            "seam-routing-test.invalid",
+            "--no-dns",
+            "--json",
+            "--verbose",
+        ],
+        vec![
+            "test",
+            "seam-routing-test.invalid",
+            "--no-dns",
+            "--format",
+            "toon",
+            "--verbose",
+        ],
+    ] {
+        let prediction = runtime_cli(&home, &args)?;
+        assert_eq!(prediction["daemon_running"], true);
+        assert_eq!(prediction["active_proxy"]["id"], "secondary");
+        assert_eq!(prediction["applied_proxy"], "primary");
+        assert_eq!(prediction["effective_proxy"], "secondary");
+        assert_eq!(prediction["prediction_basis"], "applied_config_prediction");
+        assert!(prediction["live_ipset_match"].is_null());
+    }
+
+    primary.set_behavior(MockBehavior::AuthenticatedTunnelEcho { token });
+    let recovered = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon_running"] == true
+            && status["effective_proxy"] == "primary"
+            && status["daemon"]["snapshot"]["runtime"]["is_failed_over"] == false
+    })
+    .await?;
+    assert_eq!(recovered["configured_proxy"], "primary");
+    assert_eq!(recovered["applied_proxy"], "primary");
+    assert_runtime_tunnels(address, &primary, &secondary).await?;
+    let toon = runtime_cli(&home, &["status", "--format", "toon"])?;
+    assert_eq!(toon["effective_proxy"], "primary");
+    assert_eq!(toon["daemon_running"], true);
+    assert!(graceful_shutdown(&mut daemon.0)?.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_observation_reloads_keep_applied_truth_and_machine_secrets_out() -> Result<()> {
+    require_non_root();
+    let alpha = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let beta = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let port = free_listen_port();
+    let mut home = activation_config("beta", alpha.port, beta.port, port)?;
+    home._temp.disable_cleanup(true);
+    eprintln!("runtime reload fixtures: {}", home._temp.path().display());
+    let config_path = runtime_config_path(&home);
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    config["proxies"][1]["url"] = format!(
+        "http://runtime-user-secret:runtime-password-secret@127.0.0.1:{}",
+        beta.port
+    )
+    .into();
+    config["proxies"][1]
+        .as_table_mut()
+        .context("proxy fixture")?
+        .insert(
+            "health_check_url".into(),
+            format!(
+                "http://127.0.0.1:{}/proxy-health-path-secret?token=proxy-health-query-secret",
+                beta.port
+            )
+            .into(),
+        );
+    config["settings"].as_table_mut().context("settings fixture")?.insert(
+        "health_check_target".into(),
+        format!("GET http://127.0.0.1:{}/global-health-path-secret?token=global-health-query-secret", beta.port).into(),
+    );
+    // Health is disabled: the echo upstream is a forwarding fixture, never
+    // presented as a successful GET-health implementation.
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+    let mut daemon = spawn_runtime_daemon(&home)?;
+    let initial = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon_running"] == true
+    })
+    .await?;
+    let applied = initial["daemon"]["snapshot"]["applied"].clone();
+    let generation = applied["config_generation"]
+        .as_u64()
+        .context("config generation")?;
+    assert!(generation > 0);
+    assert_eq!(initial["effective_proxy"], "beta");
+    assert_runtime_tunnels(SocketAddr::from(([127, 0, 0, 1], port)), &beta, &alpha).await?;
+    let snapshot = std::fs::read_to_string(runtime_snapshot_path(&home))?;
+    for secret in RUNTIME_SECRETS {
+        assert!(
+            !snapshot.contains(secret),
+            "persisted runtime snapshot leaked {secret}"
+        );
+    }
+
+    std::fs::write(&config_path, "[[proxies]\n")?;
+    let rejected = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon"]["snapshot"]["applied"]["last_reload_result"] == "rejected"
+    })
+    .await?;
+    assert_eq!(rejected["daemon_running"], true);
+    assert!(rejected["configured_proxy"].is_null());
+    assert!(rejected["configured_config_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("Failed parsing config")));
+    assert_eq!(rejected["applied_proxy"], "beta");
+    assert_eq!(rejected["effective_proxy"], "beta");
+    assert_eq!(
+        rejected["daemon"]["snapshot"]["applied"]["config_generation"],
+        generation
+    );
+    assert_eq!(
+        rejected["daemon"]["snapshot"]["applied"]["config"],
+        applied["config"]
+    );
+    for args in [
+        vec!["status", "--format", "toon"],
+        vec![
+            "test",
+            "seam-routing-test.invalid",
+            "--no-dns",
+            "--json",
+            "--verbose",
+        ],
+        vec![
+            "test",
+            "seam-routing-test.invalid",
+            "--no-dns",
+            "--format",
+            "toon",
+            "--verbose",
+        ],
+    ] {
+        let output = runtime_cli(&home, &args)?;
+        assert_eq!(output["daemon_running"], true);
+        if args[0] == "test" {
+            assert_eq!(output["prediction_basis"], "applied_config_prediction");
+            assert_eq!(output["would_proxy"], true);
+            assert!(output["live_ipset_match"].is_null());
+            assert_eq!(output["resolved_ips"], serde_json::json!([]));
+        }
+    }
+    let quiet = runtime_cli_raw(
+        &home,
+        &[
+            "test",
+            "seam-routing-test.invalid",
+            "--no-dns",
+            "--json",
+            "--verbose",
+            "--quiet",
+        ],
+    )?;
+    assert_eq!(quiet.status.code(), Some(2));
+    assert!(quiet.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&quiet.stderr).contains("unexpected argument '--quiet'"));
+    assert_runtime_tunnels(SocketAddr::from(([127, 0, 0, 1], port)), &beta, &alpha).await?;
+
+    let settings = config["settings"]
+        .as_table_mut()
+        .context("settings fixture")?;
+    let restart_fields = [
+        (
+            "listen_port",
+            toml::Value::Integer(i64::from(free_listen_port())),
+        ),
+        ("chain_name", "REQUESTED_RESTART_CHAIN".into()),
+        ("ipset_name", "requested_restart_set".into()),
+        ("metrics_bind", "127.0.0.2".into()),
+        (
+            "metrics_port",
+            toml::Value::Integer(i64::from(free_listen_port())),
+        ),
+        ("metrics_path", "/requested-runtime-metrics".into()),
+        ("metrics_enabled", true.into()),
+    ];
+    for (name, value) in &restart_fields {
+        settings.insert((*name).into(), value.clone());
+    }
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+    let reloaded = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon"]["snapshot"]["applied"]["last_reload_result"] == "applied"
+            && status["daemon"]["snapshot"]["applied"]["pending_restart_fields"]
+                .as_array()
+                .is_some_and(|fields| fields.len() == 7)
+    })
+    .await?;
+    let reloaded_applied = &reloaded["daemon"]["snapshot"]["applied"];
+    assert!(
+        reloaded_applied["config_generation"]
+            .as_u64()
+            .context("reloaded generation")?
+            > generation
+    );
+    let pending = reloaded_applied["pending_restart_fields"]
+        .as_array()
+        .context("restart fields")?;
+    assert_eq!(pending.len(), 7);
+    let requested: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    for (field, value) in &restart_fields {
+        assert!(pending
+            .iter()
+            .any(|pending| pending.as_str() == Some(*field)));
+        assert_eq!(
+            reloaded_applied["config"]["settings"][*field],
+            applied["config"]["settings"][*field]
+        );
+        assert_eq!(requested["settings"][*field], *value);
+    }
+    assert_eq!(reloaded["applied_proxy"], "beta");
+    assert_eq!(reloaded["effective_proxy"], "beta");
+    assert_runtime_tunnels(SocketAddr::from(([127, 0, 0, 1], port)), &beta, &alpha).await?;
+    assert!(graceful_shutdown(&mut daemon.0)?.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_observation_identity_freshness_and_unrelated_listener_controls() -> Result<()> {
+    require_non_root();
+    let alpha = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let beta = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let unrelated = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let mut absent = activation_config(
+        "beta",
+        alpha.port,
+        beta.port,
+        unrelated.local_addr()?.port(),
+    )?;
+    absent._temp.disable_cleanup(true);
+    eprintln!(
+        "runtime absent/unrelated fixtures: {}",
+        absent._temp.path().display()
+    );
+    assert_runtime_not_ready(&absent, "absent")?;
+    unrelated.set_nonblocking(true)?;
+    assert_eq!(
+        unrelated.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    let port = free_listen_port();
+    let mut home = activation_config("beta", alpha.port, beta.port, port)?;
+    home._temp.disable_cleanup(true);
+    eprintln!("runtime identity fixtures: {}", home._temp.path().display());
+    let mut daemon = spawn_runtime_daemon(&home)?;
+    let initial = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon_running"] == true
+    })
+    .await?;
+    assert_eq!(initial["daemon"]["status"], "ready");
+    assert_runtime_tunnels(SocketAddr::from(([127, 0, 0, 1], port)), &beta, &alpha).await?;
+    runtime_signal(&daemon, "-STOP")?;
+    // Freeze the actual publisher before planting negatives; no racing
+    // heartbeat can accidentally restore the positive fixture.
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(runtime_snapshot_path(&home))?)?;
+    let mut reused = original.clone();
+    reused["identity"]["start_ticks"] = (original["identity"]["start_ticks"]
+        .as_u64()
+        .context("start ticks")?
+        + 1)
+    .into();
+    std::fs::write(runtime_snapshot_path(&home), serde_json::to_vec(&reused)?)?;
+    assert_runtime_not_ready(&home, "dead")?;
+    // This mismatched start-time is a PID-reuse surrogate negative, not a
+    // claim that the kernel was forced to reuse a PID during this test.
+    let mut foreign = original.clone();
+    foreign["config_path"] = home
+        ._temp
+        .path()
+        .join("other-config.toml")
+        .to_string_lossy()
+        .into_owned()
+        .into();
+    std::fs::write(runtime_snapshot_path(&home), serde_json::to_vec(&foreign)?)?;
+    assert_runtime_not_ready(&home, "foreign")?;
+
+    let sleeper = ManagedDaemon(Command::new("sleep").arg("30").spawn()?);
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", sleeper.0.id()))?;
+    let start_ticks: u64 = stat
+        .rsplit_once(')')
+        .context("sleep stat delimiter")?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .context("sleep start ticks")?
+        .parse()?;
+    let mut wrong_owner = original.clone();
+    wrong_owner["identity"]["pid"] = sleeper.0.id().into();
+    wrong_owner["identity"]["start_ticks"] = start_ticks.into();
+    wrong_owner["captured_boot_nanos"] = runtime_boot_nanos()?.into();
+    std::fs::write(
+        runtime_snapshot_path(&home),
+        serde_json::to_vec(&wrong_owner)?,
+    )?;
+    assert_runtime_not_ready(&home, "listener_missing")?;
+
+    let mut stopped = original.clone();
+    stopped["ready"] = false.into();
+    stopped["captured_boot_nanos"] = runtime_boot_nanos()?.into();
+    std::fs::write(runtime_snapshot_path(&home), serde_json::to_vec(&stopped)?)?;
+    assert_runtime_not_ready(&home, "stopped")?;
+    std::fs::write(runtime_snapshot_path(&home), b"{not-json")?;
+    assert_runtime_not_ready(&home, "unavailable")?;
+
+    let mut stale = original.clone();
+    // A future wall clock must not make an actually stale boot-clock sample
+    // fresh. Leave captured_boot_nanos untouched and wait across the real gate.
+    stale["captured_at"] = "9999-12-31T23:59:59Z".into();
+    std::fs::write(runtime_snapshot_path(&home), serde_json::to_vec(&stale)?)?;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_runtime_not_ready(&home, "stale")?;
+    let stale_status = runtime_cli(&home, &["status", "--json"])?;
+    assert!(
+        stale_status["daemon"]["age_ms"]
+            .as_u64()
+            .context("stale age")?
+            >= 5000
+    );
+    runtime_signal(&daemon, "-CONT")?;
+    let refreshed = wait_runtime(&home, &mut daemon, |status| {
+        status["daemon_running"] == true
+    })
+    .await?;
+    assert_eq!(refreshed["daemon"]["status"], "ready");
+    assert_runtime_tunnels(SocketAddr::from(([127, 0, 0, 1], port)), &beta, &alpha).await?;
+    runtime_signal(&daemon, "-KILL")?;
+    let killed = daemon.0.wait()?;
+    assert!(!killed.success());
+    assert_runtime_not_ready(&home, "dead")?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn authentication_sources_establish_real_byte_exact_daemon_tunnels() -> Result<()> {
     use base64::Engine as _;
