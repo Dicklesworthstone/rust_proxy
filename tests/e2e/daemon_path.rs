@@ -101,6 +101,14 @@ fn spawn_daemon(home: &TestHome, test_mode: bool, stderr_file: &Path) -> Result<
         .env("HOME", home._temp.path())
         .env("XDG_CONFIG_HOME", home._temp.path().join(".config"))
         .env("XDG_STATE_HOME", home._temp.path().join(".state"))
+        .env(
+            "RUST_PROXY_CONFIG",
+            home._temp.path().join(".config/rust_proxy/config.toml"),
+        )
+        .env(
+            "RUST_PROXY_STATE_DIR",
+            home._temp.path().join(".state/rust_proxy"),
+        )
         .env("RUST_LOG", "debug")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -117,13 +125,45 @@ fn read_stderr(path: &Path) -> String {
 }
 
 /// Wait until the daemon's transparent-proxy listener accepts connections.
-async fn wait_for_listener(addr: std::net::SocketAddr) -> Result<()> {
+async fn wait_for_listener(
+    addr: std::net::SocketAddr,
+    home: &TestHome,
+    child: &mut Child,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("daemon listener never came up at {}", addr);
         }
-        if TcpStream::connect(addr).await.is_ok() {
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "daemon exited before owned readiness"
+        );
+        let observation = Command::new(proxy_binary())
+            .args(["status", "--json"])
+            .env(
+                "RUST_PROXY_CONFIG",
+                home._temp.path().join(".config/rust_proxy/config.toml"),
+            )
+            .env(
+                "RUST_PROXY_STATE_DIR",
+                home._temp.path().join(".state/rust_proxy"),
+            )
+            .env_remove("RUST_PROXY_OUTPUT_FORMAT")
+            .env_remove("TOON_DEFAULT_FORMAT")
+            .output()?;
+        eprintln!(
+            "daemon readiness status: {}\nstdout:\n{}\nstderr:\n{}",
+            observation.status,
+            String::from_utf8_lossy(&observation.stdout),
+            String::from_utf8_lossy(&observation.stderr)
+        );
+        anyhow::ensure!(observation.status.success(), "readiness CLI failed");
+        let status: serde_json::Value = serde_json::from_slice(&observation.stdout)?;
+        if status["daemon_running"] == true
+            && status["daemon"]["snapshot"]["identity"]["pid"] == child.id()
+            && TcpStream::connect(addr).await.is_ok()
+        {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -148,7 +188,7 @@ async fn test_mode_daemon_relays_tunnel_traffic_as_non_root() -> Result<()> {
     let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse()?;
 
     // The daemon must stay alive (root bypass worked) and serve the listener.
-    let listener_result = wait_for_listener(listen_addr).await;
+    let listener_result = wait_for_listener(listen_addr, &home, &mut child).await;
     if let Err(err) = listener_result {
         let _ = child.kill();
         // ubs:ignore[rust.ownership.panic-macro] — fails the traffic test when daemon startup did not succeed.
@@ -278,13 +318,19 @@ async fn repeated_sighup_keeps_process_and_tunnels_alive() -> Result<()> {
     require_non_root();
     let mock = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
     let listen_port = free_listen_port();
-    let home = write_test_config(mock.port, listen_port)?;
-    let logs = TempDir::new()?;
-    let stderr_path = logs.path().join("daemon.stderr.log");
+    let mut home = write_test_config(mock.port, listen_port)?;
+    home._temp.disable_cleanup(true);
+    let logs = TempDir::new()?.keep();
+    let stderr_path = logs.join("daemon.stderr.log");
+    eprintln!(
+        "SIGHUP fixture {}, daemon log {}",
+        home._temp.path().display(),
+        stderr_path.display()
+    );
     let mut child = spawn_daemon(&home, true, &stderr_path)?;
     let addr = format!("127.0.0.1:{listen_port}").parse()?;
     let exercise = async {
-        wait_for_listener(addr).await?;
+        wait_for_listener(addr, &home, &mut child).await?;
         let mut retained = TcpStream::connect(addr).await?;
         for generation in 1..=3 {
             let sent = Command::new("kill")
@@ -302,7 +348,12 @@ async fn repeated_sighup_keeps_process_and_tunnels_alive() -> Result<()> {
                     "reload not acknowledged: {}",
                     read_stderr(&stderr_path)
                 );
-                anyhow::ensure!(child.try_wait()?.is_none(), "SIGHUP terminated daemon");
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!(
+                        "SIGHUP check observed daemon exit {status}; log:\n{}",
+                        read_stderr(&stderr_path)
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             for client in [&mut retained, &mut TcpStream::connect(addr).await?] {
@@ -335,7 +386,7 @@ async fn sigint_and_sigterm_drain_an_open_tunnel_and_exit_normally() -> Result<(
         let stderr_path = logs.path().join("daemon.stderr.log");
         let mut child = spawn_daemon(&home, true, &stderr_path)?;
         let addr = format!("127.0.0.1:{listen_port}").parse()?;
-        if let Err(err) = wait_for_listener(addr).await {
+        if let Err(err) = wait_for_listener(addr, &home, &mut child).await {
             let _ = child.kill();
             let _ = child.wait();
             return Err(err.context(read_stderr(&stderr_path)));
@@ -514,7 +565,7 @@ async fn establishment_admission_recovers_after_silent_peer_timeouts() -> Result
     let mut child = spawn_daemon(&home, true, &stderr_path)?;
     let addr = format!("127.0.0.1:{port}").parse()?;
     let exercise = async {
-        wait_for_listener(addr).await?;
+        wait_for_listener(addr, &home, &mut child).await?;
         let mut clients = Vec::new();
         // The readiness connection occupies one silent establishment slot.
         for _ in 1..ADMISSION_LIMIT {
