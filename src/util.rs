@@ -935,10 +935,18 @@ pub fn generate_service_file(
     }
     let config_path = absolute_service_path(config_path, "config")?;
     let config = service_path(&config_path, "config")?;
+    // Resolve state once as the operator generating the unit. The service may
+    // run under a different HOME, so the emitted override and write allowance
+    // must name this same absolute directory.
+    let state_dir = absolute_service_path(&crate::config::state_dir()?, "state directory")?;
     // ':' disables Exec environment substitution. '%' specifiers are escaped
     // separately, including in the executable path and Environment assignment.
     let binary = quote_service_value(&format!(":{binary}"));
     let config = quote_service_value(&format!("RUST_PROXY_CONFIG={config}"));
+    let state = quote_service_value(&format!(
+        "RUST_PROXY_STATE_DIR={}",
+        service_path(&state_dir, "state directory")?
+    ));
     let mut service = format!(
         r#"[Unit]
 Description=rust_proxy - Targeted transparent proxy daemon
@@ -960,6 +968,7 @@ Group={group}
 
 # Config file read by the daemon and cleanup command
 Environment={config}
+Environment={state}
 
 # Logging
 StandardOutput=journal
@@ -971,12 +980,13 @@ LimitNOFILE=65535
 "#,
         binary = binary,
         config = config,
+        state = state,
         user = user,
         group = group
     );
 
     if hardened {
-        service.push_str(&hardening_section(&config_path)?);
+        service.push_str(&hardening_section(&config_path, &state_dir)?);
     }
 
     service.push_str(
@@ -1044,7 +1054,7 @@ fn quote_service_value(value: &str) -> String {
     quoted
 }
 
-fn hardening_section(config_path: &Path) -> Result<String> {
+fn hardening_section(config_path: &Path, state_dir: &Path) -> Result<String> {
     let config_dir = config_path.parent().unwrap_or(config_path);
     let mut section = String::new();
     section.push_str("\n# Security hardening (limited due to iptables requirement)\n");
@@ -1053,10 +1063,9 @@ fn hardening_section(config_path: &Path) -> Result<String> {
         "ReadWritePaths={}\n",
         quote_service_value(service_path(config_dir, "config directory")?)
     ));
-    let state_dir = absolute_service_path(&crate::config::state_dir()?, "state directory")?;
     section.push_str(&format!(
         "ReadWritePaths={}\n",
-        quote_service_value(service_path(&state_dir, "state directory")?)
+        quote_service_value(service_path(state_dir, "state directory")?)
     ));
     section.push_str("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n");
     section.push_str("NoNewPrivileges=no\n");
@@ -1361,6 +1370,7 @@ mod tests {
 
     #[test]
     fn test_generate_service_file_basic() -> Result<()> {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         let binary = std::path::Path::new("/usr/local/bin/rust_proxy");
         let config = std::path::Path::new("/etc/rust_proxy/config.toml");
         let service = generate_service_file(binary, config, "root", "root", false)?;
@@ -1419,7 +1429,6 @@ mod tests {
         // Runtime consumption: the emitted Environment line must actually
         // steer config_path() so service runs read the same file as manual
         // runs (round-trip proof for RUST_PROXY_CONFIG support).
-        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         let previous_config = std::env::var_os("RUST_PROXY_CONFIG");
         std::env::set_var("RUST_PROXY_CONFIG", "/etc/rust_proxy/config.toml");
         assert_eq!(
@@ -1463,6 +1472,7 @@ mod tests {
 
     #[test]
     fn test_generate_service_file_custom_user_group() -> Result<()> {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         let binary = Path::new("/opt/rust_proxy/bin/rust_proxy");
         let config = Path::new("/etc/rust_proxy/custom.toml");
         let service = generate_service_file(binary, config, "proxy", "proxy-group", false)?;
@@ -1480,6 +1490,7 @@ mod tests {
 
     #[test]
     fn test_generate_service_file_current_executable() -> Result<()> {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         let binary = std::env::current_exe()?;
         assert!(binary.is_file());
         let service = generate_service_file(
@@ -1533,7 +1544,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("Environment="))
                 .count(),
-            1
+            2
         );
         Ok(())
     }
@@ -1541,6 +1552,7 @@ mod tests {
     #[test]
     fn test_generate_service_file_relative_config_is_anchored_to_generator_directory() -> Result<()>
     {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         let config = std::env::current_dir()?.join("config with spaces.toml");
         let service = generate_service_file(
             Path::new("/usr/local/bin/rust_proxy"),
@@ -1557,6 +1569,7 @@ mod tests {
 
     #[test]
     fn test_generate_service_file_rejects_account_directive_injection() {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         let binary = Path::new("/usr/local/bin/rust_proxy");
         let config = Path::new("/etc/rust_proxy/config.toml");
         for invalid in [
@@ -1588,6 +1601,7 @@ mod tests {
 
     #[test]
     fn test_generate_service_file_rejects_unrepresentable_paths() {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         let binary = Path::new("/usr/local/bin/rust_proxy");
         let config = Path::new("/etc/rust_proxy/config.toml");
         for invalid in [
@@ -1627,6 +1641,7 @@ mod tests {
 
     #[test]
     fn test_generate_service_file_rejects_non_utf8_paths() {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
         use std::os::unix::ffi::OsStrExt;
         let invalid = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/proxy-\xff"));
         assert!(generate_service_file(
@@ -1645,6 +1660,137 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    struct RestoreServiceStateEnvironment(Option<std::ffi::OsString>);
+
+    impl RestoreServiceStateEnvironment {
+        fn capture() -> Self {
+            Self(std::env::var_os("RUST_PROXY_STATE_DIR"))
+        }
+    }
+
+    impl Drop for RestoreServiceStateEnvironment {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(previous) => std::env::set_var("RUST_PROXY_STATE_DIR", previous),
+                None => std::env::remove_var("RUST_PROXY_STATE_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_service_file_state_directory_matches_runtime_and_hardening() -> Result<()> {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        let _restore = RestoreServiceStateEnvironment::capture();
+        let selected = PathBuf::from("/tmp/operator state");
+        for (user, hardened) in [("root", false), ("root", true), ("proxy", true)] {
+            std::env::set_var("RUST_PROXY_STATE_DIR", &selected);
+            let service = generate_service_file(
+                Path::new("/usr/local/bin/rust_proxy"),
+                Path::new("/etc/rust_proxy/config.toml"),
+                user,
+                "root",
+                hardened,
+            )?;
+            let assignment = service
+                .lines()
+                .find_map(|line| line.strip_prefix("Environment=\"RUST_PROXY_STATE_DIR="))
+                .and_then(|value| value.strip_suffix('"'))
+                .context("Generated service lacks state-directory override")?;
+            assert_eq!(assignment, "/tmp/operator state");
+            let allowance = "ReadWritePaths=\"/tmp/operator state\"";
+            assert_eq!(
+                service.lines().filter(|line| *line == allowance).count(),
+                usize::from(hardened)
+            );
+
+            // The existing runtime reader must consume the value emitted for
+            // the unit, regardless of a different pre-service default.
+            std::env::set_var("RUST_PROXY_STATE_DIR", "/tmp/different runtime default");
+            std::env::set_var("RUST_PROXY_STATE_DIR", assignment);
+            assert_eq!(crate::config::state_dir()?, selected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_service_file_state_path_preserves_quotes_and_literal_expansion() -> Result<()>
+    {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        let _restore = RestoreServiceStateEnvironment::capture();
+        std::env::set_var("RUST_PROXY_STATE_DIR", r#"operator "state"\$HOME/%i"#);
+        let service = generate_service_file(
+            Path::new("/usr/local/bin/rust_proxy"),
+            Path::new("/etc/rust_proxy/config.toml"),
+            "root",
+            "root",
+            true,
+        )?;
+        let cwd = std::env::current_dir()?;
+        let environment = format!(
+            r#"Environment="RUST_PROXY_STATE_DIR={}/operator \"state\"\\$HOME/%%i""#,
+            cwd.display()
+        );
+        let allowance = format!(
+            r#"ReadWritePaths="{}/operator \"state\"\\$HOME/%%i""#,
+            cwd.display()
+        );
+        assert_eq!(
+            service.lines().filter(|line| *line == environment).count(),
+            1
+        );
+        assert_eq!(service.lines().filter(|line| *line == allowance).count(), 1);
+        assert_eq!(
+            service
+                .lines()
+                .filter(|line| line.starts_with("Environment="))
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_service_file_rejects_invalid_state_directory_before_generation() -> Result<()>
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        let _restore = RestoreServiceStateEnvironment::capture();
+        for hardened in [false, true] {
+            for invalid in [
+                OsStr::new("/tmp/state\nExecStart=/bin/false"),
+                OsStr::new("/tmp/state\rGroup=root"),
+                OsStr::new("/tmp/state\tfile"),
+                OsStr::new("/tmp/state\u{7f}file"),
+                OsStr::from_bytes(b"/tmp/state-\xff"),
+            ] {
+                std::env::set_var("RUST_PROXY_STATE_DIR", invalid);
+                let error = generate_service_file(
+                    Path::new("/usr/local/bin/rust_proxy"),
+                    Path::new("/etc/rust_proxy/config.toml"),
+                    "root",
+                    "root",
+                    hardened,
+                )
+                .err()
+                .context("Invalid state directory produced a service")?;
+                assert!(format!("{error:#}").contains("Service state directory path"));
+            }
+            std::env::set_var("RUST_PROXY_STATE_DIR", "/tmp/operator-state");
+            let service = generate_service_file(
+                Path::new("/usr/local/bin/rust_proxy"),
+                Path::new("/etc/rust_proxy/config.toml"),
+                "root",
+                "root",
+                hardened,
+            )?;
+            assert!(service
+                .lines()
+                .any(|line| line == "Environment=\"RUST_PROXY_STATE_DIR=/tmp/operator-state\""));
+        }
+        Ok(())
     }
 
     // =========================================================================
