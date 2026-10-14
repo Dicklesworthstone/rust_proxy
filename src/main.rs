@@ -909,6 +909,7 @@ async fn activate_cmd(
     }
 
     config.active_proxy = Some(target_id.clone());
+    config.settings.routing_enabled = true;
     config.save()?;
     drop(mutation); // Config/state may share a directory; never nest its flock.
 
@@ -948,6 +949,7 @@ fn deactivate_cmd(keep_rules: bool, _output: &OutputDispatcher) -> Result<()> {
                 iptables::clear_rules(&config.settings.chain_name, &config.settings.ipset_name)?;
             }
             config.active_proxy = None;
+            config.settings.routing_enabled = false;
             config.save()?;
             println!("Proxy routing deactivated.");
         }
@@ -1160,6 +1162,14 @@ fn diagnose_cmd(_output: &OutputDispatcher) -> Result<()> {
         .unwrap_or(false);
 
     println!("iptables: {}", if iptables_ok { "ok" } else { "missing" });
+    let restore_ok = std::process::Command::new("iptables-restore")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    println!(
+        "iptables-restore: {}",
+        if restore_ok { "ok" } else { "missing" }
+    );
     println!("ipset:    {}", if ipset_ok { "ok" } else { "missing" });
     Ok(())
 }
@@ -1252,7 +1262,7 @@ async fn doctor_cmd(output: &OutputDispatcher, offline: bool) -> Result<()> {
     // 3. Check state directory
     checks.push(check_state_directory().await);
 
-    // 4. Check system dependencies (iptables, ipset)
+    // 4. Check system dependencies (iptables, iptables-restore, ipset)
     checks.extend(check_system_dependencies().await);
 
     // 5. Check listen port availability (if config loaded)
@@ -1511,6 +1521,21 @@ async fn check_system_dependencies() -> Vec<DoctorCheck> {
             "Install iptables (apt install iptables / dnf install iptables)",
         ));
     }
+
+    // Check ipset
+    let restore_ok = std::process::Command::new("iptables-restore")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    checks.push(if restore_ok {
+        DoctorCheck::ok("iptables-restore", "Available for atomic routing reload")
+    } else {
+        DoctorCheck::error(
+            "iptables-restore",
+            "Not found or not executable",
+            "Install the iptables package; routing reload requires iptables-restore",
+        )
+    });
 
     // Check ipset
     let ipset_ok = std::process::Command::new("ipset")
@@ -3334,21 +3359,15 @@ fn changed_restart_required_settings(old: &Settings, new: &Settings) -> Vec<&'st
 fn load_config_for_reload(path: &std::path::Path) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed reading config {}", path.display()))?;
-    let config: AppConfig = toml::from_str(&content)
-        .with_context(|| format!("Failed parsing config {}", path.display()))?;
-    Ok(config)
+    config::parse_config_text(&content, path)
 }
 
-/// Run one hot-reload cycle: load from disk, gate on the same validation as
-/// `rust_proxy check`, warn about restart-required fields, and swap the new
-/// snapshot into the config bus. Returns true when the bus was updated.
+/// Load and validate a requested reload without publishing it. Pin settings
+/// tied to process-owned sockets and firewall objects until the next restart.
 ///
 /// Invalid configs are rejected with a warning and the last-known-good
 /// snapshot stays live.
-async fn reload_config_once(
-    config_tx: &tokio::sync::watch::Sender<Arc<AppConfig>>,
-    path: &std::path::Path,
-) -> bool {
+fn prepare_config_reload(old: &AppConfig, path: &std::path::Path) -> Option<AppConfig> {
     let mut new_config = match load_config_for_reload(path) {
         Ok(config) => config,
         Err(err) => {
@@ -3357,7 +3376,7 @@ async fn reload_config_once(
                 path = %path.display(),
                 "Config reload could not read/parse file; keeping last-known-good configuration"
             );
-            return false;
+            return None;
         }
     };
 
@@ -3368,10 +3387,9 @@ async fn reload_config_once(
             warnings = report.warning_count(),
             "Rejected invalid config on hot-reload; keeping last-known-good configuration"
         );
-        return false;
+        return None;
     }
 
-    let old = config_tx.borrow().clone();
     for field in changed_restart_required_settings(&old.settings, &new_config.settings) {
         tracing::warn!(
             setting = field,
@@ -3402,12 +3420,110 @@ async fn reload_config_once(
         tracing::info!("active_proxy change applies to failback origin on next restart");
     }
 
-    match config_tx.send(Arc::new(new_config)) {
-        Ok(()) => {
-            tracing::info!(path = %path.display(), "Configuration hot-reloaded");
-            true
+    Some(new_config)
+}
+
+/// One owner serializes watcher/HUP reloads and periodic routing refresh.
+/// Requested configurations become visible only after their kernel routing
+/// generation succeeds. Ordinary source failures retain prior source entries.
+#[derive(Debug)]
+enum RoutingOwnerExit {
+    Deactivated,
+}
+
+async fn routing_owner_loop(
+    config_tx: tokio::sync::watch::Sender<Arc<AppConfig>>,
+    mut reload_requests: tokio::sync::mpsc::Receiver<()>,
+    path: PathBuf,
+    mut targets: RouteInventory,
+    mut upstreams: RouteInventory,
+    self_exempt: Option<iptables::SelfExemption>,
+    test_mode: bool,
+) -> Result<RoutingOwnerExit> {
+    loop {
+        let old = config_tx.borrow().clone();
+        let delay = if test_mode {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_secs(old.settings.dns_refresh_secs)
+        };
+        let reload = tokio::select! {
+            request = reload_requests.recv() => {
+                if request.is_none() { bail!("Reload request channel closed unexpectedly"); }
+                true
+            }
+            _ = tokio::time::sleep(delay) => false,
+        };
+        let cfg = if reload {
+            let Some(requested) = prepare_config_reload(&old, &path) else {
+                continue;
+            };
+            Arc::new(requested)
+        } else {
+            old
+        };
+        if !cfg.settings.routing_enabled {
+            tracing::info!("Routing explicitly deactivated; shutting down daemon normally");
+            return Ok(RoutingOwnerExit::Deactivated);
         }
-        Err(_) => false,
+        if !test_mode {
+            let (target_outcomes, upstream_outcomes) =
+                tokio::join!(target_source_outcomes(&cfg), upstream_source_outcomes(&cfg),);
+            // deactivate holds this same directory lock through clear+save.
+            // Exclude its deliberate removal from the publication-failure
+            // path; never race a CLI mutation halfway through that transaction.
+            let lock_path = path.clone();
+            let mutation = match tokio::task::spawn_blocking(move || {
+                util::PersistenceLock::acquire(&lock_path)
+            })
+            .await?
+            {
+                Ok(lock) => lock,
+                Err(error) => {
+                    tracing::warn!(%error, "Routing publication waiting for config mutation; keeping applied generation");
+                    continue;
+                }
+            };
+            // Explicit intent works for load balancing too, where an absent
+            // active_proxy can be a valid running configuration. Kernel
+            // absence alone must never be mislabeled intentional shutdown.
+            if load_config_for_reload(&path).is_ok_and(|disk| !disk.settings.routing_enabled) {
+                tracing::info!("Routing explicitly deactivated; shutting down daemon normally");
+                metrics::IPSET_SIZE.set(0.0);
+                metrics::set_effective_proxy(
+                    cfg.proxies.iter().map(|proxy| proxy.id.as_str()),
+                    None,
+                );
+                return Ok(RoutingOwnerExit::Deactivated);
+            }
+            let upstream_outcomes = match upstream_outcomes {
+                Ok(outcomes) => outcomes,
+                Err(error) => {
+                    tracing::warn!(%error, "Routing refresh rejected; keeping applied configuration");
+                    continue;
+                }
+            };
+            if let Err(error) = commit_owned_routing_generation(
+                &cfg,
+                &mut targets,
+                &mut upstreams,
+                target_outcomes,
+                upstream_outcomes,
+                self_exempt,
+            ) {
+                if error.is::<RoutingCommitFatal>() {
+                    return Err(error);
+                }
+                tracing::warn!(%error, "Routing refresh rejected; keeping applied configuration and kernel generation");
+                continue;
+            }
+            drop(mutation);
+        }
+        if reload {
+            metrics::set_target_proxy_counts(cfg.targets.len(), cfg.proxies.len());
+            config_tx.send_replace(cfg);
+            tracing::info!(path = %path.display(), "Configuration hot-reloaded");
+        }
     }
 }
 
@@ -3469,6 +3585,9 @@ async fn run_daemon() -> Result<()> {
             )
         })?;
     let config = AppConfig::load()?;
+    if !config.settings.routing_enabled {
+        bail!("Routing is disabled; run `rust_proxy activate <id>` before starting the daemon");
+    }
     let report = validation::validate_config(&config, &watch_config_path);
     if report.has_errors() {
         bail!(
@@ -3561,60 +3680,18 @@ async fn run_daemon() -> Result<()> {
         active_id.as_deref(),
     );
 
-    // Collect all proxy hosts to exclude from iptables (prevents redirect loops)
-    let mut upstream_hosts = Vec::new();
-    for proxy in &config.proxies {
-        if let Ok(endpoint) = util::parse_proxy_url(&proxy.url) {
-            upstream_hosts.push(endpoint.host);
-        }
-    }
-    upstream_hosts.sort();
-    upstream_hosts.dedup();
-
-    // Fail closed on total upstream DNS failure. resolve_ipv4 is an Ok-only
-    // wrapper, so the old code could never propagate a resolution failure: a
-    // total outage degraded into an empty exclude set plus a warning, and the
-    // daemon started with NO upstream excludes -- every upstream connection
-    // was then redirected back into this proxy (self-redirect loop).
-    let upstream_report = tokio::select! {
-        report = dns::resolve_parallel(&upstream_hosts) => report,
+    // Every selected upstream needs a known route generation. A partial
+    // startup lookup failure is unsafe too; refresh may retain a previously
+    // successful host, but startup has no such last-good exclusion.
+    let upstream_outcomes = tokio::select! {
+        outcomes = upstream_source_outcomes(&config) => outcomes?,
         _ = sigint.recv() => return Ok(()),
         _ = sigterm.recv() => return Ok(()),
     };
-    if upstream_report.total_failure() {
-        bail!(
-            "DNS resolution failed for ALL {} upstream proxy host(s): {}. \
-             Refusing to start: iptables would get no upstream excludes and \
-             upstream traffic would be redirected back into this proxy \
-             (self-redirect loop). Fix name resolution, then retry.",
-            upstream_report.failed.len(),
-            upstream_report
-                .failed
-                .iter()
-                .map(|(h, _)| h.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    if !upstream_report.failed.is_empty() {
-        tracing::warn!(
-            success_ratio = format!("{:.2}", upstream_report.success_ratio()),
-            "Partial DNS failure resolving upstream proxy host(s)"
-        );
-        for (host, err) in &upstream_report.failed {
-            tracing::warn!(
-                host = %host,
-                error = %err,
-                "Upstream host unresolved; its traffic may be redirected"
-            );
-        }
-    }
-    let upstream_excludes = upstream_report.ipv4_addresses();
-    if upstream_excludes.is_empty() {
-        tracing::warn!(
-            "No IPv4 addresses found for upstream proxies. Upstream traffic may be redirected."
-        );
-    }
+    let (upstream_inventory, upstream_excludes) =
+        stage_upstream_outcomes(&RouteInventory::default(), upstream_outcomes).context(
+            "Refusing to start without known upstream routes. Fix name resolution, then retry",
+        )?;
 
     let state = Arc::new(StateStore::load().await?);
     if let Some(ref id) = active_id {
@@ -3656,6 +3733,7 @@ async fn run_daemon() -> Result<()> {
         None
     };
     let mut target_inventory = RouteInventory::default();
+    let mut routing_self_exempt = None;
     if test_mode {
         tracing::info!("test mode: skipping firewall mutations (ipset/iptables)");
     } else {
@@ -3732,37 +3810,21 @@ async fn run_daemon() -> Result<()> {
             &upstream_excludes,
         )?;
         runtime_state.set_firewall_context(true, bypass_mark).await;
+        proxy::set_daemon_socket_mark(bypass_mark);
+        routing_self_exempt = self_exempt;
+        upstream_inventory.publish_metrics(&RouteInventory::default());
     }
     let flush_task = state.clone().start_flush_loop(Duration::from_secs(5));
-    let mut refresh_rx = config_rx.clone();
-    let refresh_task = if test_mode {
-        tracing::info!("test mode: skipping DNS/ipset refresh task");
-        None
-    } else {
-        Some(tokio::spawn(async move {
-            loop {
-                let delay = Duration::from_secs(refresh_rx.borrow().settings.dns_refresh_secs);
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    changed = refresh_rx.changed() => {
-                        if changed.is_err() { break; }
-                    }
-                }
-                let cfg = refresh_rx.borrow_and_update().clone();
-                let outcomes = target_source_outcomes(&cfg).await;
-                // A change arriving during DNS/feed IO supersedes this generation.
-                if !Arc::ptr_eq(&cfg, &refresh_rx.borrow()) {
-                    continue;
-                }
-                match commit_target_outcomes(&cfg, &mut target_inventory, outcomes) {
-                    Ok(count) => tracing::info!(entries = count, "Target routes refreshed"),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "Target refresh failed; keeping live ipset")
-                    }
-                }
-            }
-        }))
-    };
+    let (reload_requests, reload_rx) = tokio::sync::mpsc::channel(1);
+    let mut routing_task = tokio::spawn(routing_owner_loop(
+        config_tx.clone(),
+        reload_rx,
+        watch_config_path.clone(),
+        target_inventory,
+        upstream_inventory,
+        routing_self_exempt,
+        test_mode,
+    ));
 
     let ping_rx = config_rx.clone();
     let state_clone = state.clone();
@@ -3853,13 +3915,12 @@ async fn run_daemon() -> Result<()> {
     // Reload source: fs-event watcher drives the same validated reload path
     // as SIGHUP. Poll cadence bounds worst-case reload latency; debounce is
     // handled inside ConfigWatcher::poll.
-    let watcher_tx = config_tx.clone();
-    let watcher_path = watch_config_path.clone();
+    let watcher_requests = reload_requests.clone();
     let watcher_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if config_watcher.poll() {
-                reload_config_once(&watcher_tx, &watcher_path).await;
+                let _ = watcher_requests.try_send(());
             }
         }
     });
@@ -3867,6 +3928,7 @@ async fn run_daemon() -> Result<()> {
     let mut proxy_finished = false;
     let mut health_finished = false;
     let mut metrics_finished = false;
+    let mut routing_finished = false;
     let outcome = loop {
         tokio::select! {
             _ = sigint.recv() => {
@@ -3879,7 +3941,15 @@ async fn run_daemon() -> Result<()> {
             }
             _ = sighup.recv() => {
                 tracing::info!("SIGHUP received: reloading configuration");
-                reload_config_once(&config_tx, &watch_config_path).await;
+                let _ = reload_requests.try_send(());
+            }
+            result = &mut routing_task => {
+                routing_finished = true;
+                break match result {
+                    Ok(Ok(RoutingOwnerExit::Deactivated)) => Ok(()),
+                    Ok(Err(error)) => Err(error.context("Routing owner failed")),
+                    Err(error) => Err(anyhow::anyhow!("Routing owner task failed: {error}")),
+                };
             }
             result = &mut proxy_task => {
                 proxy_finished = true;
@@ -3908,9 +3978,9 @@ async fn run_daemon() -> Result<()> {
     let _ = proxy_shutdown_tx.send(true);
     watcher_task.abort();
     let _ = watcher_task.await;
-    if let Some(refresh_task) = refresh_task {
-        refresh_task.abort();
-        let _ = refresh_task.await;
+    if !routing_finished {
+        routing_task.abort();
+        let _ = routing_task.await;
     }
     if let Some(ping_task) = ping_task {
         ping_task.abort();
@@ -3963,7 +4033,7 @@ async fn run_daemon() -> Result<()> {
 async fn ping_proxy(host: &str, port: u16, timeout_ms: u64) -> Result<f64> {
     let timeout = util::format_timeout(timeout_ms)?;
     let start = Instant::now();
-    let connect = TcpStream::connect((host, port));
+    let connect = proxy::connect_daemon_tcp(host, port);
     let stream = tokio::time::timeout(timeout, connect)
         .await
         .context("Ping timed out")??;
@@ -4007,6 +4077,7 @@ fn build_proxy_rows(config: &AppConfig, state: &State) -> Vec<ProxyRow> {
 enum RouteSource {
     Domain(String),
     Provider(&'static str),
+    Upstream(String),
 }
 
 impl RouteSource {
@@ -4014,6 +4085,7 @@ impl RouteSource {
         match self {
             Self::Domain(domain) => format!("dns:{domain}"),
             Self::Provider(provider) => format!("provider:{provider}"),
+            Self::Upstream(host) => format!("upstream:{host}"),
         }
     }
 }
@@ -4038,9 +4110,12 @@ impl RouteInventory {
         self.sources.retain(|source, _| enabled.contains(source));
         for (source, outcome) in outcomes {
             let label = source.label();
+            // A successfully resolved IPv6-only upstream needs no IPv4 NAT
+            // exclusion. Target/provider sources still require usable IPv4.
+            let upstream = matches!(source, RouteSource::Upstream(_));
             let cached = self.sources.entry(source).or_default();
             match outcome {
-                Ok(entries) if !entries.is_empty() => {
+                Ok(entries) if !entries.is_empty() || upstream => {
                     cached.entries = entries;
                     cached.last_success_at = Some(chrono::Utc::now());
                     cached.last_error = None;
@@ -4055,6 +4130,13 @@ impl RouteInventory {
                 }
             }
         }
+        self.sources
+            .values()
+            .flat_map(|source| source.entries.iter().cloned())
+            .collect()
+    }
+
+    fn entries(&self) -> HashSet<String> {
         self.sources
             .values()
             .flat_map(|source| source.entries.iter().cloned())
@@ -4080,6 +4162,146 @@ impl RouteInventory {
                 });
         }
     }
+}
+
+async fn upstream_source_outcomes(config: &AppConfig) -> Result<Vec<SourceOutcome>> {
+    let mut hosts = config
+        .proxies
+        .iter()
+        .map(|proxy| proxy::UpstreamProxy::from_config(proxy).map(|proxy| proxy.host))
+        .collect::<Result<Vec<_>>>()?;
+    hosts.sort();
+    hosts.dedup();
+    let report = dns::resolve_parallel(&hosts).await;
+    tracing::info!(
+        success_ratio = report.success_ratio(),
+        total_failure = report.total_failure(),
+        "Upstream DNS generation resolved"
+    );
+    Ok(upstream_outcomes_from_report(hosts, &report))
+}
+
+fn upstream_outcomes_from_report(
+    hosts: Vec<String>,
+    report: &dns::DnsResolutionReport,
+) -> Vec<SourceOutcome> {
+    hosts
+        .into_iter()
+        .map(|host| {
+            let resolved = report
+                .resolved
+                .iter()
+                .find(|(name, ips)| name == &host && !ips.is_empty());
+            let outcome = resolved
+                .map(|(_, ips)| {
+                    ips.iter()
+                        .filter_map(|ip| match ip {
+                            std::net::IpAddr::V4(ip) => Some(ip.to_string()),
+                            std::net::IpAddr::V6(_) => None,
+                        })
+                        .collect()
+                })
+                .ok_or_else(|| anyhow::anyhow!("Upstream DNS lookup failed for {host}"));
+            (RouteSource::Upstream(host), outcome)
+        })
+        .collect()
+}
+
+fn stage_upstream_outcomes(
+    previous: &RouteInventory,
+    outcomes: Vec<SourceOutcome>,
+) -> Result<(RouteInventory, HashSet<String>)> {
+    let mut candidate = previous.clone();
+    let entries = candidate.apply(outcomes);
+    for (source, routes) in &candidate.sources {
+        if routes.last_success_at.is_none() {
+            bail!("No known route for {}; refusing configuration without a safe upstream exclusion generation", source.label());
+        }
+    }
+    Ok((candidate, entries))
+}
+
+#[derive(Debug)]
+struct RoutingCommitFatal(String);
+
+impl std::fmt::Display for RoutingCommitFatal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for RoutingCommitFatal {}
+
+fn equivalent_route_entries(left: &HashSet<String>, right: &HashSet<String>) -> bool {
+    let canonical = |entries: &HashSet<String>| {
+        entries
+            .iter()
+            .map(|entry| entry.strip_suffix("/32").unwrap_or(entry).to_string())
+            .collect::<HashSet<_>>()
+    };
+    canonical(left) == canonical(right)
+}
+
+fn commit_owned_routing_generation(
+    config: &AppConfig,
+    targets: &mut RouteInventory,
+    upstreams: &mut RouteInventory,
+    target_outcomes: Vec<SourceOutcome>,
+    upstream_outcomes: Vec<SourceOutcome>,
+    self_exempt: Option<iptables::SelfExemption>,
+) -> Result<()> {
+    let (next_targets, entries) = stage_target_outcomes(config, targets, target_outcomes)?;
+    let (next_upstreams, excluded) = stage_upstream_outcomes(upstreams, upstream_outcomes)?;
+    let old_excluded = upstreams.entries();
+    let changed_exclusions = excluded != old_excluded;
+    if changed_exclusions && self_exempt.is_none() && !old_excluded.is_subset(&excluded) {
+        bail!("Removing upstream exclusions requires SO_MARK for in-flight configurations; restart the daemon with that capability");
+    }
+    if changed_exclusions {
+        iptables::replace_owned_chain(
+            &config.settings.chain_name,
+            &config.settings.ipset_name,
+            config.settings.listen_port,
+            self_exempt,
+            &excluded,
+        )?;
+    }
+    if let Err(error) = iptables::sync_ipset(&config.settings.ipset_name, &entries) {
+        // restore's final destroy can fail after swap committed. Inspect the
+        // actual set before deciding whether this generation needs rollback.
+        let observed =
+            iptables::ipset_members(&config.settings.ipset_name).map_err(|inspection| {
+                RoutingCommitFatal(format!(
+                    "Cannot establish ipset publication state after {error}: {inspection}"
+                ))
+            })?;
+        if equivalent_route_entries(&observed, &entries) {
+            tracing::warn!(%error, "Routing swap committed; temporary-set cleanup failed");
+        } else {
+            if !equivalent_route_entries(&observed, &targets.entries()) {
+                return Err(RoutingCommitFatal(format!(
+                    "Live ipset differs from both known generations after {error}"
+                ))
+                .into());
+            }
+            if changed_exclusions {
+                iptables::replace_owned_chain(&config.settings.chain_name, &config.settings.ipset_name,
+                    config.settings.listen_port, self_exempt, &old_excluded)
+                    .map_err(|rollback| RoutingCommitFatal(format!("Routing publication failed: {error}; exclusion rollback failed: {rollback}")))?;
+            }
+            return Err(error);
+        }
+    }
+    next_targets.publish_metrics(targets);
+    next_upstreams.publish_metrics(upstreams);
+    metrics::IPSET_SIZE.set(entries.len() as f64);
+    *targets = next_targets;
+    *upstreams = next_upstreams;
+    tracing::info!(
+        entries = entries.len(),
+        upstream_exclusions = excluded.len(),
+        "Routing generation applied"
+    );
+    Ok(())
 }
 
 /// All source outcomes belong to one generation; a nonempty feed cannot hide
@@ -4165,11 +4387,11 @@ where
     outcomes
 }
 
-fn commit_target_outcomes(
+fn stage_target_outcomes(
     config: &AppConfig,
-    inventory: &mut RouteInventory,
+    inventory: &RouteInventory,
     outcomes: Vec<SourceOutcome>,
-) -> Result<usize> {
+) -> Result<(RouteInventory, HashSet<String>)> {
     let mut candidate = inventory.clone();
     let entries = candidate.apply(outcomes);
     if !config.targets.is_empty()
@@ -4179,6 +4401,15 @@ fn commit_target_outcomes(
     {
         bail!("No configured target has usable IPv4 coverage; refusing to publish provider-only routing");
     }
+    Ok((candidate, entries))
+}
+
+fn commit_target_outcomes(
+    config: &AppConfig,
+    inventory: &mut RouteInventory,
+    outcomes: Vec<SourceOutcome>,
+) -> Result<usize> {
+    let (candidate, entries) = stage_target_outcomes(config, inventory, outcomes)?;
     iptables::sync_ipset(&config.settings.ipset_name, &entries)?;
     candidate.publish_metrics(inventory);
     metrics::IPSET_SIZE.set(entries.len() as f64);
@@ -4210,6 +4441,272 @@ mod tests {
 
     fn route_set(entries: &[&str]) -> HashSet<String> {
         entries.iter().map(|entry| entry.to_string()).collect()
+    }
+
+    #[derive(Default)]
+    struct RoutingBackend {
+        members: HashSet<String>,
+        chains: Vec<String>,
+        fail_chain: usize,
+        reject_set: bool,
+        post_swap_error: bool,
+        unreadable: bool,
+    }
+    thread_local! {
+        static ROUTING_BACKEND: std::cell::RefCell<RoutingBackend> = std::cell::RefCell::new(RoutingBackend::default());
+    }
+
+    fn routing_backend(program: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
+        ROUTING_BACKEND.with(|backend| {
+            let mut backend = backend.borrow_mut();
+            match (program, args[0]) {
+                ("iptables-restore", "--noflush") => {
+                    assert_eq!(args, ["--noflush", "--wait", "2"]);
+                    backend.chains.push(stdin.unwrap().into());
+                    if backend.fail_chain == backend.chains.len() {
+                        bail!("controlled NAT transaction rejection");
+                    }
+                    Ok(String::new())
+                }
+                ("ipset", "list") => {
+                    if backend.unreadable {
+                        bail!("controlled inspection refusal");
+                    }
+                    Ok(format!(
+                        "Name: owner_routes\nMembers:\n{}",
+                        backend
+                            .members
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ))
+                }
+                ("ipset", "restore") => {
+                    if backend.reject_set {
+                        bail!("controlled pre-swap refusal");
+                    }
+                    backend.members = stdin
+                        .unwrap()
+                        .lines()
+                        .filter(|line| line.starts_with("add "))
+                        .map(|line| line.split_whitespace().nth(2).unwrap().to_string())
+                        .collect();
+                    if backend.post_swap_error {
+                        bail!("controlled post-swap destroy failure");
+                    }
+                    Ok(String::new())
+                }
+                _ => bail!("unexpected routing command: {program} {args:?}"),
+            }
+        })
+    }
+
+    fn owner_fixture() -> (AppConfig, RouteInventory, RouteInventory) {
+        let config = AppConfig {
+            settings: Settings {
+                chain_name: "OWNER_CHAIN".into(),
+                ipset_name: "owner_routes".into(),
+                ..Settings::default()
+            },
+            targets: vec![TargetSpec::Simple("owner-target.invalid".into())],
+            ..AppConfig::default()
+        };
+        let mut targets = RouteInventory::default();
+        targets.apply(vec![(
+            RouteSource::Domain("owner-target.invalid".into()),
+            Ok(route_set(&["198.51.100.1"])),
+        )]);
+        let mut upstreams = RouteInventory::default();
+        upstreams.apply(vec![(
+            RouteSource::Upstream("old.invalid".into()),
+            Ok(route_set(&["192.0.2.1"])),
+        )]);
+        ROUTING_BACKEND.with(|backend| {
+            *backend.borrow_mut() = RoutingBackend {
+                members: targets.entries(),
+                ..RoutingBackend::default()
+            }
+        });
+        (config, targets, upstreams)
+    }
+
+    fn next_owner_outcomes() -> (Vec<SourceOutcome>, Vec<SourceOutcome>) {
+        (
+            vec![(
+                RouteSource::Domain("owner-target.invalid".into()),
+                Ok(route_set(&["198.51.100.2"])),
+            )],
+            vec![(
+                RouteSource::Upstream("new.invalid".into()),
+                Ok(route_set(&["192.0.2.2"])),
+            )],
+        )
+    }
+
+    #[test]
+    fn routing_owner_reconciles_exclusions_and_target_publication() -> Result<()> {
+        let (config, mut targets, mut upstreams) = owner_fixture();
+        let (target_outcomes, upstream_outcomes) = next_owner_outcomes();
+        iptables::with_test_spawn(routing_backend, || {
+            commit_owned_routing_generation(
+                &config,
+                &mut targets,
+                &mut upstreams,
+                target_outcomes,
+                upstream_outcomes,
+                Some(iptables::SelfExemption::Mark(iptables::DIRECT_BYPASS_MARK)),
+            )
+        })?;
+        assert_eq!(targets.entries(), route_set(&["198.51.100.2"]));
+        assert_eq!(upstreams.entries(), route_set(&["192.0.2.2"]));
+        ROUTING_BACKEND.with(|backend| {
+            let backend = backend.borrow();
+            assert_eq!(backend.chains.len(), 1);
+            let chain = &backend.chains[0];
+            assert!(chain.starts_with("*nat\n:OWNER_CHAIN - [0:0]\n-F OWNER_CHAIN\n"));
+            assert!(chain.contains("-d 192.0.2.2 -j RETURN"));
+            assert!(!chain.contains("192.0.2.1"));
+            assert!(!chain.contains("OUTPUT"));
+            assert!(chain.ends_with("\nCOMMIT\n"));
+            assert_eq!(backend.members, targets.entries());
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn routing_owner_rolls_back_exclusions_only_before_an_uncommitted_swap() {
+        for failed_rollback in [false, true] {
+            let (config, mut targets, mut upstreams) = owner_fixture();
+            ROUTING_BACKEND.with(|backend| {
+                let mut backend = backend.borrow_mut();
+                backend.reject_set = true;
+                backend.fail_chain = if failed_rollback { 2 } else { 0 };
+            });
+            let (target_outcomes, upstream_outcomes) = next_owner_outcomes();
+            let result = iptables::with_test_spawn(routing_backend, || {
+                commit_owned_routing_generation(
+                    &config,
+                    &mut targets,
+                    &mut upstreams,
+                    target_outcomes,
+                    upstream_outcomes,
+                    Some(iptables::SelfExemption::Mark(iptables::DIRECT_BYPASS_MARK)),
+                )
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err().is::<RoutingCommitFatal>(),
+                failed_rollback
+            );
+            assert_eq!(targets.entries(), route_set(&["198.51.100.1"]));
+            assert_eq!(upstreams.entries(), route_set(&["192.0.2.1"]));
+            ROUTING_BACKEND.with(|backend| {
+                let backend = backend.borrow();
+                assert_eq!(backend.chains.len(), 2);
+                assert!(backend.chains[1].contains("-d 192.0.2.1 -j RETURN"));
+                assert_eq!(backend.members, targets.entries());
+            });
+        }
+    }
+
+    #[test]
+    fn routing_owner_recognizes_a_committed_swap_despite_final_destroy_failure() -> Result<()> {
+        let (config, mut targets, mut upstreams) = owner_fixture();
+        ROUTING_BACKEND.with(|backend| backend.borrow_mut().post_swap_error = true);
+        let (target_outcomes, upstream_outcomes) = next_owner_outcomes();
+        iptables::with_test_spawn(routing_backend, || {
+            commit_owned_routing_generation(
+                &config,
+                &mut targets,
+                &mut upstreams,
+                target_outcomes,
+                upstream_outcomes,
+                Some(iptables::SelfExemption::Mark(iptables::DIRECT_BYPASS_MARK)),
+            )
+        })?;
+        assert_eq!(targets.entries(), route_set(&["198.51.100.2"]));
+        assert_eq!(upstreams.entries(), route_set(&["192.0.2.2"]));
+        ROUTING_BACKEND.with(|backend| assert_eq!(backend.borrow().chains.len(), 1));
+        Ok(())
+    }
+
+    #[test]
+    fn routing_owner_refuses_unknown_commit_state_and_unsafe_unmarked_retirement() {
+        for unreadable in [false, true] {
+            let (config, mut targets, mut upstreams) = owner_fixture();
+            if unreadable {
+                ROUTING_BACKEND.with(|backend| {
+                    let mut backend = backend.borrow_mut();
+                    backend.unreadable = true;
+                    backend.reject_set = true;
+                });
+            }
+            let (target_outcomes, upstream_outcomes) = next_owner_outcomes();
+            let exemption =
+                unreadable.then_some(iptables::SelfExemption::Mark(iptables::DIRECT_BYPASS_MARK));
+            let error = iptables::with_test_spawn(routing_backend, || {
+                commit_owned_routing_generation(
+                    &config,
+                    &mut targets,
+                    &mut upstreams,
+                    target_outcomes,
+                    upstream_outcomes,
+                    exemption,
+                )
+            })
+            .unwrap_err();
+            assert_eq!(error.is::<RoutingCommitFatal>(), unreadable);
+            assert_eq!(targets.entries(), route_set(&["198.51.100.1"]));
+            assert_eq!(upstreams.entries(), route_set(&["192.0.2.1"]));
+            if !unreadable {
+                ROUTING_BACKEND.with(|backend| assert!(backend.borrow().chains.is_empty()));
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_outages_retain_per_host_entries_but_unknown_hosts_refuse_generation() -> Result<()>
+    {
+        let (_, _, previous) = owner_fixture();
+        let (retained, entries) = stage_upstream_outcomes(
+            &previous,
+            vec![(
+                RouteSource::Upstream("old.invalid".into()),
+                Err(anyhow::anyhow!("resolver outage")),
+            )],
+        )?;
+        assert_eq!(entries, route_set(&["192.0.2.1"]));
+        assert!(
+            retained.sources[&RouteSource::Upstream("old.invalid".into())]
+                .last_error
+                .is_some()
+        );
+        assert!(stage_upstream_outcomes(
+            &previous,
+            vec![(
+                RouteSource::Upstream("new.invalid".into()),
+                Err(anyhow::anyhow!("resolver outage"))
+            )]
+        )
+        .is_err());
+        let report = dns::DnsResolutionReport {
+            resolved: vec![("ipv6.invalid".into(), vec!["::1".parse()?])],
+            failed: vec![],
+            total_domains: 1,
+            elapsed: Duration::ZERO,
+        };
+        let (ipv6, exclusions) = stage_upstream_outcomes(
+            &previous,
+            upstream_outcomes_from_report(vec!["ipv6.invalid".into()], &report),
+        )?;
+        assert!(exclusions.is_empty());
+        assert_eq!(ipv6.sources.len(), 1);
+        assert!(ipv6
+            .sources
+            .values()
+            .all(|source| source.last_error.is_none()));
+        Ok(())
     }
 
     struct RouteLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -4631,9 +5128,7 @@ mod tests {
         requested.settings.metrics_port += 1;
         requested.settings.dns_refresh_secs = 900;
         std::fs::write(&path, toml::to_string(&requested).unwrap()).unwrap();
-        let (sender, receiver) = tokio::sync::watch::channel(Arc::new(original.clone()));
-        assert!(reload_config_once(&sender, &path).await);
-        let applied = receiver.borrow().clone();
+        let applied = prepare_config_reload(&original, &path).unwrap();
         assert_eq!(applied.settings.listen_port, original.settings.listen_port);
         assert_eq!(applied.settings.chain_name, original.settings.chain_name);
         assert_eq!(applied.settings.ipset_name, original.settings.ipset_name);

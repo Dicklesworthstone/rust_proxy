@@ -3,6 +3,7 @@ use base64::engine::general_purpose::STANDARD as Base64;
 use base64::Engine as _;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +20,33 @@ use crate::state::{RuntimeState, StateStore};
 const TRY_ALL_TIMEOUT_PER_PROXY_SECS: u64 = 10;
 const CONNECT_HEADER_LIMIT: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 256;
+
+// Installed once at startup after the matching NAT RETURN rule succeeds.
+// Standalone CLI probes and rootless tests retain ordinary unmarked sockets.
+static DAEMON_SOCKET_MARK: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_daemon_socket_mark(mark: Option<u32>) {
+    DAEMON_SOCKET_MARK.store(mark.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Exempt daemon upstream traffic before SYN, including DNS changes and
+/// connections accepted under a configuration whose exclusions were removed.
+/// A required mark failure never falls back to an unmarked connection.
+pub async fn connect_daemon_tcp(host: &str, port: u16) -> Result<TcpStream> {
+    let mark = DAEMON_SOCKET_MARK.load(Ordering::Relaxed);
+    if mark == 0 {
+        return TcpStream::connect((host, port)).await.map_err(Into::into);
+    }
+    let addresses = tokio::net::lookup_host((host, port)).await?;
+    let mut last_error = None;
+    for address in addresses {
+        match connect_with_mark(address, mark).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Upstream resolved to no socket addresses")))
+}
 
 /// Guard that tracks connection metrics with RAII pattern.
 ///
@@ -841,17 +869,17 @@ async fn direct_connect(
 async fn connect_with_mark(addr: SocketAddr, mark: u32) -> Result<TcpStream> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
-        .context("Failed creating direct-connect socket")?;
+        .context("Failed creating marked daemon socket")?;
     sock.set_mark(mark)
-        .context("Failed setting SO_MARK on direct-connect socket")?;
+        .context("Failed setting SO_MARK on daemon socket")?;
     sock.set_nonblocking(true)
-        .context("Failed setting non-blocking mode on direct-connect socket")?;
+        .context("Failed setting non-blocking mode on daemon socket")?;
     // A cancellable async connect releases the socket on timeout. A blocking
     // pool connect would survive cancellation and could stall runtime shutdown.
     tokio::net::TcpSocket::from_std_stream(std::net::TcpStream::from(sock))
         .connect(addr)
         .await
-        .context("Marked direct connect failed")
+        .context("Marked daemon connect failed")
 }
 
 /// Probe whether this process may set SO_MARK (requires CAP_NET_ADMIN).
@@ -1051,7 +1079,7 @@ async fn connect_with_retry(upstream: &UpstreamProxy, config: &RetryConfig) -> R
 
     for attempt in 0..=config.max_retries {
         let connected =
-            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, port)))
+            tokio::time::timeout(Duration::from_secs(5), connect_daemon_tcp(host, port))
                 .await
                 .context("Upstream TCP connect timed out")?;
         match connected {

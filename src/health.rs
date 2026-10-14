@@ -195,7 +195,7 @@ async fn check_proxy_get(upstream: &UpstreamProxy, url: &str) -> Result<()> {
         }
         return check_https_get(stream, &parsed_url, roots).await;
     }
-    let mut stream = TcpStream::connect(format!("{}:{}", upstream.host, upstream.port)).await?;
+    let mut stream = crate::proxy::connect_daemon_tcp(&upstream.host, upstream.port).await?;
     send_get(&mut stream, &parsed_url, true, &upstream.auth_header()).await
 }
 

@@ -352,6 +352,49 @@ pub fn apply_rules(
     Ok(())
 }
 
+/// Replace only our existing NAT chain in one table transaction. OUTPUT jumps
+/// and unrelated chains survive; a rejected restore never publishes a partial
+/// series of RETURN/REDIRECT commands.
+pub fn replace_owned_chain(
+    chain_name: &str,
+    ipset_name: &str,
+    listen_port: u16,
+    self_exempt: Option<SelfExemption>,
+    exclude_dests: &HashSet<String>,
+) -> Result<()> {
+    validate_chain_name(chain_name)?;
+    validate_ipset_name(ipset_name)?;
+    let mut excluded = exclude_dests
+        .iter()
+        .map(|ip| {
+            ip.parse::<std::net::Ipv4Addr>()
+                .context("Invalid upstream IPv4 exclusion")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    excluded.sort();
+    let mut payload = format!(
+        "*nat\n:{chain_name} - [0:0]\n-F {chain_name}\n-A {chain_name} -d 127.0.0.0/8 -j RETURN\n"
+    );
+    if let Some(SelfExemption::Mark(mark)) = self_exempt {
+        payload.push_str(&format!(
+            "-A {chain_name} -m mark --mark {mark} -j RETURN\n"
+        ));
+    }
+    for ip in excluded {
+        payload.push_str(&format!("-A {chain_name} -p tcp -d {ip} -j RETURN\n"));
+    }
+    payload.push_str(&format!("-A {chain_name} -p tcp -m set --match-set {ipset_name} dst -j REDIRECT --to-ports {listen_port}\nCOMMIT\n"));
+    run_with_stdin("iptables-restore", &["--noflush", "--wait", "2"], &payload)?;
+    Ok(())
+}
+
+/// Reconcile a potentially failed batch's commit point against live members.
+/// An ipset restore may have completed swap before its final destroy failed.
+pub fn ipset_members(ipset_name: &str) -> Result<HashSet<String>> {
+    validate_ipset_name(ipset_name)?;
+    current_ipset_members(ipset_name)
+}
+
 pub fn clear_rules(chain_name: &str, ipset_name: &str) -> Result<()> {
     validate_chain_name(chain_name)?;
     validate_ipset_name(ipset_name)?;

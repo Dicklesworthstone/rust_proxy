@@ -667,5 +667,12 @@ async fn deactivate_reports_permission_failure_and_accepts_confirmed_absence() -
     assert!(String::from_utf8_lossy(&absent.stdout).contains("deactivated"));
     let config: toml::Value = toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
     assert!(config.get("active_proxy").is_none());
+    assert_eq!(config["settings"]["routing_enabled"].as_bool(), Some(false));
+    assert!(harness.run_command(&["activate", "upstream"]).success);
+    let reactivated: toml::Value = toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
+    assert_eq!(
+        reactivated["settings"]["routing_enabled"].as_bool(),
+        Some(true)
+    );
     Ok(())
 }

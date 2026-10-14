@@ -405,6 +405,9 @@ pub fn infer_provider(domain: &str) -> Option<Provider> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// Desired routing state. deactivate clears this; activate sets it.
+    #[serde(default = "default_routing_enabled")]
+    pub routing_enabled: bool,
     pub listen_port: u16,
     pub dns_refresh_secs: u64,
     pub ping_interval_secs: u64,
@@ -517,6 +520,10 @@ fn default_consecutive_failures_threshold() -> u32 {
     3
 }
 
+fn default_routing_enabled() -> bool {
+    true
+}
+
 fn default_auto_failover() -> bool {
     true
 }
@@ -536,6 +543,7 @@ fn default_degradation_delay_secs() -> u64 {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            routing_enabled: default_routing_enabled(),
             listen_port: 12345,
             dns_refresh_secs: 300,
             ping_interval_secs: 60,
@@ -1151,7 +1159,7 @@ impl AppConfig {
 
 /// TOML's diagnostic display includes the source line, which may be a password.
 /// Keep a useful location without attaching that unredacted error as a cause.
-fn parse_config_text(content: &str, path: &std::path::Path) -> Result<AppConfig> {
+pub(crate) fn parse_config_text(content: &str, path: &std::path::Path) -> Result<AppConfig> {
     toml::from_str(content).map_err(|error: toml::de::Error| {
         let offset = error.span().map_or(0, |span| span.start);
         let prefix = content.get(..offset).unwrap_or_default();

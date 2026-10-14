@@ -200,6 +200,10 @@ sudo rust_proxy daemon
 ```
 
 ### `rust_proxy deactivate`
+
+Successful deactivation clears `settings.routing_enabled` and the daemon shuts
+down normally after draining its tunnels and flushing stats. `activate` enables
+routing again. `--keep-rules` preserves routing intent and the existing rules.
 Disable routing (clears iptables/ipset when root).
 
 ```bash
@@ -319,6 +323,7 @@ domain = "console.cloud.google.com"
 provider = "google"
 
 [settings]
+routing_enabled = true # activate enables routing; deactivate disables it
 listen_port = 12345
 # Refresh DNS + provider ranges every 5 minutes
 dns_refresh_secs = 300
