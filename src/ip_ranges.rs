@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use futures::FutureExt;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -6,19 +7,37 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 const MAX_FEED_BYTES: usize = 16 * 1024 * 1024;
-static FEED_CLIENT: LazyLock<Result<reqwest::Client>> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .user_agent("OpenAI File Downloader, XaiImageApiFetch/1.0")
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("Failed building provider-feed HTTP client")
+type FeedClient = futures::future::Shared<
+    futures::future::BoxFuture<'static, std::result::Result<reqwest::Client, String>>,
+>;
+static FEED_CLIENT: LazyLock<FeedClient> = LazyLock::new(|| {
+    // Native TLS trust discovery can perform blocking filesystem I/O. Its one
+    // owned constructor survives a timed-out caller; later probes adopt its
+    // result instead of spawning another stalled trust reader.
+    let task = tokio::task::spawn_blocking(|| {
+        reqwest::Client::builder()
+            .user_agent("OpenAI File Downloader, XaiImageApiFetch/1.0")
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| format!("Failed building provider-feed HTTP client: {error}"))
+    });
+    async move {
+        task.await
+            .map_err(|error| format!("Provider-feed client constructor failed: {error}"))?
+    }
+    .boxed()
+    .shared()
 });
 
 async fn fetch_body(url: &str) -> Result<Vec<u8>> {
-    let client = FEED_CLIENT
-        .as_ref()
-        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    tokio::time::timeout(Duration::from_secs(10), fetch_body_with_client(url))
+        .await
+        .context("Provider-feed total request/body budget exceeded (ten seconds)")?
+}
+
+async fn fetch_body_with_client(url: &str) -> Result<Vec<u8>> {
+    let client = FEED_CLIENT.clone().await.map_err(anyhow::Error::msg)?;
     let mut response = client
         .get(url)
         .send()
@@ -189,5 +208,43 @@ mod tests {
             }
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn silent_feed_uses_product_deadline_and_releases_its_socket() -> Result<()> {
+        silent_feed_deadline(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n").await
+    }
+
+    #[tokio::test]
+    async fn stalled_feed_body_uses_product_deadline_and_releases_its_socket() -> Result<()> {
+        silent_feed_deadline(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nd").await
+    }
+
+    async fn silent_feed_deadline(response: &'static [u8]) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await?;
+                request.push(byte[0]);
+            }
+            // Leave either the head or body incomplete. No fixture timeout can
+            // produce the failure: the client's own budget must close the socket.
+            stream.write_all(response).await?;
+            let mut byte = [0];
+            Ok::<_, anyhow::Error>(stream.read(&mut byte).await?)
+        });
+        let start = std::time::Instant::now();
+        let result = fetch_body(&format!("http://{addr}/silent-ranges")).await;
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(12));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), server).await???,
+            0
+        );
+        Ok(())
     }
 }
