@@ -701,6 +701,146 @@ impl From<bool> for DryRun {
     }
 }
 
+/// Advisory transactions lock the directory inode, which survives atomic
+/// replacement and needs no persistent sidecar with cross-user ownership.
+/// Config and state mutations sharing a directory serialize together.
+pub struct PersistenceLock {
+    _directory: std::fs::File,
+}
+
+impl PersistenceLock {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = publication_path(path)?;
+        let parent = nonempty_parent(&path);
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed creating persistence directory {}", parent.display())
+        })?;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(parent)
+            .with_context(|| {
+                format!("Failed opening persistence directory {}", parent.display())
+            })?;
+        let started = std::time::Instant::now();
+        loop {
+            // SAFETY: the descriptor belongs to a live directory File. flock
+            // borrows no memory; close releases the lock, including after SIGKILL.
+            if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self {
+                    _directory: directory,
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(error).context("Failed locking persistence directory");
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                return Err(error)
+                    .context("Persistence transaction busy after two seconds; retry the command");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn nonempty_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+pub(crate) fn publication_path(path: &Path) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::canonicalize(path).context("Failed resolving persistence symlink")
+        }
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error).context("Failed inspecting persistence path"),
+    }
+}
+
+pub(crate) fn unique_sibling(path: &Path, kind: &str) -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{kind}-{}-{sequence}", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// Caller holds PersistenceLock through the latest read, mutation and publish.
+/// Rename is the commit point; an error before it leaves the old file intact.
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = publication_path(path)?;
+    let parent = nonempty_parent(&path);
+    std::fs::create_dir_all(parent)?;
+    let previous = match std::fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("Failed inspecting previous persisted file"),
+    };
+    let mut staging = None;
+    for _ in 0..128 {
+        let temp = unique_sibling(&path, "tmp");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+        {
+            Ok(file) => {
+                staging = Some((temp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("Failed creating persistence staging file"),
+        }
+    }
+    let (temp, mut file) = staging.context("No unused persistence staging filename available")?;
+    // Root daemon publications retain the operator's ownership; a new file
+    // inherits its containing directory's owner. Ordinary writers retain their
+    // own ownership, with the previous file's access mode kept when present.
+    // SAFETY: geteuid only reads the process's kernel credential state.
+    if unsafe { libc::geteuid() } == 0 {
+        let owner = match &previous {
+            Some(metadata) => metadata.clone(),
+            None => std::fs::metadata(parent)?,
+        };
+        // SAFETY: live staging-file descriptor and UID/GID from filesystem metadata.
+        if unsafe { libc::fchown(file.as_raw_fd(), owner.uid(), owner.gid()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Failed preserving persisted file ownership");
+        }
+    } else if let Some(previous) = &previous {
+        if file.metadata()?.gid() != previous.gid() {
+            // SAFETY: live file descriptor, unchanged UID and prior file's GID.
+            if unsafe { libc::fchown(file.as_raw_fd(), libc::uid_t::MAX, previous.gid()) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("Failed preserving persisted file group");
+            }
+        }
+    }
+    if let Some(previous) = &previous {
+        file.set_permissions(previous.permissions())?;
+    }
+    file.write_all(content)?;
+    file.sync_all()
+        .context("Failed syncing staged persistence data")?;
+    std::fs::rename(&temp, &path).context("Failed committing persistence publication")?;
+    // Returning an error after the rename would make a delta writer apply its
+    // already committed counters twice on retry. Report durability separately.
+    if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        tracing::warn!(path = %path.display(), %error, "Persistence committed but directory durability sync failed");
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ProxyEndpoint {
     pub host: String,

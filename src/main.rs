@@ -444,6 +444,7 @@ async fn async_main() -> Result<()> {
 
 fn init_config(force: bool, output: &OutputDispatcher) -> Result<()> {
     let config_path = config::config_path()?;
+    let _mutation = util::PersistenceLock::acquire(&config_path)?;
     let state_path = state::state_path()?;
 
     // Check if config already exists
@@ -511,6 +512,11 @@ fn init_config(force: bool, output: &OutputDispatcher) -> Result<()> {
 }
 
 fn proxy_cmd(cmd: ProxyCmd, _output: &OutputDispatcher) -> Result<()> {
+    let _mutation = if matches!(&cmd, ProxyCmd::List) {
+        None
+    } else {
+        Some(util::PersistenceLock::acquire(&config::config_path()?)?)
+    };
     let mut config = AppConfig::load()?;
     match cmd {
         ProxyCmd::Add {
@@ -563,6 +569,11 @@ fn proxy_cmd(cmd: ProxyCmd, _output: &OutputDispatcher) -> Result<()> {
 }
 
 fn targets_cmd(cmd: TargetCmd, output: &OutputDispatcher) -> Result<()> {
+    let _mutation = if matches!(&cmd, TargetCmd::List(_)) {
+        None
+    } else {
+        Some(util::PersistenceLock::acquire(&config::config_path()?)?)
+    };
     let mut config = AppConfig::load()?;
     match cmd {
         TargetCmd::Add { domain, provider } => {
@@ -872,7 +883,7 @@ async fn activate_cmd(
     run: bool,
     _output: &OutputDispatcher,
 ) -> Result<()> {
-    let mut config = AppConfig::load()?;
+    let config = AppConfig::load()?;
     if config.proxies.is_empty() {
         bail!("No proxies configured. Add one first.");
     }
@@ -889,20 +900,25 @@ async fn activate_cmd(
         }
     };
 
+    // Selection can wait for a person. Re-read under the mutation lock only
+    // after it completes, so another CLI operation is never overwritten.
+    let mutation = util::PersistenceLock::acquire(&config::config_path()?)?;
+    let mut config = AppConfig::load()?;
     if !config.proxies.iter().any(|p| p.id == target_id) {
         bail!("Proxy not found: {}", target_id);
     }
 
     config.active_proxy = Some(target_id.clone());
     config.save()?;
+    drop(mutation); // Config/state may share a directory; never nest its flock.
 
     let state_path = state::state_path()?;
-    let mut state = State::load(&state_path)?;
-    let stats = state.proxies.entry(target_id.clone()).or_default();
     let now = chrono::Utc::now();
-    stats.activated_at = Some(now);
-    stats.last_active = Some(now);
-    state.save(&state_path)?;
+    State::update(&state_path, |state| {
+        let stats = state.proxies.entry(target_id.clone()).or_default();
+        stats.activated_at = stats.activated_at.max(Some(now));
+        stats.last_active = stats.last_active.max(Some(now));
+    })?;
 
     println!("Activated proxy {}", target_id.green());
 
@@ -916,6 +932,7 @@ async fn activate_cmd(
 }
 
 fn deactivate_cmd(keep_rules: bool, _output: &OutputDispatcher) -> Result<()> {
+    let _mutation = util::PersistenceLock::acquire(&config::config_path()?)?;
     let mut config = AppConfig::load()?;
     let rules_present = if keep_rules {
         false

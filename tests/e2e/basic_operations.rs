@@ -7,6 +7,222 @@ use crate::common::fixtures;
 use crate::common::mock_proxy::{MockBehavior, MockProxy};
 use crate::common::TestHarness;
 
+#[tokio::test]
+async fn daemon_final_flush_preserves_real_cli_activation_and_exact_traffic() -> anyhow::Result<()>
+{
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } != 0,
+        "persistence daemon seam requires non-root"
+    );
+    let harness = TestHarness::new().await?;
+    let proxy = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
+    let mut proxies = Vec::new();
+    for id in ["first", "second"] {
+        let mut entry = toml::Table::new();
+        entry.insert("id".into(), id.into());
+        entry.insert("url".into(), proxy.url().into());
+        proxies.push(toml::Value::Table(entry));
+    }
+    let root = config.as_table_mut().unwrap();
+    root.insert("proxies".into(), proxies.into());
+    root.insert("active_proxy".into(), "first".into());
+    root.insert(
+        "targets".into(),
+        vec![toml::Value::String("persistence.target.invalid".into())].into(),
+    );
+    let settings = config["settings"].as_table_mut().unwrap();
+    settings.insert("metrics_enabled".into(), false.into());
+    settings.insert("health_check_enabled".into(), false.into());
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    assert!(harness.run_command(&["activate", "first"]).success);
+    let work = tempfile::tempdir()?.keep();
+    let log = work.join("daemon.stderr");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+        .arg("daemon")
+        .env("RUST_PROXY_CONFIG", &harness.config_path)
+        .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+        .env("RUST_PROXY_TEST_MODE", "1")
+        .env(
+            "RUST_PROXY_TEST_ORIGINAL_DST",
+            "persistence.target.invalid:443",
+        )
+        .env("RUST_LOG", "info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log)?)
+        .spawn()?;
+    struct OwnedDaemon(std::process::Child);
+    impl Drop for OwnedDaemon {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let mut daemon = OwnedDaemon(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&log)?.contains("transparent proxy listening") {
+        anyhow::ensure!(
+            daemon.0.try_wait()?.is_none(),
+            "daemon exited before persistence proof"
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "persistence daemon startup exceeded budget"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let payload = b"persistence-counter-delta-payload";
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client =
+                tokio::net::TcpStream::connect(("127.0.0.1", harness.listen_port())).await?;
+            client.write_all(payload).await?;
+            let mut echoed = vec![0; payload.len()];
+            client.read_exact(&mut echoed).await?;
+            anyhow::ensure!(echoed == payload, "persistence tunnel payload mismatch");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+    }
+    assert!(harness.run_command(&["activate", "second"]).success);
+    let path = harness.state_dir.join("state.json");
+    let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let activation = before["proxies"]["second"]["activated_at"].clone();
+    assert!(activation.is_string());
+    assert_eq!(
+        before["proxies"]["first"]["bytes_sent"], 0,
+        "traffic must still be dirty in the daemon cache"
+    );
+    // SAFETY: positive PID of the live child owned by this test, ordinary SIGTERM.
+    anyhow::ensure!(
+        unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) } == 0,
+        "cannot terminate persistence daemon"
+    );
+    let shutdown = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = daemon.0.try_wait()? {
+            assert!(status.success(), "daemon persistence exit failed");
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < shutdown,
+            "final persistence flush exceeded lifetime budget"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    assert_eq!(after["proxies"]["second"]["activated_at"], activation);
+    assert_eq!(after["proxies"]["first"]["bytes_sent"], 3 * payload.len());
+    assert_eq!(
+        after["proxies"]["first"]["bytes_received"],
+        3 * payload.len()
+    );
+    assert_eq!(
+        proxy.request_count(),
+        3,
+        "readiness cannot inflate the traffic denominator"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_config_mutations_wait_for_transaction_and_preserve_both_operations(
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
+    let harness = TestHarness::new().await?;
+    let original = std::fs::read(&harness.config_path)?;
+    let directory = std::fs::File::open(harness.config_path.parent().unwrap())?;
+    // SAFETY: live directory descriptor; the controller owns this exclusive gate.
+    anyhow::ensure!(
+        unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "cannot gate config transactions"
+    );
+    let launch = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+            .args(args)
+            .env("RUST_PROXY_CONFIG", &harness.config_path)
+            .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    };
+    let mut target = launch(&["targets", "add", "first.concurrent.invalid"])?;
+    let mut proxy = launch(&[
+        "proxy",
+        "add",
+        "second-concurrent",
+        "http://127.0.0.1:12345",
+    ])?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let both_waiting = target.try_wait()?.is_none() && proxy.try_wait()?.is_none();
+    let unchanged = std::fs::read(&harness.config_path)? == original;
+    drop(directory);
+    let target = target.wait_with_output()?;
+    let proxy = proxy.wait_with_output()?;
+    assert!(
+        both_waiting && unchanged,
+        "mutations bypassed the exclusive transaction gate"
+    );
+    assert!(
+        target.status.success(),
+        "target command: {}",
+        String::from_utf8_lossy(&target.stderr)
+    );
+    assert!(
+        proxy.status.success(),
+        "proxy command: {}",
+        String::from_utf8_lossy(&proxy.stderr)
+    );
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(&harness.config_path)?)?;
+    assert!(config["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target.as_str() == Some("first.concurrent.invalid")));
+    assert!(config["proxies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|proxy| proxy["id"].as_str() == Some("second-concurrent")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn busy_config_transaction_fails_without_changing_last_good_bytes() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    let harness = TestHarness::new().await?;
+    let original = std::fs::read(&harness.config_path)?;
+    let directory = std::fs::File::open(harness.config_path.parent().unwrap())?;
+    // SAFETY: live test-owned directory descriptor, released by File drop.
+    anyhow::ensure!(
+        unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "cannot hold busy transaction control"
+    );
+    // The controller NEVER releases the lock to produce success; the product
+    // must emit its own bounded failure while the file remains unchanged.
+    let started = std::time::Instant::now();
+    let result = harness.run_command(&["targets", "add", "must-not-publish.invalid"]);
+    drop(directory);
+    assert!(!result.success);
+    assert!(result
+        .stderr
+        .contains("Persistence transaction busy after two seconds"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(std::fs::read(&harness.config_path)?, original);
+    let recovered = harness.run_command(&["targets", "add", "must-not-publish.invalid"]);
+    assert!(
+        recovered.success,
+        "lock remained stranded: {}",
+        recovered.stderr
+    );
+    Ok(())
+}
+
 /// Child-only trust environment: never affect concurrent feed-client tests.
 /// The trust FIFO has no writer or fixture timeout. Only the product's probe
 /// deadline and bounded runtime shutdown can produce the asserted result.

@@ -1126,23 +1126,24 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed reading config {}", path.display()))?;
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed reading config {}", path.display()))
+            }
+        };
         let config = parse_config_text(&content, &path)?;
         Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
         let path = config_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed creating config dir {}", parent.display()))?;
-        }
         let content = toml::to_string_pretty(self)?;
-        fs::write(&path, content)
+        crate::util::atomic_write(&path, content.as_bytes())
             .with_context(|| format!("Failed writing config {}", path.display()))?;
         Ok(())
     }
@@ -1165,13 +1166,9 @@ pub fn default_config_template() -> Result<String> {
     Ok(insert_metrics_comments(&base))
 }
 
-pub fn write_config_template(path: &PathBuf) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed creating config dir {}", parent.display()))?;
-    }
+pub fn write_config_template(path: &std::path::Path) -> Result<()> {
     let content = default_config_template()?;
-    fs::write(path, content)
+    crate::util::atomic_write(path, content.as_bytes())
         .with_context(|| format!("Failed writing config {}", path.display()))?;
     Ok(())
 }
@@ -1192,7 +1189,7 @@ fn insert_metrics_comments(content: &str) -> String {
 /// wins over the XDG default so manual runs and service runs see the same
 /// file. Callers with their own explicit `--config` flag pass that path
 /// directly instead of consulting this function. State paths are NOT
-/// affected: they always resolve to the XDG state dir.
+/// affected: RUST_PROXY_STATE_DIR selects them independently of this config path.
 pub fn config_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("RUST_PROXY_CONFIG") {
         if !path.is_empty() {

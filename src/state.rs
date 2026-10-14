@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
@@ -36,7 +36,7 @@ impl std::fmt::Display for HealthStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ProxyStats {
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -68,57 +68,129 @@ pub struct State {
 }
 
 impl State {
-    pub fn load(path: &PathBuf) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(error).context("Failed reading persisted state"),
+        };
+        if let Ok(state) = serde_json::from_slice(&bytes) {
+            return Ok(state);
         }
-        let parsed = fs::read_to_string(path)
-            .with_context(|| format!("Failed reading state {}", path.display()))
-            .and_then(|content| {
-                serde_json::from_str(&content)
-                    .with_context(|| format!("Failed parsing state {}", path.display()))
-            });
-        match parsed {
+        // A good publication may have replaced what this reader saw. Re-read
+        // under the writer lock before quarantining any canonical file.
+        let _lock = crate::util::PersistenceLock::acquire(path)?;
+        Self::load_locked(path)
+    }
+
+    fn load_locked(path: &Path) -> Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = crate::util::publication_path(path)?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(error).context("Failed reading persisted state"),
+        };
+        match serde_json::from_slice(&bytes) {
             Ok(state) => Ok(state),
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "Corrupt state file; quarantining it and continuing with default state"
-                );
-                let ts = Utc::now().timestamp();
-                let mut sidecar = path.as_os_str().to_os_string();
-                sidecar.push(format!(".corrupt-{}", ts));
-                // Best-effort: a failed quarantine must not block daemon startup.
-                let _ = fs::rename(path, PathBuf::from(sidecar));
-                Ok(Self::default())
+            Err(error) => {
+                let from = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+                for _ in 0..128 {
+                    let sidecar = crate::util::unique_sibling(&path, "corrupt");
+                    let to = std::ffi::CString::new(sidecar.as_os_str().as_bytes())?;
+                    // SAFETY: both live CStrings are NUL-terminated paths; Linux
+                    // RENAME_NOREPLACE prevents overwriting any earlier evidence.
+                    if unsafe {
+                        libc::renameat2(
+                            libc::AT_FDCWD,
+                            from.as_ptr(),
+                            libc::AT_FDCWD,
+                            to.as_ptr(),
+                            libc::RENAME_NOREPLACE,
+                        )
+                    } == 0
+                    {
+                        tracing::warn!(path = %path.display(), %error, "Corrupt state quarantined; using default state");
+                        return Ok(Self::default());
+                    }
+                    let failure = std::io::Error::last_os_error();
+                    if failure.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(failure)
+                            .context("Cannot quarantine corrupt state without losing its bytes");
+                    }
+                }
+                anyhow::bail!("No unused corrupt-state quarantine filename available");
             }
         }
     }
 
-    pub fn save(&self, path: &PathBuf) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed creating state dir {}", parent.display()))?;
+    #[cfg(test)]
+    fn save(&self, path: &Path) -> Result<()> {
+        let _lock = crate::util::PersistenceLock::acquire(path)?;
+        self.save_locked(path)
+    }
+
+    fn save_locked(&self, path: &Path) -> Result<()> {
+        crate::util::atomic_write(path, serde_json::to_string_pretty(self)?.as_bytes())
+    }
+
+    pub fn update(path: &Path, mutate: impl FnOnce(&mut Self)) -> Result<Self> {
+        let _lock = crate::util::PersistenceLock::acquire(path)?;
+        let mut latest = Self::load_locked(path)?;
+        mutate(&mut latest);
+        latest.save_locked(path)?;
+        Ok(latest)
+    }
+}
+
+/// Counters and ping samples are additive deltas. Activity/activation use the
+/// newest timestamp; only a newly recorded health observation owns health fields.
+/// Unchanged cache fields never replace independent disk mutations.
+fn merge_state_delta(latest: &mut State, current: &State, baseline: &State) {
+    let empty = ProxyStats::default();
+    for (id, update) in &current.proxies {
+        let before = baseline.proxies.get(id).unwrap_or(&empty);
+        let destination = latest.proxies.entry(id.clone()).or_default();
+        destination.bytes_sent = destination
+            .bytes_sent
+            .saturating_add(update.bytes_sent.saturating_sub(before.bytes_sent));
+        destination.bytes_received = destination
+            .bytes_received
+            .saturating_add(update.bytes_received.saturating_sub(before.bytes_received));
+        destination.last_active = destination.last_active.max(update.last_active);
+        if update.activated_at != before.activated_at {
+            destination.activated_at = destination.activated_at.max(update.activated_at);
         }
-        let content = serde_json::to_string_pretty(self)?;
-        // Write to a sibling temp file, then atomically rename onto the final
-        // path so readers never observe partial content.
-        let mut tmp_name = path.as_os_str().to_os_string();
-        tmp_name.push(format!(".tmp-{}", std::process::id()));
-        let tmp_path = PathBuf::from(tmp_name);
+        let samples = update.ping_samples.saturating_sub(before.ping_samples);
+        if samples > 0 {
+            let count = destination.ping_samples.saturating_add(samples);
+            if let Some(average) = update.ping_avg_ms {
+                let previous_average = before.ping_avg_ms.unwrap_or(average);
+                let delta_average = average
+                    + (average - previous_average) * (before.ping_samples as f64 / samples as f64);
+                destination.ping_avg_ms = Some(match destination.ping_avg_ms {
+                    Some(existing) => {
+                        existing + (delta_average - existing) * (samples as f64 / count as f64)
+                    }
+                    None => delta_average,
+                });
+            }
+            destination.ping_samples = count;
+            destination.last_ping_at = destination.last_ping_at.max(update.last_ping_at);
+        }
+        if update.last_health_check != before.last_health_check
+            && update.last_health_check >= destination.last_health_check
         {
-            use std::io::Write;
-            let mut f = fs::File::create(&tmp_path)
-                .with_context(|| format!("Failed creating temp state {}", tmp_path.display()))?;
-            f.write_all(content.as_bytes())
-                .with_context(|| format!("Failed writing temp state {}", tmp_path.display()))?;
-            f.flush()
-                .with_context(|| format!("Failed flushing temp state {}", tmp_path.display()))?;
+            destination.health_status = update.health_status;
+            destination.consecutive_failures = update.consecutive_failures;
+            destination.last_health_check = update.last_health_check;
+            destination.last_failure_reason = update.last_failure_reason.clone();
         }
-        fs::rename(&tmp_path, path)
-            .with_context(|| format!("Failed renaming state into place {}", path.display()))?;
-        Ok(())
+        destination.last_healthy = destination.last_healthy.max(update.last_healthy);
     }
 }
 
@@ -130,14 +202,19 @@ pub fn state_path() -> Result<PathBuf> {
 #[derive(Clone)]
 pub struct StateStore {
     inner: Arc<RwLock<State>>,
+    persisted: Arc<tokio::sync::Mutex<State>>,
+    flush_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>>,
     path: PathBuf,
 }
 
 impl StateStore {
     pub async fn load() -> Result<Self> {
         let path = state_path()?;
-        let state = State::load(&path)?;
+        let read_path = path.clone();
+        let state = tokio::task::spawn_blocking(move || State::load(&read_path)).await??;
         Ok(Self {
+            persisted: Arc::new(tokio::sync::Mutex::new(state.clone())),
+            flush_task: Arc::new(tokio::sync::Mutex::new(None)),
             inner: Arc::new(RwLock::new(state)),
             path,
         })
@@ -148,6 +225,8 @@ impl StateStore {
     pub fn new_for_testing() -> Self {
         Self {
             inner: Arc::new(RwLock::new(State::default())),
+            persisted: Arc::new(tokio::sync::Mutex::new(State::default())),
+            flush_task: Arc::new(tokio::sync::Mutex::new(None)),
             path: PathBuf::from("/tmp/test-state.json"),
         }
     }
@@ -274,8 +353,42 @@ impl StateStore {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let state = self.inner.read().await;
-        state.save(&self.path)
+        let mut task = self.flush_task.lock().await;
+        if let Some(pending) = task.as_mut() {
+            // A cancelled caller leaves the owned worker intact. Adopt its
+            // completion and bookkeeping before taking another dirty snapshot.
+            let result = pending.await;
+            *task = None;
+            result.context("Pending persistence worker failed")??;
+        }
+        let store = self.clone();
+        *task = Some(tokio::spawn(async move { store.flush_snapshot().await }));
+        let result = task.as_mut().context("Persistence worker missing")?.await;
+        *task = None;
+        result.context("Persistence worker failed")?
+    }
+
+    async fn flush_snapshot(&self) -> Result<()> {
+        // Serialize this store's commits; traffic/health can keep updating inner
+        // while filesystem work runs on the blocking pool.
+        let mut persisted = self.persisted.lock().await;
+        let before = persisted.clone();
+        let snapshot = self.inner.read().await.clone();
+        let published_snapshot = snapshot.clone();
+        let path = self.path.clone();
+        let published = tokio::task::spawn_blocking(move || {
+            State::update(&path, |latest| {
+                merge_state_delta(latest, &snapshot, &before)
+            })
+        })
+        .await??;
+        let mut current = self.inner.write().await;
+        let mut combined = published.clone();
+        // Keep every update recorded while the snapshot was being committed.
+        merge_state_delta(&mut combined, &current, &published_snapshot);
+        *current = combined;
+        *persisted = published;
+        Ok(())
     }
 
     pub fn start_flush_loop(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
@@ -683,6 +796,291 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store_at(path: PathBuf) -> Result<StateStore> {
+        let initial = State::load(&path)?;
+        Ok(StateStore {
+            inner: Arc::new(RwLock::new(initial.clone())),
+            persisted: Arc::new(tokio::sync::Mutex::new(initial)),
+            flush_task: Arc::new(tokio::sync::Mutex::new(None)),
+            path,
+        })
+    }
+
+    #[tokio::test]
+    async fn stale_daemon_snapshot_preserves_cli_activation_and_adds_only_dirty_counters(
+    ) -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("state.json");
+        State::update(&path, |state| {
+            state.proxies.insert(
+                "shared".into(),
+                ProxyStats {
+                    bytes_sent: 100,
+                    bytes_received: 200,
+                    ping_avg_ms: Some(20.0),
+                    ping_samples: 1,
+                    ..ProxyStats::default()
+                },
+            );
+        })?;
+        let store = store_at(path.clone())?;
+        store.record_traffic("shared", 5, 7).await;
+        store.record_ping("shared", 40.0).await;
+        store
+            .record_health_check("shared", false, None, Some("outage".into()), 1)
+            .await;
+        let activation = Utc::now() + chrono::Duration::seconds(60);
+        State::update(&path, |state| {
+            let stats = state.proxies.get_mut("shared").unwrap();
+            stats.activated_at = Some(activation);
+            stats.last_active = Some(activation);
+            state
+                .proxies
+                .insert("independent-cli".into(), ProxyStats::default());
+        })?;
+        store.flush().await?;
+        store.flush().await?; // Repeated flush cannot reapply acknowledged deltas.
+        let disk = State::load(&path)?;
+        let stats = &disk.proxies["shared"];
+        assert_eq!((stats.bytes_sent, stats.bytes_received), (105, 207));
+        assert_eq!(stats.activated_at, Some(activation));
+        assert_eq!(stats.last_active, Some(activation));
+        assert_eq!(stats.ping_samples, 2);
+        assert_eq!(stats.ping_avg_ms, Some(30.0));
+        assert_eq!(stats.health_status, HealthStatus::Unhealthy);
+        assert_eq!(stats.last_failure_reason.as_deref(), Some("outage"));
+        assert!(disk.proxies.contains_key("independent-cli"));
+        assert_eq!(store.get_all_stats().await["shared"], *stats);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_stale_stores_merge_counter_and_ping_sample_deltas_once() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("state.json");
+        State::update(&path, |state| {
+            state.proxies.insert(
+                "shared".into(),
+                ProxyStats {
+                    bytes_sent: 1,
+                    bytes_received: 2,
+                    ping_avg_ms: Some(10.0),
+                    ping_samples: 1,
+                    ..ProxyStats::default()
+                },
+            );
+        })?;
+        let first = store_at(path.clone())?;
+        let second = store_at(path.clone())?;
+        first.record_traffic("shared", 3, 4).await;
+        second.record_traffic("shared", 5, 6).await;
+        first.record_ping("shared", 30.0).await;
+        second.record_ping("shared", 50.0).await;
+        let (a, b) = tokio::join!(first.flush(), second.flush());
+        a?;
+        b?;
+        first.flush().await?;
+        second.flush().await?;
+        let disk = State::load(&path)?;
+        let stats = &disk.proxies["shared"];
+        assert_eq!((stats.bytes_sent, stats.bytes_received), (9, 12));
+        assert_eq!(stats.ping_samples, 3);
+        assert!((stats.ping_avg_ms.unwrap() - 30.0).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_caller_cannot_double_apply_commit_or_drop_inflight_traffic(
+    ) -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("state.json");
+        let store = store_at(path.clone())?;
+        store.record_traffic("shared", 10, 20).await;
+        let gate = crate::util::PersistenceLock::acquire(&path)?;
+        let calling_store = store.clone();
+        let caller = tokio::spawn(async move { calling_store.flush().await });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if store.persisted.try_lock().is_err() {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "flush never captured its owned snapshot"
+            );
+            tokio::task::yield_now().await;
+        }
+        // This current-thread runtime observes the worker after it yielded on
+        // filesystem I/O; its dirty snapshot exists and publication is gated.
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        store.record_traffic("shared", 7, 11).await;
+        drop(gate);
+        store.flush().await?;
+        let disk = State::load(&path)?;
+        assert_eq!(
+            (
+                disk.proxies["shared"].bytes_sent,
+                disk.proxies["shared"].bytes_received
+            ),
+            (17, 31)
+        );
+        assert_eq!(
+            store.get_all_stats().await["shared"],
+            disk.proxies["shared"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_publication_keeps_old_bytes_and_pending_deltas_for_retry() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        // The workspace's existing CLI seam requires a non-root test actor.
+        anyhow::ensure!(
+            unsafe { libc::geteuid() } != 0,
+            "publication-permission control requires non-root"
+        );
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("state.json");
+        State::default().save(&path)?;
+        let original = fs::read(&path)?;
+        let store = store_at(path.clone())?;
+        store.record_traffic("shared", 11, 13).await;
+        fs::set_permissions(work.path(), fs::Permissions::from_mode(0o500))?;
+        let failed = store.flush().await;
+        fs::set_permissions(work.path(), fs::Permissions::from_mode(0o700))?;
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path)?, original);
+        store.record_traffic("shared", 5, 7).await;
+        store.flush().await?;
+        let disk = State::load(&path)?;
+        assert_eq!(
+            (
+                disk.proxies["shared"].bytes_sent,
+                disk.proxies["shared"].bytes_received
+            ),
+            (16, 20)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_state_is_an_error_and_cannot_be_misclassified_as_corrupt() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            unsafe { libc::geteuid() } != 0,
+            "state read-permission control requires non-root"
+        );
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("state.json");
+        State::default().save(&path)?;
+        let original = fs::read(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))?;
+        let failed = State::load(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path)?, original);
+        assert_eq!(
+            fs::read_dir(work.path())?.count(),
+            1,
+            "read failure created a false quarantine"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_reader_rechecks_after_a_complete_concurrent_publication() -> Result<()> {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("state.json");
+        fs::write(&path, b"corrupt-before-writer")?;
+        let gate = crate::util::PersistenceLock::acquire(&path)?;
+        // SAFETY: initializes an owned inotify descriptor with close-on-exec.
+        let descriptor = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        anyhow::ensure!(
+            descriptor >= 0,
+            "cannot observe corrupt reader's actual file open"
+        );
+        // SAFETY: descriptor ownership is transferred exactly once to this File.
+        let mut observer = unsafe { fs::File::from_raw_fd(descriptor) };
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: live descriptor and NUL-terminated pathname, valid event mask.
+        anyhow::ensure!(
+            unsafe { libc::inotify_add_watch(descriptor, name.as_ptr(), libc::IN_OPEN) } >= 0,
+            "cannot watch state file"
+        );
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || State::load(&reader_path));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut event = [0; 64];
+        loop {
+            match observer.read(&mut event) {
+                Ok(n) if n >= 16 => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                outcome => anyhow::bail!("unexpected state-open observation: {outcome:?}"),
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "reader did not open old corrupt bytes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut good = State::default();
+        good.proxies.insert(
+            "published".into(),
+            ProxyStats {
+                bytes_sent: 77,
+                ..ProxyStats::default()
+            },
+        );
+        // The controller already holds the real transaction lock.
+        good.save_locked(&path)?;
+        drop(gate);
+        let loaded = reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("state reader panicked"))??;
+        assert_eq!(loaded.proxies["published"].bytes_sent, 77);
+        assert_eq!(State::load(&path)?.proxies["published"].bytes_sent, 77);
+        assert_eq!(
+            fs::read_dir(work.path())?.count(),
+            1,
+            "reader quarantined a good publication"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_corruption_preserves_every_original_quarantine_and_file_alias() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let work = tempfile::tempdir()?;
+        let path = work.path().join("state.json");
+        let alias = work.path().join("alias.json");
+        symlink(&path, &alias)?;
+        for bytes in [b"first-corrupt".as_slice(), b"second-corrupt".as_slice()] {
+            fs::write(&path, bytes)?;
+            assert!(State::load(&alias)?.proxies.is_empty());
+            assert!(fs::symlink_metadata(&alias)?.file_type().is_symlink());
+            assert!(!path.exists());
+        }
+        let mut saved: Vec<_> = fs::read_dir(work.path())?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                path.file_name()?
+                    .to_string_lossy()
+                    .starts_with("state.json.corrupt-")
+                    .then(|| fs::read(path).unwrap())
+            })
+            .collect();
+        saved.sort();
+        assert_eq!(
+            saved,
+            vec![b"first-corrupt".to_vec(), b"second-corrupt".to_vec()]
+        );
+        Ok(())
+    }
 
     // RuntimeState degradation tracking tests
 
