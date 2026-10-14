@@ -403,6 +403,21 @@ For production deployments, run rust_proxy as a systemd service for automatic st
 
 ### Installation
 
+The bundled unit uses the root config and state paths below. For custom paths,
+generate a unit from the installed executable with explicit absolute paths:
+
+```bash
+sudo env RUST_PROXY_CONFIG=/etc/rust_proxy/config.toml \
+  RUST_PROXY_STATE_DIR=/var/lib/rust_proxy \
+  rust_proxy service generate --hardened --output rust_proxy.service
+```
+
+Create the selected config and state directories before starting the service;
+root must be able to read the config and write the state directory. The generated
+unit records both paths. Hardening bounds capabilities to network administration,
+raw sockets, and privileged ports, prevents privilege gains, and places the
+xtables lock in the writable state directory.
+
 ```bash
 # Copy the service file
 sudo cp rust_proxy.service /etc/systemd/system/
@@ -429,7 +444,10 @@ sudo systemctl status rust_proxy
 # View logs
 sudo journalctl -u rust_proxy -f
 
-# Restart after config changes
+# Apply live configuration changes
+sudo systemctl reload rust_proxy
+
+# Apply settings reported as pending restart
 sudo systemctl restart rust_proxy
 
 # Stop the service

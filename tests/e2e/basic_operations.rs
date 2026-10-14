@@ -6,6 +6,7 @@ use crate::common::assertions::*;
 use crate::common::fixtures;
 use crate::common::mock_proxy::{MockBehavior, MockProxy};
 use crate::common::TestHarness;
+use anyhow::Context as _;
 
 fn cli_8bnf_config(harness: &TestHarness) -> anyhow::Result<toml::Value> {
     let mut config: toml::Value = toml::from_str(&fixtures::single_proxy_config(
@@ -478,6 +479,416 @@ async fn cli_8bnf_target_url_credentials_are_redacted_in_verbose_machine_output(
             .as_str()
             .unwrap()
             .contains("example.invalid/path"));
+    }
+    Ok(())
+}
+
+const IPV6_UPSTREAM_TARGET: &str = "198.51.100.42:443";
+const IPV6_UPSTREAM_USER: &str = "ipv6-client-user";
+
+fn ipv6_upstream_password() -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Ipv6UpstreamReceipt {
+    request_line: String,
+    peer: std::net::SocketAddr,
+    authorized: bool,
+    body: Vec<u8>,
+}
+
+async fn ipv6_upstream_headers(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        anyhow::ensure!(
+            header.len() < 16 * 1024,
+            "IPv6 CONNECT header exceeded bound"
+        );
+        header.push(stream.read_u8().await?);
+    }
+    Ok(header)
+}
+
+/// A real loopback IPv6 CONNECT endpoint. It validates the request and Basic
+/// token before opening an echo tunnel; wrong credentials receive a real 407.
+/// This is transport proof through a local endpoint, never target NAT proof.
+async fn ipv6_upstream_endpoint(
+    log_path: std::path::PathBuf,
+    connections: usize,
+    password: &str,
+) -> anyhow::Result<(
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<anyhow::Result<Vec<Ipv6UpstreamReceipt>>>,
+)> {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await?;
+    let address = listener.local_addr()?;
+    assert!(address.is_ipv6());
+    let expected_auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{IPV6_UPSTREAM_USER}:{password}"))
+    );
+    let task = tokio::spawn(async move {
+        let mut receipts = Vec::new();
+        for _ in 0..connections {
+            let (mut stream, peer) = listener.accept().await?;
+            assert_eq!(
+                peer.ip(),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            );
+            let header = String::from_utf8(ipv6_upstream_headers(&mut stream).await?)?;
+            let request_line = header
+                .lines()
+                .next()
+                .context("missing CONNECT request")?
+                .to_owned();
+            let authorized =
+                header
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .any(|(name, value)| {
+                        name.eq_ignore_ascii_case("Proxy-Authorization")
+                            && value.trim() == expected_auth
+                    });
+            let mut receipt = Ipv6UpstreamReceipt {
+                request_line,
+                peer,
+                authorized,
+                body: Vec::new(),
+            };
+            if authorized
+                && receipt.request_line == format!("CONNECT {IPV6_UPSTREAM_TARGET} HTTP/1.1")
+            {
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                let mut buffer = [0; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    receipt.body.extend_from_slice(&buffer[..read]);
+                    stream.write_all(&buffer[..read]).await?;
+                }
+            } else {
+                stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"ipv6-test\"\r\n\r\n").await?;
+            }
+            receipts.push(receipt);
+            // Retain observations at the receiving endpoint, including any
+            // successful direct control before a product assertion fails.
+            std::fs::write(&log_path, serde_json::to_vec_pretty(&receipts)?)?;
+        }
+        Ok(receipts)
+    });
+    Ok((address, task))
+}
+
+fn ipv6_upstream_config(
+    harness: &TestHarness,
+    port: u16,
+    password: &str,
+) -> anyhow::Result<toml::Value> {
+    let mut config = cli_8bnf_config(harness)?;
+    config["proxies"][0]["url"] =
+        format!("http://{IPV6_UPSTREAM_USER}:{password}@[::1]:{port}").into();
+    config["settings"]
+        .as_table_mut()
+        .context("settings fixture")?
+        .insert(
+            "health_check_target".into(),
+            format!("CONNECT {IPV6_UPSTREAM_TARGET}").into(),
+        );
+    Ok(config)
+}
+
+fn ipv6_upstream_cli(
+    harness: &TestHarness,
+    args: &[&str],
+    password: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use base64::Engine as _;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+        .args(args)
+        .env("RUST_PROXY_CONFIG", &harness.config_path)
+        .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+        .env_remove("RUST_PROXY_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .output()?;
+    eprintln!(
+        "IPv6 upstream CLI {args:?}: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let token = base64::engine::general_purpose::STANDARD
+        .encode(format!("{IPV6_UPSTREAM_USER}:{password}"));
+    for bytes in [&output.stdout, &output.stderr] {
+        for secret in [IPV6_UPSTREAM_USER, password, token.as_str()] {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains(secret),
+                "CLI leaked {secret}"
+            );
+        }
+    }
+    cli_8bnf_machine(&output, "json")
+}
+
+fn ipv6_upstream_assert_authority(value: &serde_json::Value, port: u16) -> anyhow::Result<()> {
+    let text = value.as_str().context("redacted IPv6 upstream URL")?;
+    assert_eq!(text, format!("http://[::1]:{port}"));
+    let parsed = url::Url::parse(text)?;
+    assert_eq!(
+        parsed.host(),
+        Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+    );
+    assert_eq!(parsed.port(), Some(port));
+    assert!(parsed.username().is_empty());
+    assert!(parsed.password().is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_upstream_cli_connectivity_and_redacted_authorities_are_real() -> anyhow::Result<()> {
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut harness = TestHarness::new().await?;
+    harness.temp_dir.disable_cleanup(true);
+    eprintln!("IPv6 CLI fixtures: {}", harness.temp_dir.path().display());
+    let password = ipv6_upstream_password()?;
+    let (address, endpoint) = ipv6_upstream_endpoint(
+        harness.temp_dir.path().join("ipv6-cli-receipts.json"),
+        4,
+        &password,
+    )
+    .await?;
+    let control_payload = b"independent-ipv6-connect-control";
+    // Independent socket control discriminates an unavailable endpoint from
+    // the product's bracketed-host lookup defect retained in the baseline log.
+    let mut control = tokio::net::TcpStream::connect(address).await?;
+    let token = base64::engine::general_purpose::STANDARD
+        .encode(format!("{IPV6_UPSTREAM_USER}:{password}"));
+    control.write_all(format!("CONNECT {IPV6_UPSTREAM_TARGET} HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n\r\n").as_bytes()).await?;
+    assert!(ipv6_upstream_headers(&mut control)
+        .await?
+        .starts_with(b"HTTP/1.1 200 "));
+    control.write_all(control_payload).await?;
+    let mut echoed = vec![0; control_payload.len()];
+    control.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, control_payload);
+    control.shutdown().await?;
+    drop(control);
+
+    let mut config = ipv6_upstream_config(&harness, address.port(), &password)?;
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let positive = ipv6_upstream_cli(
+        &harness,
+        &["check", "--test-connectivity", "--json"],
+        &password,
+    )?;
+    assert_eq!(positive["valid"], true);
+    assert_eq!(positive["connectivity"][0]["status"], "success");
+    assert!(positive["connectivity"][0]["error"].is_null());
+    assert!(positive["connectivity"][0]["latency_ms"].is_number());
+    for args in [
+        vec!["list", "--json"],
+        vec!["test", "example.invalid", "--no-dns", "--json", "--verbose"],
+    ] {
+        let output = ipv6_upstream_cli(&harness, &args, &password)?;
+        let redacted = if args[0] == "list" {
+            &output["proxies"][0]["url"]
+        } else {
+            &output["active_proxy"]["url"]
+        };
+        ipv6_upstream_assert_authority(redacted, address.port())?;
+    }
+    config["proxies"][0]["url"] = format!(
+        "http://{IPV6_UPSTREAM_USER}:{password}-wrong@[::1]:{}",
+        address.port()
+    )
+    .into();
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let denied = ipv6_upstream_cli(
+        &harness,
+        &["check", "--test-connectivity", "--json"],
+        &password,
+    )?;
+    assert_eq!(denied["valid"], true);
+    assert_eq!(denied["connectivity"][0]["status"], "auth_required");
+    assert!(denied["connectivity"][0]["latency_ms"].is_null());
+    std::fs::write(
+        &harness.config_path,
+        toml::to_string(&ipv6_upstream_config(&harness, address.port(), &password)?)?,
+    )?;
+    let recovered = ipv6_upstream_cli(
+        &harness,
+        &["check", "--test-connectivity", "--json"],
+        &password,
+    )?;
+    assert_eq!(recovered["connectivity"][0]["status"], "success");
+    let receipts = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint).await???;
+    assert_eq!(receipts.len(), 4);
+    assert_eq!(receipts[0].body, control_payload);
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|receipt| receipt.authorized)
+            .collect::<Vec<_>>(),
+        [true, true, false, true]
+    );
+    for receipt in &receipts {
+        assert_eq!(
+            receipt.request_line,
+            format!("CONNECT {IPV6_UPSTREAM_TARGET} HTTP/1.1")
+        );
+    }
+    assert!(receipts[1..].iter().all(|receipt| receipt.body.is_empty()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_upstream_daemon_relays_ipv4_destination_bytes_without_restart() -> anyhow::Result<()>
+{
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } != 0,
+        "IPv6 upstream daemon seam requires non-root"
+    );
+    let mut harness = TestHarness::new().await?;
+    harness.temp_dir.disable_cleanup(true);
+    eprintln!(
+        "IPv6 daemon fixtures: {}",
+        harness.temp_dir.path().display()
+    );
+    let password = ipv6_upstream_password()?;
+    let (address, endpoint) = ipv6_upstream_endpoint(
+        harness.temp_dir.path().join("ipv6-daemon-receipts.json"),
+        3,
+        &password,
+    )
+    .await?;
+    let config = ipv6_upstream_config(&harness, address.port(), &password)?;
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let stdout = harness.temp_dir.path().join("ipv6-daemon.stdout.log");
+    let stderr = harness.temp_dir.path().join("ipv6-daemon.stderr.log");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"))
+        .arg("daemon")
+        .env("RUST_PROXY_CONFIG", &harness.config_path)
+        .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+        .env("RUST_PROXY_TEST_MODE", "1")
+        .env("RUST_PROXY_TEST_ORIGINAL_DST", IPV6_UPSTREAM_TARGET)
+        .env("RUST_LOG", "debug")
+        .stdout(std::fs::File::create(&stdout)?)
+        .stderr(std::fs::File::create(&stderr)?)
+        .spawn()?;
+    struct Ipv6OwnedDaemon(std::process::Child);
+    impl Drop for Ipv6OwnedDaemon {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let mut daemon = Ipv6OwnedDaemon(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        anyhow::ensure!(
+            daemon.0.try_wait()?.is_none(),
+            "IPv6 daemon exited before readiness"
+        );
+        let status = ipv6_upstream_cli(&harness, &["status", "--json"], &password)?;
+        if status["daemon_running"] == true {
+            assert_eq!(status["daemon"]["status"], "ready");
+            assert_eq!(
+                status["daemon"]["snapshot"]["identity"]["pid"],
+                daemon.0.id()
+            );
+            assert_eq!(status["daemon"]["snapshot"]["test_mode"], true);
+            assert_eq!(status["rules_active"], false);
+            ipv6_upstream_assert_authority(
+                &status["daemon"]["snapshot"]["applied"]["config"]["proxies"][0]["url"],
+                address.port(),
+            )?;
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "IPv6 daemon exceeded original 5s readiness bound"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let payloads: [&[u8]; 3] = [
+        b"IPv6-upstream-relay-one",
+        b"IPv6-upstream-relay-two",
+        b"IPv6-upstream-relay-three",
+    ];
+    for payload in payloads {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client =
+                tokio::net::TcpStream::connect(("127.0.0.1", harness.listen_port())).await?;
+            client.write_all(payload).await?;
+            let mut echoed = vec![0; payload.len()];
+            client.read_exact(&mut echoed).await?;
+            assert_eq!(echoed, payload);
+            client.shutdown().await?;
+            let mut tail = Vec::new();
+            client.read_to_end(&mut tail).await?;
+            assert!(tail.is_empty());
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+    }
+    let receipts = tokio::time::timeout(Duration::from_secs(5), endpoint).await???;
+    assert_eq!(
+        receipts.len(),
+        3,
+        "readiness and disabled health cannot inflate recipients"
+    );
+    for (receipt, payload) in receipts.iter().zip(payloads) {
+        assert!(receipt.authorized);
+        assert_eq!(
+            receipt.request_line,
+            format!("CONNECT {IPV6_UPSTREAM_TARGET} HTTP/1.1")
+        );
+        assert_eq!(receipt.body, payload);
+    }
+    let stopped = std::process::Command::new("kill")
+        .args(["-TERM", &daemon.0.id().to_string()])
+        .output()?;
+    eprintln!(
+        "IPv6 owned shutdown: {}\nstdout:{}\nstderr:{}",
+        stopped.status,
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(stopped.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = daemon.0.try_wait()? {
+            assert!(status.success());
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "IPv6 daemon graceful shutdown exceeded 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    for path in [stdout, stderr] {
+        let output = std::fs::read_to_string(path)?;
+        for secret in [IPV6_UPSTREAM_USER, password.as_str()] {
+            assert!(!output.contains(secret), "daemon emitted a credential");
+        }
     }
     Ok(())
 }

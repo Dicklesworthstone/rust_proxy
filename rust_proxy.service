@@ -18,6 +18,7 @@ ExecStart=/usr/local/bin/rust_proxy daemon
 # Post-crash recovery: clear stale rules/pidfile before starting (idempotent;
 # refuses while a live daemon holds the pidfile).
 ExecStartPre=/usr/local/bin/rust_proxy cleanup-stale
+ExecReload=/bin/kill -HUP $MAINPID
 
 # Restart on failure with exponential backoff
 Restart=on-failure
@@ -37,12 +38,16 @@ ProtectSystem=strict
 # State:  ~/.local/state/rust_proxy/state.json -> /root/.local/state/rust_proxy/
 ReadWritePaths=/root/.config/rust_proxy
 ReadWritePaths=/root/.local/state/rust_proxy
+Environment=RUST_PROXY_CONFIG=/root/.config/rust_proxy/config.toml
+Environment=RUST_PROXY_STATE_DIR=/root/.local/state/rust_proxy
+Environment=XTABLES_LOCKFILE=/root/.local/state/rust_proxy/xtables.lock
 
 # Allow network namespace and iptables access
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 
 # Standard security restrictions
-NoNewPrivileges=no
+NoNewPrivileges=yes
 PrivateTmp=true
 ProtectHome=read-only
 ProtectKernelTunables=true

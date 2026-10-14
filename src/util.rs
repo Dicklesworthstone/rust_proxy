@@ -873,9 +873,14 @@ pub fn parse_proxy_url(raw: &str) -> Result<ProxyEndpoint> {
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         bail!("Proxy URL must contain only an HTTP host, port and optional credentials");
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("Proxy URL missing host"))?;
+    // URL authorities bracket IPv6, but tuple-based DNS/socket APIs require
+    // the address itself. Keep that distinction in this shared parser.
+    let host = match url.host() {
+        Some(url::Host::Domain(host)) => host.to_owned(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => host.to_string(),
+        None => bail!("Proxy URL missing host"),
+    };
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow::anyhow!("Proxy URL missing port"))?;
@@ -883,7 +888,7 @@ pub fn parse_proxy_url(raw: &str) -> Result<ProxyEndpoint> {
         bail!("Proxy port must be greater than zero");
     }
     Ok(ProxyEndpoint {
-        host: host.to_string(),
+        host,
         port,
         username: (!url.username().is_empty())
             .then(|| decode_url_credential(url.username()))
@@ -913,6 +918,9 @@ fn decode_url_credential(encoded: &str) -> Result<String> {
 /// Safe display even for malformed URLs: never echo unparsed input.
 pub fn redact_proxy_url(raw: &str) -> String {
     match parse_proxy_url(raw) {
+        Ok(endpoint) if endpoint.host.parse::<std::net::Ipv6Addr>().is_ok() => {
+            format!("http://[{}]:{}", endpoint.host, endpoint.port)
+        }
         Ok(endpoint) => format!("http://{}:{}", endpoint.host, endpoint.port),
         Err(_) => "[invalid proxy URL]".to_string(),
     }
@@ -1100,7 +1108,17 @@ fn hardening_section(config_path: &Path, state_dir: &Path) -> Result<String> {
         quote_service_value(service_path(state_dir, "state directory")?)
     ));
     section.push_str("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n");
-    section.push_str("NoNewPrivileges=no\n");
+    section.push_str("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n");
+    section.push_str("NoNewPrivileges=yes\n");
+    // ProtectSystem=strict also makes /run read-only. Keep the xtables lock
+    // inside the same explicitly writable, service-owned state directory.
+    section.push_str(&format!(
+        "Environment={}\n",
+        quote_service_value(&format!(
+            "XTABLES_LOCKFILE={}",
+            service_path(&state_dir.join("xtables.lock"), "xtables lock")?
+        ))
+    ));
     section.push_str("PrivateTmp=true\n");
     section.push_str("ProtectHome=read-only\n");
     section.push_str("ProtectKernelTunables=true\n");
@@ -1221,6 +1239,36 @@ mod tests {
         let result = parse_proxy_url("proxy.example.com:3128").unwrap();
         assert_eq!(result.host, "proxy.example.com");
         assert_eq!(result.port, 3128);
+    }
+
+    #[test]
+    fn ipv6_upstream_host_is_unbracketed_for_sockets_and_bracketed_for_urls() {
+        for raw in [
+            "http://[::1]:3128",
+            "[::1]:3128",
+            "http://user:password@[::1]:3128",
+        ] {
+            let endpoint = parse_proxy_url(raw).unwrap();
+            assert_eq!(endpoint.host, "::1");
+            assert_eq!(endpoint.port, 3128);
+            let redacted = redact_proxy_url(raw);
+            assert_eq!(redacted, "http://[::1]:3128");
+            let reparsed = Url::parse(&redacted).unwrap();
+            assert_eq!(
+                reparsed.host(),
+                Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+            );
+            assert!(reparsed.username().is_empty());
+            assert!(reparsed.password().is_none());
+        }
+        assert_eq!(
+            parse_proxy_url("http://[2001:db8::1]").unwrap().host,
+            "2001:db8::1"
+        );
+        assert_eq!(
+            redact_proxy_url("http://[2001:db8::1]"),
+            "http://[2001:db8::1]:80"
+        );
     }
 
     #[test]
@@ -1509,7 +1557,8 @@ mod tests {
             "ProtectSystem=strict",
             "ReadWritePaths=\"/etc/rust_proxy\"",
             "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
-            "NoNewPrivileges=no",
+            "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
+            "NoNewPrivileges=yes",
             "PrivateTmp=true",
             "ProtectHome=read-only",
             "ProtectKernelTunables=true",
@@ -1522,8 +1571,11 @@ mod tests {
                 "missing or duplicate hardening directive: {required}"
             );
         }
-        // This pins the current limited hardening output. It does not qualify
-        // live service permissions or satisfy the bead's bounding-set criterion.
+        assert!(service.lines().any(|line| {
+            line.starts_with("Environment=\"XTABLES_LOCKFILE=") && line.ends_with("/xtables.lock\"")
+        }));
+        // Actual capability enforcement and writable paths require a managed
+        // service probe; template checks alone do not qualify deployment.
         Ok(())
     }
 
@@ -1570,6 +1622,8 @@ mod tests {
     fn test_generate_service_file_preserves_spaces_and_literal_expansion_characters() -> Result<()>
     {
         let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        let _restore = RestoreServiceStateEnvironment::capture();
+        std::env::set_var("RUST_PROXY_STATE_DIR", "/var/lib/proxy-state");
         let service = generate_service_file(
             Path::new("/opt/rust proxy/$HOME/%i;tool"),
             Path::new(r#"/etc/proxy "quoted"\$HOME/%i/config.toml"#),
@@ -1582,6 +1636,7 @@ mod tests {
             r#"ExecStartPre=":/opt/rust proxy/$HOME/%%i;tool" cleanup-stale"#,
             r#"Environment="RUST_PROXY_CONFIG=/etc/proxy \"quoted\"\\$HOME/%%i/config.toml""#,
             r#"ReadWritePaths="/etc/proxy \"quoted\"\\$HOME/%%i""#,
+            r#"Environment="XTABLES_LOCKFILE=/var/lib/proxy-state/xtables.lock""#,
         ] {
             assert_eq!(
                 service.lines().filter(|line| *line == required).count(),
@@ -1601,7 +1656,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("Environment="))
                 .count(),
-            2
+            3
         );
         Ok(())
     }
@@ -1793,6 +1848,10 @@ mod tests {
             r#"ReadWritePaths="{}/operator \"state\"\\$HOME/%%i""#,
             cwd.display()
         );
+        let lock_environment = format!(
+            r#"Environment="XTABLES_LOCKFILE={}/operator \"state\"\\$HOME/%%i/xtables.lock""#,
+            cwd.display()
+        );
         assert_eq!(
             service.lines().filter(|line| *line == environment).count(),
             1
@@ -1801,9 +1860,16 @@ mod tests {
         assert_eq!(
             service
                 .lines()
+                .filter(|line| *line == lock_environment)
+                .count(),
+            1
+        );
+        assert_eq!(
+            service
+                .lines()
                 .filter(|line| line.starts_with("Environment="))
                 .count(),
-            2
+            3
         );
         Ok(())
     }
