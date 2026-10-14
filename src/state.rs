@@ -670,7 +670,7 @@ impl RuntimeState {
         let inner = self.inner.read().await;
         inner
             .recovery_detected_at
-            .map(|t| Utc::now().signed_duration_since(t).num_seconds() >= delay_secs as i64)
+            .map(|t| Utc::now().signed_duration_since(t).num_seconds().max(0) as u64 >= delay_secs)
             .unwrap_or(false)
     }
 
@@ -680,7 +680,9 @@ impl RuntimeState {
         let inner = self.inner.read().await;
         inner
             .last_switch_at
-            .map(|t| Utc::now().signed_duration_since(t).num_seconds() >= min_interval_secs as i64)
+            .map(|t| {
+                Utc::now().signed_duration_since(t).num_seconds().max(0) as u64 >= min_interval_secs
+            })
             .unwrap_or(true)
     }
 
@@ -1364,6 +1366,12 @@ mod tests {
 
         // With 0 delay, should pass immediately
         assert!(state.failback_delay_passed(0).await);
+        // Large configured delays must not wrap into negative signed seconds
+        // and authorize an immediate failback/switch.
+        assert!(!state.failback_delay_passed(u64::MAX).await);
+        state.rebase(Some("proxy-a".into())).await;
+        assert!(state.can_switch(0).await);
+        assert!(!state.can_switch(u64::MAX).await);
     }
 
     #[tokio::test]

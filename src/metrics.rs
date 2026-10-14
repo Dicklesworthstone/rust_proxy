@@ -32,7 +32,8 @@ use prometheus::{
     core::Collector, histogram_opts, CounterVec, Encoder, Gauge, GaugeVec, HistogramVec, Opts,
     Registry, TextEncoder,
 };
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
+use std::time::Instant;
 
 // ============================================================================
 // Registry
@@ -43,6 +44,7 @@ use std::sync::LazyLock;
 /// Using a custom registry allows us to control exactly what gets exported
 /// and avoid conflicts with other libraries that might use Prometheus.
 pub static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+static PROCESS_STARTED: OnceLock<Instant> = OnceLock::new();
 
 // ============================================================================
 // Counters
@@ -152,6 +154,19 @@ pub static CONFIG_RELOADS: LazyLock<CounterVec> = LazyLock::new(|| {
         &["result"],
     )
     .expect("Failed to create CONFIG_RELOADS metric")
+});
+
+/// Load-balancer decisions, including selections whose connection later fails.
+/// This is distinct from completed request counts.
+pub static PROXY_SELECTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    CounterVec::new(
+        Opts::new(
+            "rust_proxy_proxy_selections_total",
+            "Load balancer proxy selections",
+        ),
+        &["proxy"],
+    )
+    .expect("Failed to create PROXY_SELECTIONS metric")
 });
 
 /// Failed or IPv6-only routing sources (1), versus fresh usable coverage (0).
@@ -326,6 +341,7 @@ pub static DNS_RESOLUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
 ///
 /// Returns an error if metric registration fails (e.g., duplicate metric names).
 pub fn init_metrics() -> Result<(), prometheus::Error> {
+    PROCESS_STARTED.get_or_init(Instant::now);
     // Counters
     register_or_ignore(REQUESTS_TOTAL.clone())?;
     register_or_ignore(BYTES_SENT.clone())?;
@@ -336,6 +352,7 @@ pub fn init_metrics() -> Result<(), prometheus::Error> {
     register_or_ignore(CONNECTION_RETRIES.clone())?;
     register_or_ignore(CONNECTIONS_TOTAL.clone())?;
     register_or_ignore(CONFIG_RELOADS.clone())?;
+    register_or_ignore(PROXY_SELECTIONS.clone())?;
 
     // Gauges
     register_or_ignore(ACTIVE_CONNECTIONS.clone())?;
@@ -370,6 +387,9 @@ where
 ///
 /// Returns a string suitable for serving from `/metrics` endpoint.
 pub fn encode_metrics() -> String {
+    if let Some(started) = PROCESS_STARTED.get() {
+        UPTIME_SECONDS.set(started.elapsed().as_secs_f64());
+    }
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
     if encoder.encode(&REGISTRY.gather(), &mut buffer).is_err() {
@@ -426,6 +446,14 @@ pub fn record_health_check(proxy_id: &str, healthy: bool, latency_secs: f64) {
         .set(if healthy { 1.0 } else { 0.0 });
 }
 
+/// A changed/removed endpoint has no current health observation until its new
+/// probe completes. Historical counters and histograms remain available.
+pub fn clear_health_observations(proxy_ids: &[String]) {
+    for id in proxy_ids {
+        let _ = PROXY_HEALTH.remove_label_values(&[id]);
+    }
+}
+
 /// Record a failover event.
 #[inline]
 pub fn record_failover(from_proxy: &str, to_proxy: &str) {
@@ -436,6 +464,10 @@ pub fn record_config_reload(applied: bool) {
     CONFIG_RELOADS
         .with_label_values(&[if applied { "applied" } else { "rejected" }])
         .inc();
+}
+
+pub fn record_proxy_selection(proxy_id: &str) {
+    PROXY_SELECTIONS.with_label_values(&[proxy_id]).inc();
 }
 
 /// Increment active connections for a proxy.
@@ -567,6 +599,40 @@ mod tests {
 
         let output = encode_metrics();
         assert!(output.contains("rust_proxy_requests_total"));
+    }
+
+    #[test]
+    fn export_reports_elapsed_uptime_and_selection_decisions() {
+        init_metrics_once();
+        let proxy_id = unique_label("selection-export");
+        record_proxy_selection(&proxy_id);
+        record_proxy_selection(&proxy_id);
+        let output = encode_metrics();
+        let uptime: f64 = output
+            .lines()
+            .find_map(|line| line.strip_prefix("rust_proxy_uptime_seconds "))
+            .expect("uptime sample")
+            .parse()
+            .expect("numeric uptime");
+        assert!(uptime > 0.0);
+        assert!(output.contains(&format!(
+            "rust_proxy_proxy_selections_total{{proxy=\"{proxy_id}\"}} 2"
+        )));
+    }
+
+    #[test]
+    fn obsolete_health_is_removed_without_erasing_probe_history() {
+        init_metrics_once();
+        let proxy_id = unique_label("obsolete-health");
+        record_health_check(&proxy_id, true, 0.01);
+        let health_label = format!("rust_proxy_proxy_health{{proxy=\"{proxy_id}\"}}");
+        assert!(encode_metrics().contains(&health_label));
+        clear_health_observations(std::slice::from_ref(&proxy_id));
+        let output = encode_metrics();
+        assert!(!output.contains(&health_label));
+        assert!(output.contains(&format!(
+            "rust_proxy_health_checks_total{{proxy=\"{proxy_id}\",result=\"healthy\"}} 1"
+        )));
     }
 
     #[test]

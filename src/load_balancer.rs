@@ -66,6 +66,7 @@ impl LoadBalancer {
 
     /// Record that a proxy was selected.
     fn record_selection(&self, proxy_id: &str) {
+        crate::metrics::record_proxy_selection(proxy_id);
         self.total_selections.fetch_add(1, Ordering::Relaxed);
 
         // Try to increment existing counter first (read lock)
@@ -529,6 +530,33 @@ mod tests {
 
         // Should return 0.0 when total is 0, not panic
         assert_eq!(stats.percentage("any"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn actual_round_robin_decisions_are_visible_in_exported_metrics() {
+        crate::metrics::init_metrics().expect("register metrics");
+        let balancer = LoadBalancer::new();
+        let state = StateStore::new_for_testing();
+        let proxies = [
+            make_proxy("lb-export-a", None, 100),
+            make_proxy("lb-export-b", None, 100),
+        ];
+        for expected in ["lb-export-a", "lb-export-b", "lb-export-a"] {
+            assert_eq!(
+                balancer
+                    .select_proxy(LoadBalanceStrategy::RoundRobin, &proxies, &state, None)
+                    .await
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        let stats = balancer.get_stats();
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.selections.get("lb-export-a"), Some(&2));
+        assert_eq!(stats.selections.get("lb-export-b"), Some(&1));
+        let exported = crate::metrics::encode_metrics();
+        assert!(exported.contains("rust_proxy_proxy_selections_total{proxy=\"lb-export-a\"} 2"));
+        assert!(exported.contains("rust_proxy_proxy_selections_total{proxy=\"lb-export-b\"} 1"));
     }
 
     #[tokio::test]

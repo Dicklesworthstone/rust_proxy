@@ -1730,7 +1730,7 @@ async fn check_cmd(
     let config_path = config::config_path()?;
 
     // Try to load config
-    let config = match AppConfig::load() {
+    let config = match load_config_for_reload(&config_path) {
         Ok(config) => config,
         Err(err) => {
             if output.mode().is_json() {
@@ -1744,6 +1744,8 @@ async fn check_cmd(
                     "warnings": [],
                 });
                 output.print_json(&json_output);
+            } else if output.mode().is_quiet() {
+                eprintln!("Failed to load configuration: {err}");
             } else {
                 eprintln!("{} Failed to load configuration: {}", "✗".red(), err);
             }
@@ -1848,8 +1850,41 @@ async fn check_cmd(
         }
 
         output.print_json(&json_output);
-    } else if !output.mode().is_quiet() || report.has_errors() || (strict && report.has_warnings())
-    {
+    } else if output.mode().is_quiet() {
+        for result in &report.results {
+            if result.severity == ValidationSeverity::Error
+                || strict && result.severity == ValidationSeverity::Warning
+            {
+                let id = result
+                    .id
+                    .as_deref()
+                    .map(|id| format!(" [{id}]"))
+                    .unwrap_or_default();
+                println!("{}{}: {}", result.category, id, result.message);
+                if let Some(suggestion) = &result.suggestion {
+                    println!("  Fix: {suggestion}");
+                }
+            }
+        }
+        for result in &connectivity_results {
+            if result.status != "success" {
+                println!(
+                    "proxy [{}]: {} ({})",
+                    result.proxy_id,
+                    result.status,
+                    result.error.as_deref().unwrap_or("probe failed")
+                );
+            }
+        }
+        if let Some(probe) = &target_probe {
+            if !probe.success {
+                println!(
+                    "health target: {}",
+                    probe.failure_reason.as_deref().unwrap_or("unreachable")
+                );
+            }
+        }
+    } else {
         println!("Configuration: {}", config_path.display());
         println!();
 
@@ -2081,27 +2116,31 @@ struct PingReport {
 }
 
 /// Parse a URL or domain input and extract the domain
-fn extract_domain(input: &str) -> String {
+fn extract_domain(input: &str) -> Result<String> {
     let input = input.trim();
 
     // If it looks like a URL, parse it
-    if input.starts_with("http://") || input.starts_with("https://") {
-        if let Ok(url) = url::Url::parse(input) {
-            if let Some(host) = url.host_str() {
-                return host.to_string();
-            }
+    if input.contains("://") {
+        let url = url::Url::parse(input)
+            .map_err(|_| anyhow::anyhow!("Invalid target domain: malformed HTTP(S) URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("Invalid target domain: use an HTTP(S) URL or bare domain");
         }
+        return url
+            .host_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Invalid target domain: URL has no host"));
     }
 
     // Try adding https:// and parsing
     if let Ok(url) = url::Url::parse(&format!("https://{}", input)) {
         if let Some(host) = url.host_str() {
-            return host.to_string();
+            return Ok(host.to_string());
         }
     }
 
     // Fall back to treating as domain (strip path if present)
-    input.split('/').next().unwrap_or(input).to_string()
+    Ok(input.split('/').next().unwrap_or(input).to_string())
 }
 
 /// Parse a trace target into host/port with sensible defaults.
@@ -2227,12 +2266,13 @@ fn is_daemon_running(port: u16) -> bool {
 async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatcher) -> Result<()> {
     let config = AppConfig::load()?;
 
-    let domain = config::canonical_target_domain(&extract_domain(url))?;
+    let domain = config::canonical_target_domain(&extract_domain(url)?)?;
     let verbose = verbose && !output.mode().is_json();
+    let displayed_input = util::redact_target_input(url);
 
     if verbose {
         println!("[1/5] Parsing URL...");
-        println!("      Input: {}", url);
+        println!("      Input: {}", displayed_input);
         println!("      Extracted domain: {}", domain);
         println!();
     }
@@ -2384,7 +2424,7 @@ async fn test_cmd(url: &str, verbose: bool, no_dns: bool, output: &OutputDispatc
     let would_proxy = domain_in_targets || !provider_range_matches.is_empty();
 
     let decision = RoutingDecision {
-        input: url.to_string(),
+        input: displayed_input,
         domain: domain.clone(),
         resolved_ips: resolved_ips.clone(),
         dns_error,
@@ -3358,7 +3398,8 @@ fn changed_restart_required_settings(old: &Settings, new: &Settings) -> Vec<&'st
         .collect()
 }
 
-/// Load the config from an explicit path for a hot-reload attempt.
+/// Load an existing config from an explicit path. Checking and reloads must
+/// report a missing file rather than silently validating a default config.
 fn load_config_for_reload(path: &std::path::Path) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed reading config {}", path.display()))?;
@@ -3608,6 +3649,7 @@ async fn routing_owner_loop(
         if reload {
             let changed = changed_observation_ids(&old, &cfg);
             context.state.invalidate_observations(&changed).await;
+            metrics::clear_health_observations(&changed);
             let effective = context.runtime.get_effective_proxy().await;
             let original = context.runtime.get_original_proxy().await;
             if old.active_proxy != cfg.active_proxy

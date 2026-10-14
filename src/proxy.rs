@@ -442,7 +442,7 @@ async fn handle_connection_with_load_balancing(
                     {
                         Ok(connected) => connected,
                         Err(err) => {
-                            if err.is::<tokio::time::error::Elapsed>() {
+                            if is_timeout(&err) {
                                 metrics::record_request_timeout(&id);
                             } else {
                                 metrics::record_request_error(&id);
@@ -520,7 +520,11 @@ async fn handle_connection_with_load_balancing(
         match tokio::io::copy_bidirectional(&mut client, &mut upstream_socket).await {
             Ok(bytes) => bytes,
             Err(e) => {
-                metrics::record_request_error(&proxy_id);
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    metrics::record_request_timeout(&proxy_id);
+                } else {
+                    metrics::record_request_error(&proxy_id);
+                }
                 return Err(e.into());
             }
         };
@@ -1089,6 +1093,16 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Context wrappers must not hide transport timeouts in generic failures.
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<tokio::time::error::Elapsed>()
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+    })
+}
+
 /// Connect to upstream with exponential backoff retry
 async fn connect_with_retry(upstream: &UpstreamProxy, config: &RetryConfig) -> Result<TcpStream> {
     let host = upstream.host.as_str();
@@ -1231,6 +1245,23 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+
+    #[tokio::test]
+    async fn nested_timeout_errors_remain_distinct_from_refusal() {
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .expect_err("pending operation must time out");
+        let elapsed = anyhow::Error::new(elapsed).context("outer transport context");
+        assert!(is_timeout(&elapsed));
+        let timed_out = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            .context("socket deadline");
+        assert!(is_timeout(&timed_out));
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("socket refusal");
+        assert!(!is_timeout(&refused));
+        assert!(!is_timeout(&anyhow!("non-timeout establishment error")));
+    }
 
     /// Open a loopback client TcpStream for tests that need a sink argument but
     /// never assert on what is written to it. Hermetic: 127.0.0.1 only.

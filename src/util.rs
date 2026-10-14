@@ -918,6 +918,38 @@ pub fn redact_proxy_url(raw: &str) -> String {
     }
 }
 
+/// Preserve a routing-test URL/domain while removing URL userinfo. Target
+/// inputs support HTTPS as well as bare domains, unlike HTTP-only upstreams.
+pub fn redact_target_input(raw: &str) -> String {
+    let explicit_scheme = raw.contains("://");
+    let parsed = if explicit_scheme {
+        url::Url::parse(raw)
+    } else {
+        url::Url::parse(&format!("https://{raw}"))
+    };
+    match parsed {
+        Ok(mut target) => {
+            if target.username().is_empty() && target.password().is_none() {
+                return raw.to_owned();
+            }
+            if target.set_username("").is_err() || target.set_password(None).is_err() {
+                return "[invalid target URL]".into();
+            }
+            let displayed = target.as_str();
+            if explicit_scheme {
+                displayed.to_owned()
+            } else {
+                displayed
+                    .strip_prefix("https://")
+                    .unwrap_or(displayed)
+                    .to_owned()
+            }
+        }
+        Err(_) if raw.contains('@') => "[invalid target URL]".into(),
+        Err(_) => raw.to_owned(),
+    }
+}
+
 /// Render a unit using systemd's quoting rules, never shell interpolation.
 /// Account names use systemd's portable syntax, or a numeric UID/GID.
 pub fn generate_service_file(
@@ -1151,6 +1183,31 @@ pub fn format_since_label(when: Option<DateTime<Utc>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_input_redaction_preserves_routing_information() {
+        for (input, expected) in [
+            ("example.invalid/path", "example.invalid/path"),
+            (
+                "https://example.invalid/path?q=1",
+                "https://example.invalid/path?q=1",
+            ),
+            (
+                "https://public-user:public-password@example.invalid/path?q=1",
+                "https://example.invalid/path?q=1",
+            ),
+            (
+                "public-user:public-password@example.invalid/path",
+                "example.invalid/path",
+            ),
+            (
+                "https://public-user:public-password@/",
+                "[invalid target URL]",
+            ),
+        ] {
+            assert_eq!(redact_target_input(input), expected);
+        }
+    }
 
     #[test]
     fn test_parse_proxy_url_with_scheme() {

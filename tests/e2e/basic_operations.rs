@@ -7,6 +7,481 @@ use crate::common::fixtures;
 use crate::common::mock_proxy::{MockBehavior, MockProxy};
 use crate::common::TestHarness;
 
+fn cli_8bnf_config(harness: &TestHarness) -> anyhow::Result<toml::Value> {
+    let mut config: toml::Value = toml::from_str(&fixtures::single_proxy_config(
+        harness.listen_port(),
+        "http://127.0.0.1:12345",
+    ))?;
+    // Custom targets use the real Simple string variant. A detailed target
+    // without a provider is valid TOML but not a valid AppConfig.
+    config["targets"] = vec![toml::Value::String("example.invalid".into())].into();
+    Ok(config)
+}
+
+fn cli_8bnf_run(
+    harness: &TestHarness,
+    args: &[&str],
+    environment: &[(&str, &str)],
+) -> anyhow::Result<std::process::Output> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rust_proxy"));
+    command
+        .args(args)
+        .env("RUST_PROXY_CONFIG", &harness.config_path)
+        .env("RUST_PROXY_STATE_DIR", &harness.state_dir)
+        .env_remove("RUST_PROXY_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT");
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let output = command.output()?;
+    // --nocapture retains the actual child streams in the invoking Cargo log;
+    // capture does not turn missing/failed execution into a successful result.
+    eprintln!(
+        "CLI 8bnf {args:?}: status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output)
+}
+
+fn cli_8bnf_clean_output(output: &std::process::Output) {
+    for (name, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        assert!(!bytes.contains(&0x1b), "ANSI escape in {name}");
+        let text = String::from_utf8_lossy(bytes);
+        for markup in ["[bold", "[/bold", "[red]", "[/red]", "[green]", "[/green]"] {
+            assert!(!text.contains(markup), "terminal markup in {name}");
+        }
+    }
+}
+
+fn cli_8bnf_machine(
+    output: &std::process::Output,
+    format: &str,
+) -> anyhow::Result<serde_json::Value> {
+    cli_8bnf_clean_output(output);
+    if format == "toon" {
+        return Ok(toon_rust::try_decode(std::str::from_utf8(&output.stdout)?, None)?.into());
+    }
+    let value = serde_json::from_slice(&output.stdout)?;
+    // The original acceptance explicitly names jq as the downstream consumer.
+    // Check the complete bytes with both parsers; no prefix/tail is discarded.
+    let mut jq = std::process::Command::new("jq")
+        .args(["-e", "."])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = jq
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("jq stdin missing"))?;
+        std::io::Write::write_all(&mut stdin, &output.stdout)?;
+    }
+    let parsed = jq.wait_with_output()?;
+    assert!(
+        parsed.status.success(),
+        "jq rejected CLI JSON: {}",
+        String::from_utf8_lossy(&parsed.stderr)
+    );
+    Ok(value)
+}
+
+/// Offline validation/output contracts only; no daemon or kernel interception.
+#[tokio::test]
+async fn cli_8bnf_check_exact_exit_codes_and_json_payloads() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    let valid = cli_8bnf_config(&harness)?;
+    std::fs::write(&harness.config_path, toml::to_string(&valid)?)?;
+    let report = cli_8bnf_run(&harness, &["check", "--strict", "--json"], &[])?;
+    assert_eq!(report.status.code(), Some(0));
+    let payload = cli_8bnf_machine(&report, "json")?;
+    assert_eq!(payload["valid"], true);
+    assert_eq!(payload["summary"]["error_count"], 0);
+    assert_eq!(payload["summary"]["warning_count"], 0);
+    assert_eq!(payload["errors"], serde_json::json!([]));
+    assert_eq!(payload["warnings"], serde_json::json!([]));
+
+    let mut errors = valid.clone();
+    errors["settings"]["listen_port"] = 0.into();
+    std::fs::write(&harness.config_path, toml::to_string(&errors)?)?;
+    let report = cli_8bnf_run(&harness, &["check", "--json"], &[])?;
+    assert_eq!(report.status.code(), Some(1));
+    let payload = cli_8bnf_machine(&report, "json")?;
+    assert_eq!(payload["valid"], false);
+    assert!(payload["errors"].as_array().unwrap().iter().any(|error| {
+        error["category"] == "settings" && error["message"] == "listen_port cannot be 0"
+    }));
+
+    let mut warnings = valid.clone();
+    warnings.as_table_mut().unwrap().remove("active_proxy");
+    std::fs::write(&harness.config_path, toml::to_string(&warnings)?)?;
+    for (args, expected) in [
+        (vec!["check", "--json"], 0),
+        (vec!["check", "--strict", "--json"], 2),
+    ] {
+        let report = cli_8bnf_run(&harness, &args, &[])?;
+        assert_eq!(report.status.code(), Some(expected));
+        let payload = cli_8bnf_machine(&report, "json")?;
+        assert_eq!(payload["valid"], true);
+        assert_eq!(payload["summary"]["error_count"], 0);
+        assert_eq!(payload["summary"]["warning_count"], 1);
+        assert_eq!(payload["warnings"][0]["category"], "active");
+    }
+
+    std::fs::write(&harness.config_path, "[[proxies]\n")?;
+    let report = cli_8bnf_run(&harness, &["check", "--json"], &[])?;
+    assert_eq!(report.status.code(), Some(3));
+    let payload = cli_8bnf_machine(&report, "json")?;
+    assert_eq!(payload["valid"], false);
+    assert_eq!(payload["errors"][0]["category"], "file");
+    assert_eq!(payload["warnings"], serde_json::json!([]));
+
+    let missing = harness.temp_dir.path().join("never-created-config.toml");
+    let report = cli_8bnf_run(
+        &harness,
+        &["check", "--json"],
+        &[("RUST_PROXY_CONFIG", missing.to_str().unwrap())],
+    )?;
+    assert_eq!(report.status.code(), Some(3));
+    let payload = cli_8bnf_machine(&report, "json")?;
+    assert_eq!(payload["valid"], false);
+    assert_eq!(payload["config_path"], missing.to_str().unwrap());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_8bnf_check_format_and_environment_precedence() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    std::fs::write(
+        &harness.config_path,
+        toml::to_string(&cli_8bnf_config(&harness)?)?,
+    )?;
+    for (args, environment, format) in [
+        (vec!["check", "--json"], vec![], "json"),
+        (vec!["check", "--format", "json"], vec![], "json"),
+        (vec!["check", "--format", "toon"], vec![], "toon"),
+        (vec!["check", "--json", "--quiet"], vec![], "json"),
+        (
+            vec!["check", "--json"],
+            vec![("RUST_PROXY_OUTPUT_FORMAT", "toon")],
+            "toon",
+        ),
+        (
+            vec!["check", "--json"],
+            vec![("TOON_DEFAULT_FORMAT", "toon")],
+            "toon",
+        ),
+        (
+            vec!["check", "--json"],
+            vec![
+                ("RUST_PROXY_OUTPUT_FORMAT", "json"),
+                ("TOON_DEFAULT_FORMAT", "toon"),
+            ],
+            "json",
+        ),
+        (
+            vec!["check", "--format", "json"],
+            vec![("RUST_PROXY_OUTPUT_FORMAT", "toon")],
+            "json",
+        ),
+        (
+            vec!["check", "--format", "toon"],
+            vec![("RUST_PROXY_OUTPUT_FORMAT", "json")],
+            "toon",
+        ),
+    ] {
+        let output = cli_8bnf_run(&harness, &args, &environment)?;
+        assert_eq!(output.status.code(), Some(0), "{args:?} {environment:?}");
+        let payload = cli_8bnf_machine(&output, format)?;
+        assert_eq!(payload["valid"], true);
+        assert_eq!(payload["summary"]["error_count"].as_f64(), Some(0.0));
+        assert_eq!(payload["summary"]["warning_count"].as_f64(), Some(0.0));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_8bnf_no_dns_target_hit_miss_and_removal_are_predictions() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    std::fs::write(
+        &harness.config_path,
+        toml::to_string(&cli_8bnf_config(&harness)?)?,
+    )?;
+    for (url, domain, expected) in [
+        ("https://EXAMPLE.invalid/v1/chat", "example.invalid", true),
+        ("HTTPS://EXAMPLE.invalid/v1/chat", "example.invalid", true),
+        ("example.invalid", "example.invalid", true),
+        ("example.invalid:443", "example.invalid", true),
+        ("excluded.invalid", "excluded.invalid", false),
+        (
+            "unlisted.example.invalid",
+            "unlisted.example.invalid",
+            false,
+        ),
+    ] {
+        let output = cli_8bnf_run(&harness, &["test", url, "--no-dns", "--json"], &[])?;
+        assert_eq!(output.status.code(), Some(0));
+        let prediction = cli_8bnf_machine(&output, "json")?;
+        assert_eq!(prediction["domain"], domain);
+        assert_eq!(prediction["would_proxy"], expected);
+        assert_eq!(
+            prediction["routing_decision"]["domain_in_targets"],
+            expected
+        );
+        assert_eq!(prediction["resolved_ips"], serde_json::json!([]));
+        assert!(prediction["dns_error"].is_null());
+        assert_eq!(
+            prediction["routing_decision"]["provider_range_matches"],
+            serde_json::json!([])
+        );
+        assert_eq!(prediction["active_proxy"]["id"], "test-proxy");
+        // daemon_running is deliberately not interpreted as proof of identity
+        // or active firewall interception: this command predicts configuration.
+    }
+    let removed = cli_8bnf_run(&harness, &["targets", "remove", "example.invalid"], &[])?;
+    assert_eq!(removed.status.code(), Some(0));
+    let output = cli_8bnf_run(
+        &harness,
+        &["test", "example.invalid", "--no-dns", "--json"],
+        &[],
+    )?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(cli_8bnf_machine(&output, "json")?["would_proxy"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_8bnf_verbose_machine_formats_and_environment_are_pure() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    std::fs::write(
+        &harness.config_path,
+        toml::to_string(&cli_8bnf_config(&harness)?)?,
+    )?;
+    for (flags, environment, format) in [
+        (vec!["--json", "-v"], vec![], "json"),
+        (vec!["--json", "--verbose"], vec![], "json"),
+        (vec!["--format", "json", "-v"], vec![], "json"),
+        (vec!["--format", "toon", "--verbose"], vec![], "toon"),
+        (
+            vec!["--json", "-v"],
+            vec![("RUST_PROXY_OUTPUT_FORMAT", "toon")],
+            "toon",
+        ),
+        (
+            vec!["--json", "--verbose"],
+            vec![("TOON_DEFAULT_FORMAT", "toon")],
+            "toon",
+        ),
+        (
+            vec!["--format", "json", "-v"],
+            vec![("RUST_PROXY_OUTPUT_FORMAT", "toon")],
+            "json",
+        ),
+    ] {
+        for (domain, expected) in [("example.invalid", true), ("excluded.invalid", false)] {
+            let mut args = vec!["test", domain, "--no-dns"];
+            args.extend(flags.iter().copied());
+            let output = cli_8bnf_run(&harness, &args, &environment)?;
+            assert_eq!(output.status.code(), Some(0));
+            let payload = cli_8bnf_machine(&output, format)?;
+            assert_eq!(payload["domain"], domain);
+            assert_eq!(payload["would_proxy"], expected);
+            assert_eq!(payload["resolved_ips"], serde_json::json!([]));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_8bnf_supported_quiet_preserves_exit_codes_and_plain_failures() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    let valid = cli_8bnf_config(&harness)?;
+    std::fs::write(&harness.config_path, toml::to_string(&valid)?)?;
+    let output = cli_8bnf_run(&harness, &["check", "--quiet"], &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    let mut warnings = valid.clone();
+    warnings.as_table_mut().unwrap().remove("active_proxy");
+    std::fs::write(&harness.config_path, toml::to_string(&warnings)?)?;
+    let output = cli_8bnf_run(&harness, &["check", "--quiet"], &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    let output = cli_8bnf_run(&harness, &["check", "--strict", "--quiet"], &[])?;
+    assert_eq!(output.status.code(), Some(2));
+    cli_8bnf_clean_output(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No active proxy configured"));
+    let mut errors = valid;
+    errors["settings"]["listen_port"] = 0.into();
+    std::fs::write(&harness.config_path, toml::to_string(&errors)?)?;
+    let output = cli_8bnf_run(&harness, &["check", "--quiet"], &[])?;
+    assert_eq!(output.status.code(), Some(1));
+    cli_8bnf_clean_output(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("listen_port cannot be 0"));
+    std::fs::write(&harness.config_path, "[[proxies]\n")?;
+    let output = cli_8bnf_run(&harness, &["check", "--quiet"], &[])?;
+    assert_eq!(output.status.code(), Some(3));
+    cli_8bnf_clean_output(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Failed to load configuration"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_8bnf_invalid_arguments_and_target_errors_are_explicit() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    std::fs::write(
+        &harness.config_path,
+        toml::to_string(&cli_8bnf_config(&harness)?)?,
+    )?;
+    let valid = cli_8bnf_run(&harness, &["check", "--strict", "--json"], &[])?;
+    assert_eq!(valid.status.code(), Some(0));
+    assert_eq!(cli_8bnf_machine(&valid, "json")?["valid"], true);
+    for args in [
+        vec!["check", "--json", "--not-a-supported-option"],
+        vec!["check", "--verbose"],
+        vec!["test", "example.invalid", "--json", "--quiet", "--no-dns"],
+        vec!["test", "example.invalid", "--format", "yaml", "--no-dns"],
+        vec!["test", "--json"],
+    ] {
+        let output = cli_8bnf_run(&harness, &args, &[])?;
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        cli_8bnf_clean_output(&output);
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+    }
+    for target in [
+        "",
+        "bad..invalid",
+        "https://[invalid-host",
+        "ftp://public-user:public-password@example.invalid/path",
+    ] {
+        let output = cli_8bnf_run(&harness, &["test", target, "--json", "--no-dns"], &[])?;
+        assert_eq!(output.status.code(), Some(1), "invalid target {target:?}");
+        cli_8bnf_clean_output(&output);
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid target domain"));
+        for secret in ["public-user", "public-password"] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_8bnf_config_credentials_never_enter_machine_reports() -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    let mut config = cli_8bnf_config(&harness)?;
+    config["proxies"][0]["url"] =
+        "http://inline-user-secret:inline-password-secret@127.0.0.1:12345".into();
+    let mut auth = toml::Table::new();
+    auth.insert("username".into(), "config-user-secret".into());
+    auth.insert("password".into(), "config-password-secret".into());
+    auth.insert("username_env".into(), "CLI_8BNF_USER".into());
+    auth.insert("password_env".into(), "CLI_8BNF_PASSWORD".into());
+    config["proxies"][0]
+        .as_table_mut()
+        .unwrap()
+        .insert("auth".into(), auth.into());
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let before = std::fs::read(&harness.config_path)?;
+    let credentials = [
+        ("CLI_8BNF_USER", "environment-user-secret"),
+        ("CLI_8BNF_PASSWORD", "environment-password-secret"),
+    ];
+    for (args, format) in [
+        (vec!["check", "--json"], "json"),
+        (vec!["check", "--format", "toon"], "toon"),
+        (
+            vec!["test", "example.invalid", "--no-dns", "--json", "-v"],
+            "json",
+        ),
+        (
+            vec![
+                "test",
+                "example.invalid",
+                "--no-dns",
+                "--format",
+                "toon",
+                "--verbose",
+            ],
+            "toon",
+        ),
+    ] {
+        let output = cli_8bnf_run(&harness, &args, &credentials)?;
+        assert_eq!(output.status.code(), Some(0));
+        cli_8bnf_machine(&output, format)?;
+        for secret in [
+            "inline-user-secret",
+            "inline-password-secret",
+            "config-user-secret",
+            "config-password-secret",
+            "environment-user-secret",
+            "environment-password-secret",
+        ] {
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains(secret),
+                "stdout leaked {secret}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains(secret),
+                "stderr leaked {secret}"
+            );
+        }
+        assert_eq!(std::fs::read(&harness.config_path)?, before);
+    }
+    config["proxies"][0]["url"] =
+        "http://inline-user-secret:inline-password-secret@bad host:12345".into();
+    std::fs::write(&harness.config_path, toml::to_string(&config)?)?;
+    let output = cli_8bnf_run(&harness, &["check", "--json"], &credentials)?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(cli_8bnf_machine(&output, "json")?["valid"], false);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("inline-password-secret"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("inline-password-secret"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_8bnf_target_url_credentials_are_redacted_in_verbose_machine_output(
+) -> anyhow::Result<()> {
+    let harness = TestHarness::new().await?;
+    std::fs::write(
+        &harness.config_path,
+        toml::to_string(&cli_8bnf_config(&harness)?)?,
+    )?;
+    let target = "https://client-user-secret:client-password-secret@example.invalid/path";
+    for (flags, format) in [
+        (vec!["--json", "-v"], "json"),
+        (vec!["--format", "toon", "--verbose"], "toon"),
+    ] {
+        let mut args = vec!["test", target, "--no-dns"];
+        args.extend(flags);
+        let output = cli_8bnf_run(&harness, &args, &[])?;
+        assert_eq!(output.status.code(), Some(0));
+        let payload = cli_8bnf_machine(&output, format)?;
+        assert_eq!(payload["domain"], "example.invalid");
+        assert_eq!(payload["would_proxy"], true);
+        for secret in ["client-user-secret", "client-password-secret"] {
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains(secret),
+                "stdout leaked {secret}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains(secret),
+                "stderr leaked {secret}"
+            );
+        }
+        assert!(payload["input"]
+            .as_str()
+            .unwrap()
+            .contains("example.invalid/path"));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn daemon_final_flush_preserves_real_cli_activation_and_exact_traffic() -> anyhow::Result<()>
 {
