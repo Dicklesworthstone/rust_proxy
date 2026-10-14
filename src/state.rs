@@ -199,9 +199,23 @@ pub fn state_path() -> Result<PathBuf> {
     Ok(dir.join("state.json"))
 }
 
+fn add_ping_sample(stats: &mut ProxyStats, ms: f64, at: DateTime<Utc>) {
+    let count = stats.ping_samples.saturating_add(1);
+    stats.ping_avg_ms = Some(
+        stats
+            .ping_avg_ms
+            .map_or(ms, |avg| avg + (ms - avg) / count as f64),
+    );
+    stats.ping_samples = count;
+    stats.last_ping_at = Some(at);
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     inner: Arc<RwLock<State>>,
+    // Routing observations belong to this daemon/configuration, rather than
+    // to persisted historical counters that a flush can merge back in.
+    live: Arc<RwLock<HashMap<String, ProxyStats>>>,
     persisted: Arc<tokio::sync::Mutex<State>>,
     flush_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>>,
     path: PathBuf,
@@ -213,6 +227,7 @@ impl StateStore {
         let read_path = path.clone();
         let state = tokio::task::spawn_blocking(move || State::load(&read_path)).await??;
         Ok(Self {
+            live: Arc::new(RwLock::new(HashMap::new())),
             persisted: Arc::new(tokio::sync::Mutex::new(state.clone())),
             flush_task: Arc::new(tokio::sync::Mutex::new(None)),
             inner: Arc::new(RwLock::new(state)),
@@ -224,6 +239,7 @@ impl StateStore {
     #[cfg(test)]
     pub fn new_for_testing() -> Self {
         Self {
+            live: Arc::new(RwLock::new(HashMap::new())),
             inner: Arc::new(RwLock::new(State::default())),
             persisted: Arc::new(tokio::sync::Mutex::new(State::default())),
             flush_task: Arc::new(tokio::sync::Mutex::new(None)),
@@ -249,16 +265,11 @@ impl StateStore {
 
     pub async fn record_ping(&self, proxy_id: &str, ms: f64) {
         let now = Utc::now();
+        let mut live = self.live.write().await;
+        add_ping_sample(live.entry(proxy_id.to_string()).or_default(), ms, now);
         let mut state = self.inner.write().await;
         let stats = state.proxies.entry(proxy_id.to_string()).or_default();
-        let next_count = stats.ping_samples.saturating_add(1);
-        let next_avg = match stats.ping_avg_ms {
-            None => ms,
-            Some(avg) => avg + (ms - avg) / next_count as f64,
-        };
-        stats.ping_avg_ms = Some(next_avg);
-        stats.ping_samples = next_count;
-        stats.last_ping_at = Some(now);
+        add_ping_sample(stats, ms, now);
     }
 
     /// Record the result of a health check for a proxy
@@ -272,8 +283,8 @@ impl StateStore {
         threshold: u32,
     ) {
         let now = Utc::now();
-        let mut state = self.inner.write().await;
-        let stats = state.proxies.entry(proxy_id.to_string()).or_default();
+        let mut live = self.live.write().await;
+        let stats = live.entry(proxy_id.to_string()).or_default();
 
         stats.last_health_check = Some(now);
 
@@ -285,14 +296,7 @@ impl StateStore {
 
             // Also record ping if latency was measured
             if let Some(ms) = latency_ms {
-                let next_count = stats.ping_samples.saturating_add(1);
-                let next_avg = match stats.ping_avg_ms {
-                    None => ms,
-                    Some(avg) => avg + (ms - avg) / next_count as f64,
-                };
-                stats.ping_avg_ms = Some(next_avg);
-                stats.ping_samples = next_count;
-                stats.last_ping_at = Some(now);
+                add_ping_sample(stats, ms, now);
             }
         } else {
             stats.consecutive_failures = stats.consecutive_failures.saturating_add(1);
@@ -302,14 +306,27 @@ impl StateStore {
                 stats.health_status = HealthStatus::Unhealthy;
             }
         }
+        let mut state = self.inner.write().await;
+        let history = state.proxies.entry(proxy_id.to_string()).or_default();
+        history.last_health_check = stats.last_health_check;
+        history.health_status = stats.health_status;
+        history.consecutive_failures = stats.consecutive_failures;
+        history
+            .last_failure_reason
+            .clone_from(&stats.last_failure_reason);
+        history.last_healthy = history.last_healthy.max(stats.last_healthy);
+        if success {
+            if let Some(ms) = latency_ms {
+                add_ping_sample(history, ms, now);
+            }
+        }
     }
 
     /// Get the current health status of a proxy
     #[allow(dead_code)]
     pub async fn get_health_status(&self, proxy_id: &str) -> HealthStatus {
-        let state = self.inner.read().await;
+        let state = self.live.read().await;
         state
-            .proxies
             .get(proxy_id)
             .map(|s| s.health_status)
             .unwrap_or(HealthStatus::Unknown)
@@ -318,9 +335,8 @@ impl StateStore {
     /// Get a list of proxy IDs that are currently healthy
     #[allow(dead_code)]
     pub async fn get_healthy_proxies(&self) -> Vec<String> {
-        let state = self.inner.read().await;
+        let state = self.live.read().await;
         state
-            .proxies
             .iter()
             .filter(|(_, stats)| stats.health_status == HealthStatus::Healthy)
             .map(|(id, _)| id.clone())
@@ -337,19 +353,35 @@ impl StateStore {
     /// Get the average latency for a proxy (used by LeastLatency load balancing)
     #[allow(dead_code)]
     pub async fn get_latency(&self, proxy_id: &str) -> Option<f64> {
-        let state = self.inner.read().await;
-        state.proxies.get(proxy_id).and_then(|s| s.ping_avg_ms)
+        let state = self.live.read().await;
+        state.get(proxy_id).and_then(|s| s.ping_avg_ms)
     }
 
     /// Get the proxy ID that was most recently healthy (used by UseLast degradation policy)
     pub async fn get_last_healthy_proxy(&self) -> Option<String> {
-        let state = self.inner.read().await;
+        let state = self.live.read().await;
         state
-            .proxies
             .iter()
             .filter_map(|(id, stats)| stats.last_healthy.map(|ts| (id.clone(), ts)))
             .max_by_key(|(_, ts)| *ts)
             .map(|(id, _)| id)
+    }
+
+    /// Forget endpoint-specific eligibility while preserving all historical
+    /// byte, activation and ping records. Persisted merges cannot resurrect it.
+    pub async fn invalidate_observations(&self, proxy_ids: &[String]) {
+        let mut live = self.live.write().await;
+        for id in proxy_ids {
+            live.remove(id);
+        }
+    }
+
+    /// A connection keeps the observations from its admitted generation.
+    /// Traffic still updates the shared durable counters through inner.
+    pub async fn routing_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.live = Arc::new(RwLock::new(self.live.read().await.clone()));
+        snapshot
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -409,7 +441,7 @@ impl StateStore {
 /// Runtime state that can change during daemon operation.
 /// Separate from Config (user intent) and StateStore (persistent stats).
 /// This manages dynamic proxy switching for failover/failback.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RuntimeStateInner {
     /// Currently effective proxy (may differ from config during failover)
     effective_proxy: Option<String>,
@@ -438,12 +470,14 @@ struct RuntimeStateInner {
 #[derive(Clone)]
 pub struct RuntimeState {
     inner: Arc<RwLock<RuntimeStateInner>>,
+    configuration_gate: Arc<RwLock<()>>,
 }
 
 impl RuntimeState {
     /// Create from the active proxy ID on daemon startup
     pub fn new(active_proxy: Option<String>) -> Self {
         Self {
+            configuration_gate: Arc::new(RwLock::new(())),
             inner: Arc::new(RwLock::new(RuntimeStateInner {
                 effective_proxy: active_proxy.clone(),
                 original_proxy: active_proxy,
@@ -456,6 +490,30 @@ impl RuntimeState {
                 direct_bypass_mark: None,
             })),
         }
+    }
+
+    pub fn configuration_gate(&self) -> Arc<RwLock<()>> {
+        self.configuration_gate.clone()
+    }
+
+    pub async fn routing_snapshot(&self) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(self.inner.read().await.clone())),
+            configuration_gate: self.configuration_gate.clone(),
+        }
+    }
+
+    /// Owner holds configuration_gate exclusively through kernel publication,
+    /// observation invalidation, this rebase and the config-bus commit.
+    pub async fn rebase(&self, active_proxy: Option<String>) {
+        let mut inner = self.inner.write().await;
+        inner.effective_proxy = active_proxy.clone();
+        inner.original_proxy = active_proxy;
+        inner.failover_at = None;
+        inner.last_switch_at = Some(Utc::now());
+        inner.recovery_detected_at = None;
+        inner.all_unhealthy_since = None;
+        inner.degradation_active = false;
     }
 
     /// Record the daemon's firewall posture, fixed for the process lifetime:
@@ -564,6 +622,7 @@ impl RuntimeState {
     ) -> bool {
         let mut inner = self.inner.write().await;
         let now = Utc::now();
+        let previous = inner.degradation_active;
 
         if healthy_proxies.is_empty() {
             if inner.all_unhealthy_since.is_none() {
@@ -572,11 +631,10 @@ impl RuntimeState {
             }
 
             if let Some(since) = inner.all_unhealthy_since {
-                let elapsed = now.signed_duration_since(since).num_seconds();
-                if elapsed >= delay_secs as i64 && !inner.degradation_active {
-                    inner.degradation_active = true;
+                let elapsed = now.signed_duration_since(since).num_seconds().max(0) as u64;
+                inner.degradation_active = elapsed >= delay_secs;
+                if inner.degradation_active && !previous {
                     tracing::warn!(elapsed_secs = elapsed, "Degradation mode activated");
-                    return true;
                 }
             }
         } else {
@@ -587,7 +645,7 @@ impl RuntimeState {
             inner.degradation_active = false;
         }
 
-        false
+        previous != inner.degradation_active
     }
 
     /// Check if degradation policy is currently active.
@@ -800,11 +858,129 @@ mod tests {
     fn store_at(path: PathBuf) -> Result<StateStore> {
         let initial = State::load(&path)?;
         Ok(StateStore {
+            live: Arc::new(RwLock::new(HashMap::new())),
             inner: Arc::new(RwLock::new(initial.clone())),
             persisted: Arc::new(tokio::sync::Mutex::new(initial)),
             flush_task: Arc::new(tokio::sync::Mutex::new(None)),
             path,
         })
+    }
+
+    #[tokio::test]
+    async fn invalidated_observations_stay_invalid_after_flush_and_old_snapshot_is_frozen(
+    ) -> Result<()> {
+        let work = tempfile::tempdir()?.keep();
+        let store = store_at(work.join("state.json"))?;
+        store.record_activated("endpoint", Utc::now()).await;
+        store.record_traffic("endpoint", 10, 20).await;
+        store
+            .record_health_check("endpoint", true, Some(100.0), None, 2)
+            .await;
+        store.record_ping("endpoint", 200.0).await;
+        let snapshot = store.routing_snapshot().await;
+        assert_eq!(store.get_latency("endpoint").await, Some(150.0));
+        store.invalidate_observations(&["endpoint".into()]).await;
+        store.flush().await?;
+        assert_eq!(
+            store.get_health_status("endpoint").await,
+            HealthStatus::Unknown
+        );
+        assert_eq!(store.get_latency("endpoint").await, None);
+        assert!(store.get_last_healthy_proxy().await.is_none());
+        assert_eq!(
+            snapshot.get_health_status("endpoint").await,
+            HealthStatus::Healthy
+        );
+        assert_eq!(snapshot.get_latency("endpoint").await, Some(150.0));
+        let history = store.get_all_stats().await;
+        assert_eq!(
+            (
+                history["endpoint"].bytes_sent,
+                history["endpoint"].bytes_received
+            ),
+            (10, 20)
+        );
+        assert!(history["endpoint"].activated_at.is_some());
+        assert_eq!(history["endpoint"].ping_samples, 2);
+        store.record_ping("endpoint", 5.0).await;
+        assert_eq!(store.get_latency("endpoint").await, Some(5.0));
+        store
+            .record_health_check(
+                "endpoint",
+                false,
+                None,
+                Some("new endpoint failure".into()),
+                2,
+            )
+            .await;
+        assert_eq!(
+            store.get_health_status("endpoint").await,
+            HealthStatus::Unknown
+        );
+        store
+            .record_health_check(
+                "endpoint",
+                false,
+                None,
+                Some("second new failure".into()),
+                2,
+            )
+            .await;
+        assert_eq!(
+            store.get_health_status("endpoint").await,
+            HealthStatus::Unhealthy
+        );
+        store.flush().await?;
+        assert_eq!(
+            store.get_health_status("endpoint").await,
+            HealthStatus::Unhealthy
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn increasing_degradation_delay_defers_existing_activation_without_overflow() {
+        let runtime = RuntimeState::new(None);
+        assert!(runtime.update_degradation_state(&[], 0).await);
+        assert!(runtime.is_degraded().await);
+        assert!(runtime.update_degradation_state(&[], u64::MAX).await);
+        assert!(!runtime.is_degraded().await);
+        assert!(runtime.update_degradation_state(&[], 0).await);
+        assert!(
+            runtime
+                .update_degradation_state(&["available".into()], 0)
+                .await
+        );
+        assert!(!runtime.is_degraded().await);
+    }
+
+    #[tokio::test]
+    async fn runtime_rebase_resets_failback_and_degradation_but_preserves_socket_safety() {
+        let runtime = RuntimeState::new(Some("first".into()));
+        runtime.set_firewall_context(true, Some(0x1234)).await;
+        runtime.failover_to("second").await;
+        runtime.record_recovery_detected().await;
+        runtime.update_degradation_state(&[], 0).await;
+        let snapshot = runtime.routing_snapshot().await;
+        runtime.rebase(Some("third".into())).await;
+        assert_eq!(
+            runtime.get_effective_proxy().await.as_deref(),
+            Some("third")
+        );
+        assert_eq!(runtime.get_original_proxy().await.as_deref(), Some("third"));
+        assert!(!runtime.is_failed_over().await);
+        assert!(!runtime.is_degraded().await);
+        assert_eq!(runtime.firewall_context().await, (true, Some(0x1234)));
+        assert_eq!(
+            snapshot.get_effective_proxy().await.as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            snapshot.get_original_proxy().await.as_deref(),
+            Some("first")
+        );
+        assert!(snapshot.is_failed_over().await);
+        assert!(snapshot.is_degraded().await);
     }
 
     #[tokio::test]

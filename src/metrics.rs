@@ -141,6 +141,19 @@ pub static CONNECTION_RETRIES: LazyLock<CounterVec> = LazyLock::new(|| {
     .expect("Failed to create CONNECTION_RETRIES metric")
 });
 
+/// Validated reload attempts that were applied or rejected. Superseded stages
+/// and periodic DNS refreshes are not configuration reload outcomes.
+pub static CONFIG_RELOADS: LazyLock<CounterVec> = LazyLock::new(|| {
+    CounterVec::new(
+        Opts::new(
+            "rust_proxy_config_reloads_total",
+            "Configuration reload outcomes",
+        ),
+        &["result"],
+    )
+    .expect("Failed to create CONFIG_RELOADS metric")
+});
+
 /// Failed or IPv6-only routing sources (1), versus fresh usable coverage (0).
 pub static ROUTE_SOURCE_STALE: LazyLock<GaugeVec> = LazyLock::new(|| {
     GaugeVec::new(
@@ -322,6 +335,7 @@ pub fn init_metrics() -> Result<(), prometheus::Error> {
     register_or_ignore(DNS_RESOLUTIONS.clone())?;
     register_or_ignore(CONNECTION_RETRIES.clone())?;
     register_or_ignore(CONNECTIONS_TOTAL.clone())?;
+    register_or_ignore(CONFIG_RELOADS.clone())?;
 
     // Gauges
     register_or_ignore(ACTIVE_CONNECTIONS.clone())?;
@@ -416,6 +430,12 @@ pub fn record_health_check(proxy_id: &str, healthy: bool, latency_secs: f64) {
 #[inline]
 pub fn record_failover(from_proxy: &str, to_proxy: &str) {
     FAILOVERS.with_label_values(&[from_proxy, to_proxy]).inc();
+}
+
+pub fn record_config_reload(applied: bool) {
+    CONFIG_RELOADS
+        .with_label_values(&[if applied { "applied" } else { "rejected" }])
+        .inc();
 }
 
 /// Increment active connections for a proxy.

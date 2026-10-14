@@ -36,7 +36,6 @@ mod watcher;
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, Settings, TargetSpec};
 use load_balancer::LoadBalancer;
 use output::{OutputDispatcher, OutputFormat};
-use proxy::RetryConfig;
 use state::{HealthStatus, RuntimeState, State, StateStore};
 
 #[derive(Parser)]
@@ -3336,6 +3335,8 @@ const RESTART_REQUIRED_SETTINGS: &[&str] = &[
     "ipset_name",
     "metrics_bind",
     "metrics_port",
+    "metrics_path",
+    "metrics_enabled",
 ];
 
 /// Pure helper: which restart-required settings differ between two snapshots,
@@ -3350,6 +3351,8 @@ fn changed_restart_required_settings(old: &Settings, new: &Settings) -> Vec<&'st
             "ipset_name" => old.ipset_name != new.ipset_name,
             "metrics_bind" => old.metrics_bind != new.metrics_bind,
             "metrics_port" => old.metrics_port != new.metrics_port,
+            "metrics_path" => old.metrics_path != new.metrics_path,
+            "metrics_enabled" => old.metrics_enabled != new.metrics_enabled,
             _ => false,
         })
         .collect()
@@ -3413,12 +3416,11 @@ fn prepare_config_reload(old: &AppConfig, path: &std::path::Path) -> Option<AppC
         .metrics_bind
         .clone_from(&old.settings.metrics_bind);
     new_config.settings.metrics_port = old.settings.metrics_port;
-    if old.active_proxy != new_config.active_proxy {
-        // RuntimeState has no reset API for the failback origin, so the new
-        // active proxy is picked up by consumers but not written back into
-        // runtime failover bookkeeping.
-        tracing::info!("active_proxy change applies to failback origin on next restart");
-    }
+    new_config
+        .settings
+        .metrics_path
+        .clone_from(&old.settings.metrics_path);
+    new_config.settings.metrics_enabled = old.settings.metrics_enabled;
 
     Some(new_config)
 }
@@ -3431,75 +3433,157 @@ enum RoutingOwnerExit {
     Deactivated,
 }
 
+struct RoutingOwnerContext {
+    state: Arc<StateStore>,
+    runtime: RuntimeState,
+    self_exempt: Option<iptables::SelfExemption>,
+    test_mode: bool,
+}
+
+fn changed_observation_ids(old: &AppConfig, new: &AppConfig) -> Vec<String> {
+    let health_changed = old.settings.health_check_enabled != new.settings.health_check_enabled
+        || old.settings.health_check_target != new.settings.health_check_target
+        || old.settings.health_check_timeout_ms != new.settings.health_check_timeout_ms
+        || old.settings.consecutive_failures_threshold
+            != new.settings.consecutive_failures_threshold;
+    let mut changed: HashSet<_> = old
+        .proxies
+        .iter()
+        .filter(|previous| {
+            health_changed
+                || !new.proxies.iter().any(|next| {
+                    next.id == previous.id
+                        && next.url == previous.url
+                        && next.auth == previous.auth
+                        && next.health_check_url == previous.health_check_url
+                })
+        })
+        .map(|proxy| proxy.id.clone())
+        .collect();
+    for proxy in &new.proxies {
+        if health_changed || !old.proxies.iter().any(|previous| previous.id == proxy.id) {
+            changed.insert(proxy.id.clone());
+        }
+    }
+    let mut changed: Vec<_> = changed.into_iter().collect();
+    changed.sort();
+    changed
+}
+
 async fn routing_owner_loop(
     config_tx: tokio::sync::watch::Sender<Arc<AppConfig>>,
     mut reload_requests: tokio::sync::mpsc::Receiver<()>,
     path: PathBuf,
     mut targets: RouteInventory,
     mut upstreams: RouteInventory,
-    self_exempt: Option<iptables::SelfExemption>,
-    test_mode: bool,
+    context: RoutingOwnerContext,
 ) -> Result<RoutingOwnerExit> {
+    let mut pending_reload = false;
     loop {
         let old = config_tx.borrow().clone();
-        let delay = if test_mode {
+        let delay = if context.test_mode {
             Duration::from_secs(3600)
         } else {
             Duration::from_secs(old.settings.dns_refresh_secs)
         };
-        let reload = tokio::select! {
-            request = reload_requests.recv() => {
-                if request.is_none() { bail!("Reload request channel closed unexpectedly"); }
-                true
+        let reload = if pending_reload {
+            pending_reload = false;
+            true
+        } else {
+            tokio::select! {
+                request = reload_requests.recv() => {
+                    if request.is_none() { bail!("Reload request channel closed unexpectedly"); }
+                    true
+                }
+                _ = tokio::time::sleep(delay) => false,
             }
-            _ = tokio::time::sleep(delay) => false,
         };
         let cfg = if reload {
             let Some(requested) = prepare_config_reload(&old, &path) else {
+                metrics::record_config_reload(false);
                 continue;
             };
             Arc::new(requested)
         } else {
-            old
+            old.clone()
         };
         if !cfg.settings.routing_enabled {
             tracing::info!("Routing explicitly deactivated; shutting down daemon normally");
             return Ok(RoutingOwnerExit::Deactivated);
         }
-        if !test_mode {
-            let (target_outcomes, upstream_outcomes) =
-                tokio::join!(target_source_outcomes(&cfg), upstream_source_outcomes(&cfg),);
+        let outcomes = if context.test_mode {
+            None
+        } else {
+            Some(tokio::join!(
+                target_source_outcomes(&cfg),
+                upstream_source_outcomes(&cfg)
+            ))
+        };
+        // A coalesced request arriving during network work supersedes it.
+        if reload_requests.try_recv().is_ok() {
+            pending_reload = true;
+            continue;
+        }
+        let mutation_path = path.clone();
+        let mutation = match tokio::task::spawn_blocking(move || {
+            util::PersistenceLock::acquire(&mutation_path)
+        })
+        .await?
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(%error, "Routing publication waiting for config mutation");
+                continue;
+            }
+        };
+        let latest = prepare_config_reload(&old, &path);
+        if latest
+            .as_ref()
+            .is_some_and(|latest| !latest.settings.routing_enabled)
+        {
+            return Ok(RoutingOwnerExit::Deactivated);
+        }
+        if let Some(latest) = latest {
+            // Compare validated, pinned values without exposing serialized
+            // credentials. An editor/CLI change cannot commit a stale stage.
+            if toml::to_string(&latest)? != toml::to_string(cfg.as_ref())? {
+                pending_reload = true;
+                continue;
+            }
+        } else if reload {
+            metrics::record_config_reload(false);
+            continue; // requested stage was superseded by an invalid edit
+        }
+        let generation = context.runtime.configuration_gate().write_owned().await;
+        let (firewall_active, mark) = context.runtime.firewall_context().await;
+        if firewall_active
+            && mark.is_none()
+            && cfg.settings.allow_direct_fallback
+            && matches!(
+                cfg.settings.degradation_policy,
+                config::DegradationPolicy::Direct
+            )
+        {
+            tracing::warn!("Direct fallback reload requires SO_MARK; keeping applied generation");
+            if reload {
+                metrics::record_config_reload(false);
+            }
+            continue;
+        }
+        if let Some((target_outcomes, upstream_outcomes)) = outcomes {
             // deactivate holds this same directory lock through clear+save.
             // Exclude its deliberate removal from the publication-failure
             // path; never race a CLI mutation halfway through that transaction.
-            let lock_path = path.clone();
-            let mutation = match tokio::task::spawn_blocking(move || {
-                util::PersistenceLock::acquire(&lock_path)
-            })
-            .await?
-            {
-                Ok(lock) => lock,
-                Err(error) => {
-                    tracing::warn!(%error, "Routing publication waiting for config mutation; keeping applied generation");
-                    continue;
-                }
-            };
             // Explicit intent works for load balancing too, where an absent
             // active_proxy can be a valid running configuration. Kernel
             // absence alone must never be mislabeled intentional shutdown.
-            if load_config_for_reload(&path).is_ok_and(|disk| !disk.settings.routing_enabled) {
-                tracing::info!("Routing explicitly deactivated; shutting down daemon normally");
-                metrics::IPSET_SIZE.set(0.0);
-                metrics::set_effective_proxy(
-                    cfg.proxies.iter().map(|proxy| proxy.id.as_str()),
-                    None,
-                );
-                return Ok(RoutingOwnerExit::Deactivated);
-            }
             let upstream_outcomes = match upstream_outcomes {
                 Ok(outcomes) => outcomes,
                 Err(error) => {
                     tracing::warn!(%error, "Routing refresh rejected; keeping applied configuration");
+                    if reload {
+                        metrics::record_config_reload(false);
+                    }
                     continue;
                 }
             };
@@ -3509,21 +3593,57 @@ async fn routing_owner_loop(
                 &mut upstreams,
                 target_outcomes,
                 upstream_outcomes,
-                self_exempt,
+                context.self_exempt,
             ) {
+                if reload {
+                    metrics::record_config_reload(false);
+                }
                 if error.is::<RoutingCommitFatal>() {
                     return Err(error);
                 }
                 tracing::warn!(%error, "Routing refresh rejected; keeping applied configuration and kernel generation");
                 continue;
             }
-            drop(mutation);
         }
         if reload {
+            let changed = changed_observation_ids(&old, &cfg);
+            context.state.invalidate_observations(&changed).await;
+            let effective = context.runtime.get_effective_proxy().await;
+            let original = context.runtime.get_original_proxy().await;
+            if old.active_proxy != cfg.active_proxy
+                || old.settings.load_balance_strategy != cfg.settings.load_balance_strategy
+                || old.settings.health_check_enabled != cfg.settings.health_check_enabled
+                || changed
+                    .iter()
+                    .any(|id| Some(id) == effective.as_ref() || Some(id) == original.as_ref())
+            {
+                context.runtime.rebase(cfg.active_proxy.clone()).await;
+                tracing::info!(active_proxy = ?cfg.active_proxy, "Runtime proxy preference rebased");
+            }
+            if old.settings.auto_failback != cfg.settings.auto_failback
+                || old.settings.failback_delay_secs != cfg.settings.failback_delay_secs
+            {
+                context.runtime.clear_recovery_detected().await;
+            }
+            if cfg.settings.health_check_enabled {
+                let available = health::available_proxy_ids(&cfg, &context.state).await;
+                context
+                    .runtime
+                    .update_degradation_state(&available, cfg.settings.degradation_delay_secs)
+                    .await;
+            }
+            metrics::set_effective_proxy(old.proxies.iter().map(|proxy| proxy.id.as_str()), None);
+            metrics::set_effective_proxy(
+                cfg.proxies.iter().map(|proxy| proxy.id.as_str()),
+                context.runtime.get_effective_proxy().await.as_deref(),
+            );
             metrics::set_target_proxy_counts(cfg.targets.len(), cfg.proxies.len());
             config_tx.send_replace(cfg);
+            metrics::record_config_reload(true);
             tracing::info!(path = %path.display(), "Configuration hot-reloaded");
         }
+        drop(generation);
+        drop(mutation);
     }
 }
 
@@ -3822,43 +3942,62 @@ async fn run_daemon() -> Result<()> {
         watch_config_path.clone(),
         target_inventory,
         upstream_inventory,
-        routing_self_exempt,
-        test_mode,
+        RoutingOwnerContext {
+            state: state.clone(),
+            runtime: runtime_state.clone(),
+            self_exempt: routing_self_exempt,
+            test_mode,
+        },
     ));
 
-    let ping_rx = config_rx.clone();
+    let mut ping_rx = config_rx.clone();
     let state_clone = state.clone();
+    let ping_runtime = runtime_state.clone();
     let ping_task = if test_mode {
         tracing::info!("test mode: skipping proxy ping task");
         None
     } else {
         Some(tokio::spawn(async move {
-            loop {
+            'ping: loop {
                 // Per-tick pickup: borrow the latest validated snapshot so
                 // the proxy list and ping cadence follow hot-reloads.
-                let cfg = ping_rx.borrow().clone();
+                let cfg = ping_rx.borrow_and_update().clone();
                 for proxy in &cfg.proxies {
                     if let Ok(endpoint) = util::parse_proxy_url(&proxy.url) {
-                        match ping_proxy(
+                        let result = tokio::select! {
+                            biased;
+                            changed = ping_rx.changed() => {
+                                if changed.is_err() { break 'ping; }
+                                continue 'ping;
+                            }
+                            result = ping_proxy(
                             &endpoint.host,
                             endpoint.port,
                             cfg.settings.ping_timeout_ms,
-                        )
-                        .await
-                        {
+                            ) => result,
+                        };
+                        let generation = ping_runtime.configuration_gate().read_owned().await;
+                        if !Arc::ptr_eq(&cfg, &ping_rx.borrow()) {
+                            continue 'ping;
+                        }
+                        match result {
                             Ok(ms) => state_clone.record_ping(&proxy.id, ms).await,
                             Err(err) => tracing::warn!("ping failed for {}: {err}", proxy.id),
                         }
+                        drop(generation);
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(cfg.settings.ping_interval_secs)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(cfg.settings.ping_interval_secs)) => {}
+                    changed = ping_rx.changed() => { if changed.is_err() { break; } }
+                }
             }
         }))
     };
 
     // Health check task (only if enabled). Consumes the config bus so
     // health_check_* settings and the proxy set update live on reload.
-    let mut health_task = if config.settings.health_check_enabled {
+    let mut health_task = {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let health_config_rx = config_rx.clone();
         let health_state = state.clone();
@@ -3872,14 +4011,6 @@ async fn run_daemon() -> Result<()> {
             )),
             shutdown_tx,
         ))
-    } else {
-        None
-    };
-
-    let retry_config = RetryConfig {
-        max_retries: config.settings.connect_max_retries,
-        initial_backoff_ms: config.settings.connect_initial_backoff_ms,
-        max_backoff_ms: config.settings.connect_max_backoff_ms,
     };
 
     // Proxy task: consumes the config bus; each accepted connection
@@ -3892,7 +4023,6 @@ async fn run_daemon() -> Result<()> {
         state.clone(),
         runtime_arc,
         load_balancer,
-        retry_config,
         proxy_shutdown_rx,
     ));
 
@@ -5094,6 +5224,41 @@ mod tests {
         );
     }
     #[test]
+    fn observation_identity_changes_reset_eligibility_but_weights_and_priority_keep_it() {
+        let proxy = ProxyConfig {
+            id: "identity".into(),
+            url: "http://127.0.0.1:8080".into(),
+            auth: ProxyAuth::default(),
+            priority: Some(1),
+            health_check_url: None,
+            weight: 100,
+        };
+        let old = AppConfig {
+            proxies: vec![proxy],
+            ..AppConfig::default()
+        };
+        let mut next = old.clone();
+        next.proxies[0].weight = 10;
+        next.proxies[0].priority = Some(2);
+        assert!(changed_observation_ids(&old, &next).is_empty());
+        next.proxies[0].url = "http://127.0.0.1:8081".into();
+        assert_eq!(changed_observation_ids(&old, &next), ["identity"]);
+        next = old.clone();
+        next.proxies[0].auth.username = Some("public-user".into());
+        next.proxies[0].auth.password = Some("public-fixture-password".into());
+        assert_eq!(changed_observation_ids(&old, &next), ["identity"]);
+        next = old.clone();
+        next.settings.health_check_target = config::HealthCheckTarget::Connect {
+            host: "different.invalid".into(),
+            port: 443,
+        };
+        assert_eq!(changed_observation_ids(&old, &next), ["identity"]);
+        next = old.clone();
+        next.proxies.clear();
+        assert_eq!(changed_observation_ids(&old, &next), ["identity"]);
+    }
+
+    #[test]
     fn changed_restart_required_settings_detects_each_field() {
         let base = Settings::default();
         for expected in RESTART_REQUIRED_SETTINGS {
@@ -5104,6 +5269,8 @@ mod tests {
                 "ipset_name" => modified.ipset_name = format!("{}_x", modified.ipset_name),
                 "metrics_bind" => modified.metrics_bind = "0.0.0.0".to_string(),
                 "metrics_port" => modified.metrics_port += 1,
+                "metrics_path" => modified.metrics_path = "/new-metrics".into(),
+                "metrics_enabled" => modified.metrics_enabled = !base.metrics_enabled,
                 // ubs:ignore[rust.ownership.panic-macro] — unit test must fail if a restart-required field lacks a case.
                 other => panic!("unhandled restart-required setting: {other}"),
             }
@@ -5126,6 +5293,8 @@ mod tests {
         requested.settings.ipset_name = "next_targets".into();
         requested.settings.metrics_bind = "127.0.0.2".into();
         requested.settings.metrics_port += 1;
+        requested.settings.metrics_path = "/next-metrics".into();
+        requested.settings.metrics_enabled = !original.settings.metrics_enabled;
         requested.settings.dns_refresh_secs = 900;
         std::fs::write(&path, toml::to_string(&requested).unwrap()).unwrap();
         let applied = prepare_config_reload(&original, &path).unwrap();
@@ -5141,6 +5310,14 @@ mod tests {
             original.settings.metrics_port
         );
         assert_eq!(applied.settings.dns_refresh_secs, 900);
+        assert_eq!(
+            applied.settings.metrics_path,
+            original.settings.metrics_path
+        );
+        assert_eq!(
+            applied.settings.metrics_enabled,
+            original.settings.metrics_enabled
+        );
         assert_eq!(
             load_config_for_reload(&path).unwrap().settings.listen_port,
             requested.settings.listen_port,

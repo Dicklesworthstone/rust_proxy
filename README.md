@@ -220,6 +220,27 @@ clear success/failure feedback.
 sudo rust_proxy reload
 ```
 
+The daemon also watches the configuration file, including atomic replacement
+by an editor. Valid changes apply without restarting the process or dropping
+existing tunnels. New tunnels use the applied configuration. Invalid files or
+failed routing updates produce a warning and preserve the last good state.
+
+| Configuration fields | Reload policy |
+|---|---|
+| Targets and provider range toggles | Reconcile the destination ipset; retain last good entries for failed sources |
+| Proxy URLs, credentials, additions and removals | Resolve upstream exclusions before publishing; discard obsolete health and latency observations |
+| `active_proxy`, strategy, priority and weights | Apply to new tunnels; changing the active proxy also resets the failback destination |
+| Health enable, interval, timeout, target and failure threshold | Cancel obsolete probes and use the new settings; disabling health checks stops their rotation |
+| Failover, failback and degradation settings | Apply to new selection and health decisions; changing failback timing restarts its recovery delay |
+| DNS and ping intervals, ping timeout | Wake the affected loops and use the new cadence |
+| Connection retry limits and backoff | Apply to newly accepted connections |
+| Listen port, chain and ipset names | Require restart; keep the running resource names and port |
+| Metrics enable, bind, port and path | Require restart; keep the running endpoint settings |
+
+Requested restart values remain in the file. The daemon logs which fields
+need a restart and continues using its current resources. Direct fallback
+still requires the daemon's socket marking safety check.
+
 ### `rust_proxy cleanup-stale`
 Clear firewall/pid state left by a crashed daemon (SIGKILL, OOM, panic).
 Refuses while a live daemon holds the pidfile. Invoked automatically by the

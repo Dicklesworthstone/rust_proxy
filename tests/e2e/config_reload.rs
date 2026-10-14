@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::common::mock_proxy::{MockBehavior, MockProxy};
+use crate::common::mock_proxy::{MockBehavior, MockError, MockProxy};
 
 /// Distinctive payload relayed through the daemon under test.
 const PAYLOAD: &[u8] = b"rust-proxy-config-reload-e2e/9876543210";
@@ -250,8 +250,148 @@ async fn config_edit_swaps_proxy_set_without_restart() -> Result<()> {
     Ok(())
 }
 
-/// NEGATIVE: an invalid config edit is rejected — daemon stays alive on the
-/// last-known-good config and keeps routing.
+/// Retain two healthy proxies so a priority fallback cannot masquerade as
+/// active-only reload. Recovery must return to the newly selected origin.
+#[tokio::test]
+async fn active_only_edit_switches_between_two_retained_healthy_proxies() -> Result<()> {
+    require_non_root();
+    let mock_a = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let mock_b = MockProxy::new(0, MockBehavior::TunnelEcho).await?;
+    let listen_port = free_listen_port();
+    let home = write_test_config(mock_a.port, listen_port, "mock-a")?;
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&home.config_path)?)?;
+    let mut second = toml::Table::new();
+    second.insert("id".into(), "mock-b".into());
+    second.insert(
+        "url".into(),
+        format!("http://127.0.0.1:{}", mock_b.port).into(),
+    );
+    second.insert("priority".into(), 0.into());
+    config["proxies"]
+        .as_array_mut()
+        .unwrap()
+        .push(second.into());
+    let settings = config["settings"].as_table_mut().unwrap();
+    settings.insert("health_check_enabled".into(), true.into());
+    settings.insert("health_check_interval_secs".into(), 1.into());
+    settings.insert("consecutive_failures_threshold".into(), 1.into());
+    settings.insert("failback_delay_secs".into(), 1.into());
+    settings.insert(
+        "health_check_target".into(),
+        "CONNECT health.reload.invalid:443".into(),
+    );
+    std::fs::write(&home.config_path, toml::to_string(&config)?)?;
+    let work = tempfile::tempdir()?.keep();
+    let log = work.join("daemon.stderr");
+    let mut child = ChildGuard(spawn_daemon(&home, &log)?);
+    let pid = child.0.id();
+    let addr = ([127, 0, 0, 1], listen_port).into();
+    wait_for_listener(addr).await?;
+    let health_request = "CONNECT health.reload.invalid:443 HTTP/1.1";
+    let ready = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ![&mock_a, &mock_b].iter().all(|proxy| {
+        proxy
+            .get_requests()
+            .iter()
+            .any(|request| request.request_line == health_request)
+    }) {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < ready,
+            "both health probes did not complete: {}",
+            read_stderr(&log)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let traffic_count = |proxy: &MockProxy| {
+        proxy
+            .get_requests()
+            .iter()
+            .filter(|request| request.request_line == format!("CONNECT {ORIGINAL_DST} HTTP/1.1"))
+            .count()
+    };
+    tunnel_attempt(addr).await?;
+    assert!(traffic_count(&mock_a) >= 1);
+    assert_eq!(
+        traffic_count(&mock_b),
+        0,
+        "higher-priority retained B must not replace active A"
+    );
+    // This is the sole changed field. Keeping both proxy identities makes a
+    // priority fallback unable to substitute for a rebased active selection.
+    config["active_proxy"] = "mock-b".into();
+    std::fs::write(&home.config_path, toml::to_string(&config)?)?;
+    let deadline = tokio::time::Instant::now() + RELOAD_BUDGET;
+    while traffic_count(&mock_b) == 0 {
+        assert_alive(&mut child.0, "active-only reload");
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "active-only edit never selected retained B; log={}: {}",
+            log.display(),
+            read_stderr(&log)
+        );
+        tunnel_attempt(addr).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let before_a = traffic_count(&mock_a);
+    let before_b = traffic_count(&mock_b);
+    for _ in 0..3 {
+        tunnel_attempt(addr).await?;
+    }
+    assert_eq!(traffic_count(&mock_a), before_a);
+    assert_eq!(traffic_count(&mock_b), before_b + 3);
+    mock_b.set_behavior(MockBehavior::Failing {
+        error: MockError::AuthRequired,
+    });
+    let deadline = tokio::time::Instant::now() + RELOAD_BUDGET;
+    while !read_stderr(&log).contains("Failover performed") {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "rebased B never failed over: {}",
+            read_stderr(&log)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let before_a = traffic_count(&mock_a);
+    let before_b = traffic_count(&mock_b);
+    for _ in 0..3 {
+        tunnel_attempt(addr).await?;
+    }
+    assert_eq!(traffic_count(&mock_a), before_a + 3);
+    assert_eq!(traffic_count(&mock_b), before_b);
+    mock_b.set_behavior(MockBehavior::TunnelEcho);
+    let deadline = tokio::time::Instant::now() + RELOAD_BUDGET;
+    while !read_stderr(&log).contains("Failback triggered - returning to original proxy") {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "recovered B never became the failback origin: {}",
+            read_stderr(&log)
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let stderr = read_stderr(&log);
+    assert!(
+        stderr.lines().any(|line| line
+            .contains("Failback triggered - returning to original proxy")
+            && line.contains("mock-b")),
+        "{stderr}"
+    );
+    let before_a = traffic_count(&mock_a);
+    let before_b = traffic_count(&mock_b);
+    for _ in 0..3 {
+        tunnel_attempt(addr).await?;
+    }
+    assert_eq!(traffic_count(&mock_a), before_a);
+    assert_eq!(traffic_count(&mock_b), before_b + 3);
+    assert_eq!(child.0.id(), pid);
+    assert_eq!(
+        read_stderr(&log)
+            .matches("transparent proxy listening on")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn invalid_config_edit_keeps_last_known_good() -> Result<()> {
     require_non_root();

@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tokio::time::{timeout, Instant, MissedTickBehavior};
+use tokio::time::{timeout, Instant};
 
 /// Result of a health check
 pub struct HealthCheckResult {
@@ -348,50 +348,70 @@ pub async fn check_and_perform_failback(
 }
 
 /// Health check loop that runs as a background task in the daemon
+pub async fn available_proxy_ids(config: &AppConfig, state: &StateStore) -> Vec<String> {
+    let mut available = Vec::new();
+    for proxy in &config.proxies {
+        if state.get_health_status(&proxy.id).await != HealthStatus::Unhealthy {
+            available.push(proxy.id.clone());
+        }
+    }
+    available
+}
+
 pub async fn health_check_loop(
-    config_rx: watch::Receiver<std::sync::Arc<crate::AppConfig>>,
+    mut config_rx: watch::Receiver<std::sync::Arc<crate::AppConfig>>,
     state: Arc<StateStore>,
     runtime: RuntimeState,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let config = config_rx.borrow().clone();
-    let interval = Duration::from_secs(config.settings.health_check_interval_secs);
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    tracing::info!(
-        interval_secs = config.settings.health_check_interval_secs,
-        proxies = config.proxies.len(),
-        auto_failover = config.settings.auto_failover,
-        auto_failback = config.settings.auto_failback,
-        "Health check loop started"
-    );
-
-    // Perform initial health check on startup
-    run_health_checks(&config, &state).await;
-
+    let mut delay = Duration::ZERO;
+    tracing::info!("Health check loop started");
     loop {
+        let config = config_rx.borrow_and_update().clone();
+        if !config.settings.health_check_enabled {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                changed = config_rx.changed() => {
+                    if changed.is_err() { break; }
+                    delay = Duration::ZERO;
+                    continue;
+                }
+            }
+        }
         tokio::select! {
             biased;
-
-            _ = shutdown.changed() => {
-                tracing::info!("Health check loop shutting down");
-                break;
+            _ = shutdown.changed() => break,
+            changed = config_rx.changed() => {
+                if changed.is_err() { break; }
+                delay = Duration::ZERO;
+                continue;
             }
-            _ = ticker.tick() => {
-                // Hot-reload: adopt the latest validated config each tick.
-                let config = config_rx.borrow().clone();
-                run_health_checks(&config, &state).await;
-
+            _ = tokio::time::sleep(delay) => {}
+        }
+        let observed = config_rx.clone();
+        let completed = tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            changed = config_rx.changed() => {
+                if changed.is_err() { break; }
+                delay = Duration::ZERO;
+                continue;
+            }
+            complete = run_health_checks(&config, &observed, &state, &runtime) => complete,
+        };
+        if completed {
+            let generation = runtime.configuration_gate().read_owned().await;
+            if Arc::ptr_eq(&config, &config_rx.borrow()) {
                 // Update degradation state (debounced) based on current health
-                let healthy = state.get_healthy_proxies().await;
+                let available = available_proxy_ids(&config, &state).await;
                 runtime
-                    .update_degradation_state(&healthy, config.settings.degradation_delay_secs)
+                    .update_degradation_state(&available, config.settings.degradation_delay_secs)
                     .await;
 
                 // Check for failover if enabled
                 if config.settings.auto_failover {
-                    if let Some(event) = check_and_perform_failover(&config, &state, &runtime).await {
+                    if let Some(event) = check_and_perform_failover(&config, &state, &runtime).await
+                    {
                         tracing::warn!(
                             from = %event.from_proxy,
                             to = %event.to_proxy,
@@ -429,18 +449,30 @@ pub async fn health_check_loop(
                     );
                 }
             }
+            drop(generation);
         }
+        delay = Duration::from_secs(config.settings.health_check_interval_secs);
     }
+    tracing::info!("Health check loop shutting down");
 }
 
 /// Run health checks on all configured proxies
-async fn run_health_checks(config: &AppConfig, state: &StateStore) {
+async fn run_health_checks(
+    config: &Arc<AppConfig>,
+    observed: &watch::Receiver<Arc<AppConfig>>,
+    state: &StateStore,
+    runtime: &RuntimeState,
+) -> bool {
     let timeout_ms = config.settings.health_check_timeout_ms;
     let threshold = config.settings.consecutive_failures_threshold;
     let target = &config.settings.health_check_target;
 
     for proxy in &config.proxies {
         let result = check_proxy_health(proxy, timeout_ms, target).await;
+        let generation = runtime.configuration_gate().read_owned().await;
+        if !Arc::ptr_eq(config, &observed.borrow()) {
+            return false;
+        }
 
         tracing::debug!(
             proxy_id = %proxy.id,
@@ -474,7 +506,9 @@ async fn run_health_checks(config: &AppConfig, state: &StateStore) {
                 "Proxy health check failed"
             );
         }
+        drop(generation);
     }
+    true
 }
 
 #[cfg(test)]
@@ -531,6 +565,108 @@ mod tests {
             Ok(request)
         });
         Ok((proxy, task))
+    }
+
+    #[tokio::test]
+    async fn health_loop_live_enable_cancel_disable_and_interval_follow_config() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let closed = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_started = started.clone();
+        let server_closed = closed.clone();
+        let count = requests.clone();
+        let server: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await?;
+                let request = read_request(&mut stream).await?;
+                anyhow::ensure!(request.starts_with("CONNECT live.health.invalid:443 HTTP/1.1"));
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    server_started.notify_one();
+                    // No server deadline/response: config cancellation must
+                    // release this socket and prevent an obsolete result.
+                    let mut byte = [0];
+                    anyhow::ensure!(stream.read(&mut byte).await? == 0);
+                    server_closed.notify_one();
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 200 Established\r\n\r\n")
+                        .await?;
+                }
+            }
+        });
+        let mut config = AppConfig {
+            proxies: vec![ProxyConfig {
+                id: "live-health-cancellation".into(),
+                url: format!("http://{address}"),
+                auth: ProxyAuth::default(),
+                priority: None,
+                health_check_url: None,
+                weight: 100,
+            }],
+            ..AppConfig::default()
+        };
+        config.settings.health_check_enabled = false;
+        config.settings.health_check_interval_secs = 3600;
+        config.settings.health_check_timeout_ms = 5000;
+        config.settings.health_check_target = HealthCheckTarget::Connect {
+            host: "live.health.invalid".into(),
+            port: 443,
+        };
+        let (config_tx, config_rx) = watch::channel(Arc::new(config.clone()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let state = Arc::new(StateStore::new_for_testing());
+        let runtime = RuntimeState::new(None);
+        let task = tokio::spawn(health_check_loop(
+            config_rx,
+            state.clone(),
+            runtime.clone(),
+            stop_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        config.settings.health_check_enabled = true;
+        config_tx.send_replace(Arc::new(config.clone()));
+        timeout(Duration::from_secs(1), started.notified()).await?;
+        config.settings.health_check_enabled = false;
+        {
+            let generation = runtime.configuration_gate().write_owned().await;
+            state
+                .invalidate_observations(&["live-health-cancellation".into()])
+                .await;
+            config_tx.send_replace(Arc::new(config.clone()));
+            drop(generation);
+        }
+        timeout(Duration::from_secs(1), closed.notified()).await?;
+        assert_eq!(
+            state.get_health_status("live-health-cancellation").await,
+            HealthStatus::Unknown
+        );
+        config.settings.health_check_enabled = true;
+        config.settings.health_check_interval_secs = 1;
+        config_tx.send_replace(Arc::new(config.clone()));
+        timeout(Duration::from_secs(3), async {
+            while requests.load(Ordering::SeqCst) < 3
+                || state.get_health_status("live-health-cancellation").await
+                    != HealthStatus::Healthy
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await?;
+        config.settings.health_check_enabled = false;
+        config_tx.send_replace(Arc::new(config));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stable = requests.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), stable);
+        stop_tx.send(true)?;
+        timeout(Duration::from_secs(1), task).await??;
+        server.abort();
+        let _ = server.await;
+        Ok(())
     }
 
     #[tokio::test]

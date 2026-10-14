@@ -264,7 +264,6 @@ pub async fn run_proxy_with_load_balancing(
     state: Arc<StateStore>,
     runtime: Arc<RuntimeState>,
     load_balancer: Arc<LoadBalancer>,
-    retry_config: RetryConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let config = config_rx.borrow().clone();
@@ -323,10 +322,18 @@ pub async fn run_proxy_with_load_balancing(
                 break Err(e.into());
             }
         };
-        // Hot-reload: snapshot the latest config for this connection.
+        // Admission captures config, runtime preference/safety and endpoint
+        // observations together. No generation guard survives network I/O.
+        let generation = runtime.configuration_gate().read_owned().await;
         let config_clone = config_rx.borrow().clone();
-        let state_clone = state.clone();
-        let runtime_clone = runtime.clone();
+        let state_clone = Arc::new(state.routing_snapshot().await);
+        let runtime_clone = Arc::new(runtime.routing_snapshot().await);
+        let retry_config = RetryConfig {
+            max_retries: config_clone.settings.connect_max_retries,
+            initial_backoff_ms: config_clone.settings.connect_initial_backoff_ms,
+            max_backoff_ms: config_clone.settings.connect_max_backoff_ms,
+        };
+        drop(generation);
         let lb_clone = load_balancer.clone();
         connections.spawn(async move {
             if let Err(err) = handle_connection_with_load_balancing(
@@ -386,15 +393,27 @@ async fn handle_connection_with_load_balancing(
     let target_port = target.port();
 
     // Select proxy using load balancer
-    let proxy_id = load_balancer
-        .select_proxy(
-            config.settings.load_balance_strategy,
-            &config.proxies,
-            &state,
-            // Steer Single-strategy routing from the live failover state.
-            runtime.get_effective_proxy().await.as_deref(),
-        )
-        .await;
+    let preferred = runtime.get_effective_proxy().await;
+    let strict_unhealthy = config.settings.load_balance_strategy
+        == crate::config::LoadBalanceStrategy::Single
+        && !config.settings.auto_failover
+        && match preferred.as_deref() {
+            Some(id) => state.get_health_status(id).await == crate::state::HealthStatus::Unhealthy,
+            None => false,
+        };
+    let proxy_id = if strict_unhealthy {
+        None
+    } else {
+        load_balancer
+            .select_proxy(
+                config.settings.load_balance_strategy,
+                &config.proxies,
+                &state,
+                // Steer Single-strategy routing from the live failover state.
+                preferred.as_deref(),
+            )
+            .await
+    };
 
     // If no healthy proxy, apply degradation policy
     let (proxy_id, upstream, mut upstream_socket) =
