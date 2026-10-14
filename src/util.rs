@@ -918,14 +918,27 @@ pub fn redact_proxy_url(raw: &str) -> String {
     }
 }
 
-#[allow(dead_code)]
+/// Render a unit using systemd's quoting rules, never shell interpolation.
+/// Account names use systemd's portable syntax, or a numeric UID/GID.
 pub fn generate_service_file(
     binary_path: &Path,
     config_path: &Path,
     user: &str,
     group: &str,
     hardened: bool,
-) -> String {
+) -> Result<String> {
+    validate_service_account(user, "user")?;
+    validate_service_account(group, "group")?;
+    let binary = service_path(binary_path, "executable")?;
+    if !binary_path.is_absolute() || binary.contains(['\\', '\'', '"', '*', '?', '[', ']']) {
+        bail!("Service executable must be an absolute path without quotes, backslashes or glob characters");
+    }
+    let config_path = absolute_service_path(config_path, "config")?;
+    let config = service_path(&config_path, "config")?;
+    // ':' disables Exec environment substitution. '%' specifiers are escaped
+    // separately, including in the executable path and Environment assignment.
+    let binary = quote_service_value(&format!(":{binary}"));
+    let config = quote_service_value(&format!("RUST_PROXY_CONFIG={config}"));
     let mut service = format!(
         r#"[Unit]
 Description=rust_proxy - Targeted transparent proxy daemon
@@ -945,8 +958,8 @@ TimeoutStopSec=30
 User={user}
 Group={group}
 
-# Config file path (for reference)
-Environment=RUST_PROXY_CONFIG={config}
+# Config file read by the daemon and cleanup command
+Environment={config}
 
 # Logging
 StandardOutput=journal
@@ -956,14 +969,14 @@ SyslogIdentifier=rust_proxy
 # Resource limits
 LimitNOFILE=65535
 "#,
-        binary = binary_path.display(),
-        config = config_path.display(),
+        binary = binary,
+        config = config,
         user = user,
         group = group
     );
 
     if hardened {
-        service.push_str(&hardening_section(config_path));
+        service.push_str(&hardening_section(&config_path)?);
     }
 
     service.push_str(
@@ -973,19 +986,78 @@ WantedBy=multi-user.target
 "#,
     );
 
-    service
+    Ok(service)
 }
 
-#[allow(dead_code)]
-fn hardening_section(config_path: &Path) -> String {
+fn validate_service_account(account: &str, label: &str) -> Result<()> {
+    let numeric = account.bytes().all(|byte| byte.is_ascii_digit())
+        && account
+            .parse::<u32>()
+            .is_ok_and(|id| id != u32::MAX && id != 65_535);
+    let named = !account.is_empty()
+        && account.len() <= 31
+        && account
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && account
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if !numeric && !named {
+        bail!("Service {label} must be a portable account name or valid numeric ID");
+    }
+    Ok(())
+}
+
+fn service_path<'a>(path: &'a Path, label: &str) -> Result<&'a str> {
+    let value = path
+        .to_str()
+        .with_context(|| format!("Service {label} path must be UTF-8"))?;
+    if value.is_empty() || value.chars().any(char::is_control) {
+        bail!("Service {label} path must be nonempty and contain no control characters");
+    }
+    Ok(value)
+}
+
+fn absolute_service_path(path: &Path, label: &str) -> Result<PathBuf> {
+    service_path(path, label)?;
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("Failed to resolve service generation directory")?
+            .join(path))
+    }
+}
+
+fn quote_service_value(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn hardening_section(config_path: &Path) -> Result<String> {
     let config_dir = config_path.parent().unwrap_or(config_path);
     let mut section = String::new();
     section.push_str("\n# Security hardening (limited due to iptables requirement)\n");
     section.push_str("ProtectSystem=strict\n");
-    section.push_str(&format!("ReadWritePaths={}\n", config_dir.display()));
-    if let Ok(state_dir) = crate::config::state_dir() {
-        section.push_str(&format!("ReadWritePaths={}\n", state_dir.display()));
-    }
+    section.push_str(&format!(
+        "ReadWritePaths={}\n",
+        quote_service_value(service_path(config_dir, "config directory")?)
+    ));
+    let state_dir = absolute_service_path(&crate::config::state_dir()?, "state directory")?;
+    section.push_str(&format!(
+        "ReadWritePaths={}\n",
+        quote_service_value(service_path(&state_dir, "state directory")?)
+    ));
     section.push_str("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE\n");
     section.push_str("NoNewPrivileges=no\n");
     section.push_str("PrivateTmp=true\n");
@@ -993,7 +1065,7 @@ fn hardening_section(config_path: &Path) -> String {
     section.push_str("ProtectKernelTunables=true\n");
     section.push_str("ProtectKernelModules=true\n");
     section.push_str("ProtectControlGroups=true\n");
-    section
+    Ok(section)
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -1288,39 +1360,291 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_service_file_basic() {
+    fn test_generate_service_file_basic() -> Result<()> {
         let binary = std::path::Path::new("/usr/local/bin/rust_proxy");
         let config = std::path::Path::new("/etc/rust_proxy/config.toml");
-        let service = generate_service_file(binary, config, "root", "root", false);
-        assert!(service.contains(&format!(
-            "ExecStartPre={binary} cleanup-stale",
-            binary = "/usr/local/bin/rust_proxy"
-        )));
-        assert!(service.contains("ExecStart=/usr/local/bin/rust_proxy daemon"));
-        assert!(service.contains("Environment=RUST_PROXY_CONFIG=/etc/rust_proxy/config.toml"));
-        assert!(service.contains("User=root"));
-        assert!(service.contains("Group=root"));
-        assert!(!service.contains("ProtectSystem=strict"));
+        let service = generate_service_file(binary, config, "root", "root", false)?;
+        for required in [
+            "Description=rust_proxy - Targeted transparent proxy daemon",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "Type=simple",
+            "ExecStartPre=\":/usr/local/bin/rust_proxy\" cleanup-stale",
+            "ExecStart=\":/usr/local/bin/rust_proxy\" daemon",
+            "ExecReload=/bin/kill -HUP $MAINPID",
+            "Environment=\"RUST_PROXY_CONFIG=/etc/rust_proxy/config.toml\"",
+            "User=root",
+            "Group=root",
+            "Restart=on-failure",
+            "RestartSec=5",
+            "TimeoutStopSec=30",
+            "StandardOutput=journal",
+            "StandardError=journal",
+            "SyslogIdentifier=rust_proxy",
+            "WantedBy=multi-user.target",
+        ] {
+            assert_eq!(
+                service.lines().filter(|line| *line == required).count(),
+                1,
+                "missing or duplicate directive: {required}"
+            );
+        }
+        assert_eq!(
+            service
+                .lines()
+                .filter(|line| line.starts_with('['))
+                .collect::<Vec<_>>(),
+            ["[Unit]", "[Service]", "[Install]"]
+        );
+        for directive in [
+            "ProtectSystem=",
+            "ReadWritePaths=",
+            "AmbientCapabilities=",
+            "CapabilityBoundingSet=",
+            "PrivateTmp=",
+            "ProtectHome=",
+            "NoNewPrivileges=",
+        ] {
+            assert!(!service.lines().any(|line| line.starts_with(directive)));
+        }
+        for line in service.lines() {
+            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                continue;
+            }
+            assert!(line.contains('='), "invalid unit directive: {line}");
+        }
+        assert!(!service.contains("{{"));
+        assert!(!service.contains("}}"));
 
         // Runtime consumption: the emitted Environment line must actually
         // steer config_path() so service runs read the same file as manual
         // runs (round-trip proof for RUST_PROXY_CONFIG support).
         let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        let previous_config = std::env::var_os("RUST_PROXY_CONFIG");
         std::env::set_var("RUST_PROXY_CONFIG", "/etc/rust_proxy/config.toml");
         assert_eq!(
             crate::config::config_path().unwrap(),
             std::path::PathBuf::from("/etc/rust_proxy/config.toml")
         );
-        std::env::remove_var("RUST_PROXY_CONFIG");
+        match previous_config {
+            Some(previous) => std::env::set_var("RUST_PROXY_CONFIG", previous),
+            None => std::env::remove_var("RUST_PROXY_CONFIG"),
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_generate_service_file_hardened() {
+    fn test_generate_service_file_hardened() -> Result<()> {
         let binary = std::path::Path::new("/usr/local/bin/rust_proxy");
         let config = std::path::Path::new("/etc/rust_proxy/config.toml");
-        let service = generate_service_file(binary, config, "root", "root", true);
-        assert!(service.contains("ProtectSystem=strict"));
-        assert!(service.contains("ReadWritePaths=/etc/rust_proxy"));
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        let service = generate_service_file(binary, config, "root", "root", true)?;
+        for required in [
+            "ProtectSystem=strict",
+            "ReadWritePaths=\"/etc/rust_proxy\"",
+            "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
+            "NoNewPrivileges=no",
+            "PrivateTmp=true",
+            "ProtectHome=read-only",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectControlGroups=true",
+        ] {
+            assert_eq!(
+                service.lines().filter(|line| *line == required).count(),
+                1,
+                "missing or duplicate hardening directive: {required}"
+            );
+        }
+        // This pins the current limited hardening output. It does not qualify
+        // live service permissions or satisfy the bead's bounding-set criterion.
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_service_file_custom_user_group() -> Result<()> {
+        let binary = Path::new("/opt/rust_proxy/bin/rust_proxy");
+        let config = Path::new("/etc/rust_proxy/custom.toml");
+        let service = generate_service_file(binary, config, "proxy", "proxy-group", false)?;
+        assert!(service.lines().any(|line| line == "User=proxy"));
+        assert!(service.lines().any(|line| line == "Group=proxy-group"));
+        assert!(!service.lines().any(|line| line == "User=root"));
+        assert!(!service.lines().any(|line| line == "Group=root"));
+        // Unit generation supports account selection; the daemon still requires
+        // UID 0. Text output alone does not prove a non-root service can run.
+        let numeric = generate_service_file(binary, config, "0", "1000", false)?;
+        assert!(numeric.lines().any(|line| line == "User=0"));
+        assert!(numeric.lines().any(|line| line == "Group=1000"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_service_file_current_executable() -> Result<()> {
+        let binary = std::env::current_exe()?;
+        assert!(binary.is_file());
+        let service = generate_service_file(
+            &binary,
+            Path::new("/etc/rust_proxy/config.toml"),
+            "root",
+            "root",
+            false,
+        )?;
+        assert!(service
+            .lines()
+            .any(|line| line == format!("ExecStart=\":{}\" daemon", binary.display())));
+        assert!(service
+            .lines()
+            .any(|line| line == format!("ExecStartPre=\":{}\" cleanup-stale", binary.display())));
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_service_file_preserves_spaces_and_literal_expansion_characters() -> Result<()>
+    {
+        let _env_guard = crate::config::tests::CONFIG_ENV_LOCK.lock();
+        let service = generate_service_file(
+            Path::new("/opt/rust proxy/$HOME/%i;tool"),
+            Path::new(r#"/etc/proxy "quoted"\$HOME/%i/config.toml"#),
+            "root",
+            "root",
+            true,
+        )?;
+        for required in [
+            r#"ExecStart=":/opt/rust proxy/$HOME/%%i;tool" daemon"#,
+            r#"ExecStartPre=":/opt/rust proxy/$HOME/%%i;tool" cleanup-stale"#,
+            r#"Environment="RUST_PROXY_CONFIG=/etc/proxy \"quoted\"\\$HOME/%%i/config.toml""#,
+            r#"ReadWritePaths="/etc/proxy \"quoted\"\\$HOME/%%i""#,
+        ] {
+            assert_eq!(
+                service.lines().filter(|line| *line == required).count(),
+                1,
+                "incorrect systemd token: {required}"
+            );
+        }
+        assert_eq!(
+            service
+                .lines()
+                .filter(|line| line.starts_with("ExecStart="))
+                .count(),
+            1
+        );
+        assert_eq!(
+            service
+                .lines()
+                .filter(|line| line.starts_with("Environment="))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_service_file_relative_config_is_anchored_to_generator_directory() -> Result<()>
+    {
+        let config = std::env::current_dir()?.join("config with spaces.toml");
+        let service = generate_service_file(
+            Path::new("/usr/local/bin/rust_proxy"),
+            Path::new("config with spaces.toml"),
+            "root",
+            "root",
+            false,
+        )?;
+        assert!(service.lines().any(|line| {
+            line == format!("Environment=\"RUST_PROXY_CONFIG={}\"", config.display())
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_service_file_rejects_account_directive_injection() {
+        let binary = Path::new("/usr/local/bin/rust_proxy");
+        let config = Path::new("/etc/rust_proxy/config.toml");
+        for invalid in [
+            "",
+            "proxy\nExecStart=/bin/false",
+            "proxy\rGroup=root",
+            "proxy group",
+            "\"proxy\"",
+            "proxy;root",
+            "%i",
+            "$USER",
+            "-proxy",
+            "123proxy",
+            "a12345678901234567890123456789012",
+            "65535",
+            "4294967295",
+            "4294967296",
+        ] {
+            assert!(
+                generate_service_file(binary, config, invalid, "root", false).is_err(),
+                "invalid user accepted: {invalid:?}"
+            );
+            assert!(
+                generate_service_file(binary, config, "root", invalid, false).is_err(),
+                "invalid group accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_service_file_rejects_unrepresentable_paths() {
+        let binary = Path::new("/usr/local/bin/rust_proxy");
+        let config = Path::new("/etc/rust_proxy/config.toml");
+        for invalid in [
+            "",
+            "/tmp/path\nExecStart=/bin/false",
+            "/tmp/path\rGroup=root",
+            "/tmp/path\tfile",
+            "/tmp/path\0file",
+            "/tmp/path\u{7f}file",
+        ] {
+            assert!(
+                generate_service_file(Path::new(invalid), config, "root", "root", false).is_err()
+            );
+            assert!(
+                generate_service_file(binary, Path::new(invalid), "root", "root", false).is_err()
+            );
+        }
+        for invalid_binary in [
+            "relative/rust_proxy",
+            "/tmp/proxy\"quoted\"",
+            "/tmp/proxy'quoted'",
+            r"/tmp/proxy\slash",
+            "/tmp/proxy*",
+            "/tmp/proxy?",
+            "/tmp/proxy[1]",
+        ] {
+            assert!(generate_service_file(
+                Path::new(invalid_binary),
+                config,
+                "root",
+                "root",
+                false
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn test_generate_service_file_rejects_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/proxy-\xff"));
+        assert!(generate_service_file(
+            invalid,
+            Path::new("/etc/config.toml"),
+            "root",
+            "root",
+            false
+        )
+        .is_err());
+        assert!(generate_service_file(
+            Path::new("/usr/local/bin/rust_proxy"),
+            invalid,
+            "root",
+            "root",
+            false
+        )
+        .is_err());
     }
 
     // =========================================================================

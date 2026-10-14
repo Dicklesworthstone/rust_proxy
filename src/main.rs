@@ -3278,7 +3278,7 @@ fn service_generate(
     };
 
     let service_content =
-        util::generate_service_file(&binary_path, &config_path, &user, &group, hardened);
+        util::generate_service_file(&binary_path, &config_path, &user, &group, hardened)?;
     std::fs::write(&output_path, service_content)
         .with_context(|| format!("Failed to write {}", output_path.display()))?;
 
