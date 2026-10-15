@@ -33,6 +33,15 @@ mod util;
 mod validation;
 mod watcher;
 
+/// The User-Agent rust_proxy sends on its own requests (health probes,
+/// provider IP-range feeds). It names this project; never borrow another
+/// product's crawler or client User-Agent.
+pub(crate) const USER_AGENT: &str = concat!(
+    "rust_proxy/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/Dicklesworthstone/rust_proxy)"
+);
+
 use config::{infer_provider, AppConfig, Provider, ProxyAuth, ProxyConfig, Settings, TargetSpec};
 use load_balancer::LoadBalancer;
 use output::{OutputDispatcher, OutputFormat};

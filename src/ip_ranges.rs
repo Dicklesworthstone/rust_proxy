@@ -16,7 +16,7 @@ static FEED_CLIENT: LazyLock<FeedClient> = LazyLock::new(|| {
     // result instead of spawning another stalled trust reader.
     let task = tokio::task::spawn_blocking(|| {
         reqwest::Client::builder()
-            .user_agent("OpenAI File Downloader, XaiImageApiFetch/1.0")
+            .user_agent(crate::USER_AGENT)
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
@@ -198,7 +198,7 @@ mod tests {
                 let mut request = vec![0; 4096];
                 let size = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..size]);
-                assert!(request.contains("OpenAI File Downloader, XaiImageApiFetch/1.0"));
+                assert!(request.contains(crate::USER_AGENT));
                 stream.write_all(response.as_bytes()).await.unwrap();
             });
             let result = fetch_body(&format!("http://{addr}/ranges")).await;

@@ -232,8 +232,9 @@ async fn send_get<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         &url[url::Position::BeforePath..url::Position::AfterQuery]
     };
     let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+    let user_agent = crate::USER_AGENT;
     let request =
-        format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0\r\nConnection: close\r\n{auth}\r\n");
+        format!("GET {target} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {user_agent}\r\nConnection: close\r\n{auth}\r\n");
     stream.write_all(request.as_bytes()).await?;
     let (status, _) = read_response_head(stream).await?;
     if !(200..300).contains(&status) {
